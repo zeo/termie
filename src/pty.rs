@@ -74,7 +74,7 @@ impl Pty {
             pixel_height: 0,
         })?;
 
-        let shell = resolve_shell(shell);
+        let shell = resolve_shell_cached(shell);
         let mut cmd = CommandBuilder::new(&shell);
         // suppress the banner (and the profile unless asked) for a fast prompt, and
         // inject an OSC-7 prompt hook so termie learns the cwd for tab labels / title
@@ -158,6 +158,27 @@ impl Pty {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// resolved shell path memoized per ShellKind: %PATH% doesn't change within a
+/// session, so walking it once per kind avoids repeated disk I/O on every pool
+/// spawn (build_pane runs on worker threads, hence the lock)
+fn resolve_shell_cached(kind: ShellKind) -> String {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Vec<(ShellKind, String)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some((_, p)) = c.iter().find(|(k, _)| *k == kind) {
+            return p.clone();
+        }
+    }
+    let resolved = resolve_shell(kind);
+    if let Ok(mut c) = cache.lock() {
+        if !c.iter().any(|(k, _)| *k == kind) {
+            c.push((kind, resolved.clone()));
+        }
+    }
+    resolved
 }
 
 fn find_in_path(exe: &str) -> Option<PathBuf> {
