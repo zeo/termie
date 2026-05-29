@@ -30,6 +30,9 @@ const CONTENT_PT: f32 = 14.0;
 const CHROME_PT: f32 = 12.5;
 /// pre-warmed shells kept ready so splits/tabs open instantly
 const POOL_TARGET: usize = 3;
+/// stop respawning after this many consecutive shell-spawn failures so a broken
+/// shell can't peg a CPU core; the window then stays up (logged) instead
+const MAX_WARM_FAILS: usize = 10;
 
 type Rect = (f32, f32, f32, f32);
 
@@ -689,6 +692,12 @@ struct App {
     /// url under the cursor while ctrl is held, to underline + open on click:
     /// (focused-pane viewport row, col_start, col_end exclusive)
     link: Option<(usize, usize, usize)>,
+    /// system fonts are scanned lazily after first paint to keep startup fast
+    system_fonts_pending: bool,
+    /// consecutive failed pool spawns; backs off + gives up so a broken shell
+    /// can't spin a busy respawn loop with a permanently empty window
+    warm_fails: usize,
+    warm_backoff_until: Option<Instant>,
 }
 
 impl App {
@@ -730,6 +739,9 @@ impl App {
             mouse_down: None,
             cursor_icon: CursorIcon::Default,
             link: None,
+            system_fonts_pending: true,
+            warm_fails: 0,
+            warm_backoff_until: None,
             settings_open: false,
             settings_anim: None,
             pending_warm: 0,
@@ -776,21 +788,14 @@ impl App {
             }
         }
 
-        let (cols, rows) = self.content_pane_size();
-        let pane = self.spawn_pane(cols, rows)?;
-        let fid = pane.id;
-        self.tabs.push(Tab {
-            focused: fid,
-            root: Some(Node::Leaf(pane)),
-        });
         self.active_tab = 0;
-        self.relayout_all();
-        self.sync_tabs();
-        // paint one frame to the hidden surface, then reveal — no white flash,
-        // and doesn't depend on RedrawRequested reaching a hidden window
+        // paint the chrome immediately (no pane yet) and reveal the window, then
+        // spawn the first shell asynchronously — pwsh startup never blocks the
+        // window appearing. the first pool shell to arrive becomes tab one.
         self.paint();
         window.set_visible(true);
         self.shown = true;
+        self.warm_pool();
         window.request_redraw();
         Ok(())
     }
@@ -876,6 +881,16 @@ impl App {
     fn warm_pool(&mut self) {
         if self.shutting_down || self.renderer.is_none() {
             return;
+        }
+        // gave up after repeated spawn failures: stop trying (no CPU burn)
+        if self.warm_fails >= MAX_WARM_FAILS {
+            return;
+        }
+        // hold off respawning while a backoff from a recent failure is active
+        if let Some(t) = self.warm_backoff_until {
+            if Instant::now() < t {
+                return;
+            }
         }
         // build shells on worker threads so the slow pwsh spawn never blocks the
         // event loop; dispatch all that are needed at once so they spawn in
@@ -1059,26 +1074,31 @@ impl App {
             link,
             ..
         } = self;
-        if let (Some(r), Some(tab)) = (renderer.as_mut(), tabs.get(*active_tab)) {
-            let views: Vec<PaneView> = tab
-                .root
-                .as_ref()
-                .map(|root| {
-                    layout_cache
-                        .iter()
-                        .filter_map(|(id, rect)| {
-                            find_pane(root, *id).map(|p| PaneView {
-                                term: &p.term,
-                                rect: *rect,
-                                focused: *id == tab.focused,
-                                sel: selection.filter(|s| s.pane == *id).map(|s| (s.start, s.end)),
-                                flash: p.flash.map(|t| t.elapsed().as_millis() < 180).unwrap_or(false),
-                                link: if *id == tab.focused { *link } else { None },
+        if let Some(r) = renderer.as_mut() {
+            // render even before the first pane exists (async startup) so the
+            // window/chrome can appear immediately; views is just empty then
+            let views: Vec<PaneView> = match tabs.get(*active_tab) {
+                Some(tab) => tab
+                    .root
+                    .as_ref()
+                    .map(|root| {
+                        layout_cache
+                            .iter()
+                            .filter_map(|(id, rect)| {
+                                find_pane(root, *id).map(|p| PaneView {
+                                    term: &p.term,
+                                    rect: *rect,
+                                    focused: *id == tab.focused,
+                                    sel: selection.filter(|s| s.pane == *id).map(|s| (s.start, s.end)),
+                                    flash: p.flash.map(|t| t.elapsed().as_millis() < 180).unwrap_or(false),
+                                    link: if *id == tab.focused { *link } else { None },
+                                })
                             })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
             if let Err(e) = r.render(&views, *focused, *maximized) {
                 log::error!("render error: {e:#}");
             }
@@ -1978,11 +1998,38 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PaneReady(pane) => {
                 self.pending_warm = self.pending_warm.saturating_sub(1);
                 if let Some(mut pane) = pane {
+                    // a shell spawned successfully: clear the failure backoff
+                    self.warm_fails = 0;
+                    self.warm_backoff_until = None;
                     // start reading now that we own it; refresh scrollback in case
                     // it changed while the shell was spawning
                     self.start_reader(&mut pane);
                     pane.term.grid.set_scrollback_limit(self.config.scrollback);
-                    self.pool.push(*pane);
+                    if self.tabs.is_empty() {
+                        // first shell of an async startup -> becomes tab one
+                        let fid = pane.id;
+                        self.tabs.push(Tab {
+                            focused: fid,
+                            root: Some(Node::Leaf(*pane)),
+                        });
+                        self.active_tab = 0;
+                        self.relayout_all();
+                        self.sync_tabs();
+                        self.redraw();
+                    } else {
+                        self.pool.push(*pane);
+                    }
+                } else {
+                    // spawn failed: back off (growing) so a broken shell can't
+                    // hot-loop, and give up after MAX_WARM_FAILS
+                    self.warm_fails += 1;
+                    let ms = (200 * self.warm_fails as u64).min(3000);
+                    self.warm_backoff_until = Some(Instant::now() + Duration::from_millis(ms));
+                    if self.warm_fails == MAX_WARM_FAILS {
+                        log::error!(
+                            "shell failed to start {MAX_WARM_FAILS} times; stopping spawn retries"
+                        );
+                    }
                 }
             }
         }
@@ -2394,6 +2441,47 @@ impl ApplicationHandler<UserEvent> for App {
         // top up the warm pool once the window is up (one per tick, no spawn burst)
         if self.shown {
             self.warm_pool();
+            // scan system fonts once, deferred off the startup path so the window
+            // appears instantly; enables the font picker + non-Latin fallbacks
+            if self.system_fonts_pending {
+                self.system_fonts_pending = false;
+                let want = self.persisted.font.clone();
+                let scanned = if let Some(r) = self.renderer.as_mut() {
+                    let s = r.ensure_system_fonts();
+                    // a persisted system font couldn't resolve before the scan;
+                    // apply it now that the db has it
+                    if s {
+                        if let Some(f) = want.as_deref() {
+                            r.set_font_by_name(f);
+                        }
+                    }
+                    s
+                } else {
+                    false
+                };
+                if scanned {
+                    // font may have changed the grid size; repaint so the picker,
+                    // re-rasterized fallbacks, and any font switch all show
+                    self.relayout_all();
+                    self.redraw();
+                }
+            }
+        }
+        // first shell hasn't spawned yet after a failure: wake at the backoff
+        // deadline to retry, rather than hot-looping or sleeping indefinitely
+        if self.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS {
+            if let Some(t) = self.warm_backoff_until {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(t));
+                return;
+            }
+        }
+        // startup reveal fade: drive it at ~60fps until it settles
+        if self.renderer.as_ref().map(|r| r.startup_fading()).unwrap_or(false) {
+            self.redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
+            return;
         }
         // settings slide: redraw at ~60fps until the transition settles
         if let Some(t) = self.settings_anim {

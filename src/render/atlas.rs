@@ -57,6 +57,8 @@ pub struct GlyphAtlas {
     cursor_x: u32,
     cursor_y: u32,
     shelf_h: u32,
+    /// whether system fonts have been scanned into the db yet (lazy)
+    system_loaded: bool,
 
     cache: HashMap<GlyphKey, Option<AtlasGlyph>>,
 }
@@ -65,7 +67,11 @@ const PAD: u32 = 1;
 
 impl GlyphAtlas {
     pub fn new(content_pt: f32, chrome_pt: f32, scale: f32, content_override: Option<&'static str>) -> Self {
-        let mut font_system = FontSystem::new();
+        // start from an EMPTY db (no system-font scan) so startup is fast; only
+        // the bundled fonts are loaded now. system fonts are scanned lazily via
+        // load_system_fonts() once the window is up and the user needs them.
+        let db = cosmic_text::fontdb::Database::new();
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
 
         // load bundled fonts; fall back to generic monospace if unavailable
         let (maple, chrome_family) = load_bundled_fonts(&mut font_system);
@@ -112,6 +118,7 @@ impl GlyphAtlas {
             cursor_x: PAD,
             cursor_y: PAD,
             shelf_h: 0,
+            system_loaded: false,
             cache: HashMap::new(),
         };
         atlas.data = vec![0u8; (atlas.dim * atlas.dim) as usize];
@@ -136,6 +143,28 @@ impl GlyphAtlas {
     /// is a font family with this name available in the db?
     pub fn has_family(&self, name: &str) -> bool {
         family_present(&self.font_system, name)
+    }
+
+    /// scan system fonts into the db on first call (deferred off the startup
+    /// path). returns true only on the call that actually did the scan, so the
+    /// caller can refresh anything derived from the font list
+    pub fn load_system_fonts(&mut self) -> bool {
+        if self.system_loaded {
+            return false;
+        }
+        self.system_loaded = true;
+        self.font_system.db_mut().load_system_fonts();
+        true
+    }
+
+    /// drop cached missing-glyph (tofu) entries so they re-rasterize against
+    /// fonts that have since been loaded; keeps already-packed glyphs intact
+    pub fn invalidate_missing(&mut self) {
+        let before = self.cache.len();
+        self.cache.retain(|_, v| v.is_some());
+        if self.cache.len() != before {
+            self.dirty = true;
+        }
     }
 
     /// re-measure for new sizes/family and reset the glyph cache, REUSING the

@@ -262,6 +262,8 @@ pub struct Renderer {
 
     atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
+    /// kept alive for the icon badge texture referenced by atlas_bind_group
+    _icon_texture: wgpu::Texture,
 
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
@@ -320,7 +322,9 @@ impl Renderer {
             let instance = wgpu::Instance::new(desc);
             let surface = instance.create_surface(window.clone())?;
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                // a 2D terminal doesn't need the discrete GPU; low-power picks the
+                // integrated adapter, which inits faster and saves battery
+                power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             }))
@@ -383,20 +387,9 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let atlas = GlyphAtlas::new(content_pt, chrome_pt, scale, None);
-        // the bundled default plus any common monospace families present on the system
-        let mut fonts: Vec<&'static str> = vec![atlas.content_family()];
-        for cand in [
-            "Cascadia Code",
-            "Cascadia Mono",
-            "JetBrains Mono",
-            "Consolas",
-            "Lucida Console",
-            "Courier New",
-        ] {
-            if !fonts.iter().any(|f| f.eq_ignore_ascii_case(cand)) && atlas.has_family(cand) {
-                fonts.push(cand);
-            }
-        }
+        // the bundled default plus any common monospace families present on the
+        // system (initially just the bundled one — system fonts load lazily)
+        let fonts = Self::detect_fonts(&atlas);
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
@@ -447,6 +440,44 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+
+        // the app icon (">_<" master, pre-decoded to 128x128 RGBA) lives in a
+        // small color texture so it can be drawn as a badge in the title bar
+        const ICON_DIM: u32 = 128;
+        let icon_rgba: &[u8] = include_bytes!("../../assets/icon_128.rgba");
+        let icon_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("app-icon"),
+            size: wgpu::Extent3d { width: ICON_DIM, height: ICON_DIM, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &icon_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            icon_rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ICON_DIM * 4),
+                rows_per_image: Some(ICON_DIM),
+            },
+            wgpu::Extent3d { width: ICON_DIM, height: ICON_DIM, depth_or_array_layers: 1 },
+        );
+        let icon_view = icon_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let icon_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("icon-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atlas-bgl"),
             entries: &[
@@ -466,6 +497,22 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -479,6 +526,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&icon_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&icon_sampler),
                 },
             ],
         });
@@ -558,6 +613,7 @@ impl Renderer {
             uniform_bind_group,
             atlas_texture,
             atlas_bind_group,
+            _icon_texture: icon_texture,
             instance_buffer,
             instance_capacity,
             atlas,
@@ -774,6 +830,40 @@ impl Renderer {
 
     pub fn font_name(&self) -> &'static str {
         self.fonts[self.font_idx]
+    }
+
+    /// the bundled default plus any common monospace families present in the db
+    fn detect_fonts(atlas: &GlyphAtlas) -> Vec<&'static str> {
+        let mut fonts: Vec<&'static str> = vec![atlas.content_family()];
+        for cand in [
+            "Cascadia Code",
+            "Cascadia Mono",
+            "JetBrains Mono",
+            "Consolas",
+            "Lucida Console",
+            "Courier New",
+        ] {
+            if !fonts.iter().any(|f| f.eq_ignore_ascii_case(cand)) && atlas.has_family(cand) {
+                fonts.push(cand);
+            }
+        }
+        fonts
+    }
+
+    /// scan system fonts once (deferred off startup) so the font picker can
+    /// offer them and so non-Latin glyphs have fallbacks. cheap no-op after the
+    /// first call. returns true if it scanned now
+    pub fn ensure_system_fonts(&mut self) -> bool {
+        if !self.atlas.load_system_fonts() {
+            return false;
+        }
+        // any glyph cached as missing before the scan can now resolve via a
+        // newly loaded fallback font, so drop those tofu entries
+        self.atlas.invalidate_missing();
+        let cur = self.fonts[self.font_idx];
+        self.fonts = Self::detect_fonts(&self.atlas);
+        self.font_idx = self.fonts.iter().position(|f| *f == cur).unwrap_or(0);
+        true
     }
 
     /// switch to a content font by family name (no-op if not available)
@@ -1161,6 +1251,20 @@ impl Renderer {
         });
     }
 
+    /// draw the full-color app-icon badge (kind 2) at (x,y), size x size px;
+    /// `alpha` fades it for the startup reveal
+    fn push_icon(out: &mut Vec<Instance>, x: f32, y: f32, size: f32, alpha: f32) {
+        out.push(Instance {
+            pos: [x, y],
+            size: [size, size],
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            color: [1.0, 1.0, 1.0, alpha],
+            kind: 2,
+            _pad: [0; 3],
+        });
+    }
+
     /// banded vertical gradient from `top` (at y) to `bottom` (at y+h)
     fn push_vgradient(out: &mut Vec<Instance>, x: f32, y: f32, w: f32, h: f32, top: Rgb, bottom: Rgb, bands: usize) {
         let n = bands.max(1);
@@ -1542,11 +1646,11 @@ impl Renderer {
         Self::push_rect(&mut out, 0.0, 0.0, w, self.title_bar_h, INK_1, 1.0);
         Self::push_rect(&mut out, 0.0, self.title_bar_h - hair, w, hair, RULE, 1.0);
 
-        // logo mark (nerd-font terminal glyph) + wordmark
-        let _ = Self::draw_text(
-            &mut self.atlas, &mut out, FontId::Chrome, pad, text_top, "\u{f120}", PAPER, 1.0, track,
-        );
-        let wx = pad + cw_c + (10.0 * self.scale).round();
+        // app-icon badge (the ">_<" mark) + wordmark
+        let badge = (self.title_bar_h * 0.6).round();
+        let badge_y = ((self.title_bar_h - badge) / 2.0).round();
+        Self::push_icon(&mut out, pad, badge_y, badge, 1.0);
+        let wx = pad + badge + (9.0 * self.scale).round();
         let _ = Self::draw_text(
             &mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", TEXT_2, 1.0, track,
         );
@@ -1714,7 +1818,33 @@ impl Renderer {
             self.build_settings(&mut out, track);
         }
 
+        // startup reveal: a quick ease-out fade up from the background over the
+        // first ~180ms (purely visual — input is live underneath the whole time).
+        // skip if the settings panel is open so the fade rect can't land in the
+        // scissored panel range (it would otherwise be clipped to the panel)
+        let fade = self.startup_fade();
+        if fade > 0.0 && self.panel_clip.is_none() {
+            Self::push_rect(&mut out, 0.0, 0.0, w, h, INK_0, fade);
+        }
+
         out
+    }
+
+    const STARTUP_FADE: f32 = 0.18;
+
+    /// overlay alpha for the startup reveal: 1 -> 0 over STARTUP_FADE seconds
+    /// (ease-out), then 0 forever
+    fn startup_fade(&self) -> f32 {
+        let t = self.start.elapsed().as_secs_f32();
+        if t >= Self::STARTUP_FADE {
+            return 0.0;
+        }
+        let e = 1.0 - t / Self::STARTUP_FADE;
+        e * e
+    }
+
+    pub fn startup_fading(&self) -> bool {
+        self.start.elapsed().as_secs_f32() < Self::STARTUP_FADE
     }
 
     #[allow(non_snake_case)]

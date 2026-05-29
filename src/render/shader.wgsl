@@ -6,6 +6,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(1) @binding(1) var atlas_samp: sampler;
+@group(1) @binding(2) var icon_tex: texture_2d<f32>;
+@group(1) @binding(3) var icon_samp: sampler;
 
 struct InstanceIn {
     @location(0) pos: vec2<f32>,
@@ -51,6 +53,12 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == 0u) {
         return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+    }
+    // kind 2: full-color app-icon texture (straight alpha -> premultiplied)
+    if (in.kind == 2u) {
+        let t = textureSample(icon_tex, icon_samp, in.uv);
+        let ia = t.a * in.color.a;
+        return vec4<f32>(t.rgb * ia, ia);
     }
     let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
     let a = in.color.a * cov;
