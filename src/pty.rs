@@ -167,17 +167,15 @@ fn resolve_shell_cached(kind: ShellKind) -> String {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<Vec<(ShellKind, String)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(c) = cache.lock() {
-        if let Some((_, p)) = c.iter().find(|(k, _)| *k == kind) {
+    if let Ok(c) = cache.lock()
+        && let Some((_, p)) = c.iter().find(|(k, _)| *k == kind) {
             return p.clone();
         }
-    }
     let resolved = resolve_shell(kind);
-    if let Ok(mut c) = cache.lock() {
-        if !c.iter().any(|(k, _)| *k == kind) {
+    if let Ok(mut c) = cache.lock()
+        && !c.iter().any(|(k, _)| *k == kind) {
             c.push((kind, resolved.clone()));
         }
-    }
     resolved
 }
 

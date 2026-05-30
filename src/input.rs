@@ -66,15 +66,12 @@ pub fn key_to_bytes(
     }
 
     // control combinations on character keys
-    if ctrl && !alt {
-        if let Key::Character(s) = &event.logical_key {
-            if let Some(c) = s.chars().next() {
-                if let Some(code) = control_code(c) {
+    if ctrl && !alt
+        && let Key::Character(s) = &event.logical_key
+            && let Some(c) = s.chars().next()
+                && let Some(code) = control_code(c) {
                     return Some(vec![code]);
                 }
-            }
-        }
-    }
 
     // ordinary text (prefer the layout-resolved text winit provides)
     let text = event

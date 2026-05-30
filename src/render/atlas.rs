@@ -409,11 +409,10 @@ fn family_present(fs: &FontSystem, name: &str) -> bool {
 
 fn assets_font_dir() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             candidates.push(dir.join("assets/fonts"));
         }
-    }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts"));
     candidates.push(PathBuf::from("assets/fonts"));
     candidates.into_iter().find(|p| p.exists())

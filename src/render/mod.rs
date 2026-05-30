@@ -814,7 +814,7 @@ impl Renderer {
     pub fn set_dock(&mut self, widgets: Vec<DockWidget>) -> bool {
         let was = !self.dock.is_empty();
         self.dock = widgets;
-        was != !self.dock.is_empty()
+        was == self.dock.is_empty()
     }
 
     /// inner padding inside each pane rect (keeps text off the dividers)
@@ -1025,14 +1025,13 @@ impl Renderer {
 
     /// switch to a content font by family name (no-op if not available)
     pub fn set_font_by_name(&mut self, name: &str) -> (usize, usize) {
-        if let Some(i) = self.fonts.iter().position(|f| f.eq_ignore_ascii_case(name)) {
-            if i != self.font_idx {
+        if let Some(i) = self.fonts.iter().position(|f| f.eq_ignore_ascii_case(name))
+            && i != self.font_idx {
                 self.font_idx = i;
                 self.content_font = if i == 0 { None } else { Some(self.fonts[i]) };
                 self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font);
                 self.recompute_grid_size();
             }
-        }
         (self.cols, self.rows)
     }
 
@@ -1770,8 +1769,8 @@ impl Renderer {
         let m = atlas.metrics(font);
         let lin = rgb.to_linear_f32();
         for c in text.chars() {
-            if c != ' ' {
-                if let Some(g) = atlas.get(GlyphKey {
+            if c != ' '
+                && let Some(g) = atlas.get(GlyphKey {
                     font,
                     c,
                     bold: false,
@@ -1787,7 +1786,6 @@ impl Renderer {
                         _pad: [0; 3],
                     });
                 }
-            }
             x += m.cell_w + track;
         }
         x

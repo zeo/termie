@@ -146,8 +146,8 @@ pub fn clipboard_get() -> String {
         if OpenClipboard(Some(HWND(std::ptr::null_mut()))).is_err() {
             return out;
         }
-        if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
-            if !h.0.is_null() {
+        if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32)
+            && !h.0.is_null() {
                 let hglobal = HGLOBAL(h.0);
                 let ptr = GlobalLock(hglobal) as *const u16;
                 if !ptr.is_null() {
@@ -162,7 +162,6 @@ pub fn clipboard_get() -> String {
                     let _ = GlobalUnlock(hglobal);
                 }
             }
-        }
         let _ = CloseClipboard();
         let _ = HANDLE::default();
     }

@@ -285,7 +285,7 @@ impl Perform for Terminal {
             0x07 => self.bell = true,
             0x08 => self.grid.backspace(),
             0x09 => self.grid.tab(),
-            0x0a | 0x0b | 0x0c => self.grid.linefeed(),
+            0x0a..=0x0c => self.grid.linefeed(),
             0x0d => self.grid.carriage_return(),
             _ => {}
         }

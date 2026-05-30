@@ -77,12 +77,6 @@ impl Json {
         Some(v)
     }
 
-    pub fn to_string(&self) -> String {
-        let mut s = String::new();
-        self.write(&mut s);
-        s
-    }
-
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -120,6 +114,14 @@ impl Json {
                 out.push('}');
             }
         }
+    }
+}
+
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = String::new();
+        self.write(&mut s);
+        f.write_str(&s)
     }
 }
 

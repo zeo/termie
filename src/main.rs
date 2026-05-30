@@ -288,8 +288,8 @@ fn git_branch(cwd: Option<&str>) -> Option<String> {
 fn split_pane(node: Node, id: usize, dir: Dir, new: &mut Option<Pane>) -> Node {
     match node {
         Node::Leaf(p) => {
-            if p.id == id {
-                if let Some(np) = new.take() {
+            if p.id == id
+                && let Some(np) = new.take() {
                     return Node::Split {
                         dir,
                         ratio: 0.5,
@@ -297,7 +297,6 @@ fn split_pane(node: Node, id: usize, dir: Dir, new: &mut Option<Pane>) -> Node {
                         b: Box::new(Node::Leaf(np)),
                     };
                 }
-            }
             Node::Leaf(p)
         }
         Node::Split { dir: d, ratio, a, b } => {
@@ -456,7 +455,7 @@ fn swap_panes(node: &mut Node, a: usize, b: usize) {
     collect(node, a, b, &mut pa, &mut pb);
     if !pa.is_null() && !pb.is_null() {
         // safety: a != b and pane ids are unique, so pa/pb point to distinct Panes
-        unsafe { std::mem::swap(&mut *pa, &mut *pb) };
+        unsafe { core::ptr::swap(pa, pb) };
     }
 }
 
@@ -993,11 +992,10 @@ impl App {
             .with_inner_size(LogicalSize::new(1000.0, 640.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
 
-        if let Ok(handle) = window.window_handle() {
-            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+        if let Ok(handle) = window.window_handle()
+            && let RawWindowHandle::Win32(h) = handle.as_raw() {
                 win::apply_window_effects(h.hwnd.get());
             }
-        }
 
         let renderer = Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend)?;
         self.window = Some(window.clone());
@@ -1119,11 +1117,10 @@ impl App {
             return;
         }
         // hold off respawning while a backoff from a recent failure is active
-        if let Some(t) = self.warm_backoff_until {
-            if Instant::now() < t {
+        if let Some(t) = self.warm_backoff_until
+            && Instant::now() < t {
                 return;
             }
-        }
         // build shells on worker threads so the slow pwsh spawn never blocks the
         // event loop; dispatch all that are needed at once so they spawn in
         // parallel and the pool fills fast. each arrives via UserEvent::PaneReady
@@ -1278,13 +1275,11 @@ impl App {
                     log::warn!("plugin {pidx} write_pty denied (permission not granted)");
                     return;
                 }
-                if let Some(id) = self.active_focused_id() {
-                    if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
-                        if let Some(p) = find_pane_mut(root, id) {
+                if let Some(id) = self.active_focused_id()
+                    && let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut())
+                        && let Some(p) = find_pane_mut(root, id) {
                             p.pty.write(data.as_bytes());
                         }
-                    }
-                }
             }
             C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
         }
@@ -1405,11 +1400,10 @@ impl App {
             .find
             .as_ref()
             .and_then(|f| f.matches.get(f.current).copied());
-        if let Some((g, _)) = target {
-            if let Some(grid) = self.focused_grid_mut() {
+        if let Some((g, _)) = target
+            && let Some(grid) = self.focused_grid_mut() {
                 grid.scroll_to_global(g);
             }
-        }
     }
 
     fn find_step(&mut self, forward: bool) {
@@ -1435,15 +1429,14 @@ impl App {
         let f = self.find.as_ref()?;
         let qlen = f.query.chars().count();
         let mut vps = Vec::new();
-        if qlen > 0 {
-            if let Some(g) = self.focused_grid() {
+        if qlen > 0
+            && let Some(g) = self.focused_grid() {
                 for (i, &(gl, col)) in f.matches.iter().enumerate() {
                     if let Some(vr) = g.global_to_viewport(gl) {
                         vps.push((vr, col, qlen, i == f.current));
                     }
                 }
             }
-        }
         Some(render::FindView {
             query: f.query.clone(),
             count: f.matches.len(),
@@ -1477,9 +1470,9 @@ impl App {
         let Some(id) = self.active_focused_id() else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            if let Some(root) = tab.root.as_mut() {
-                if let Some(p) = find_pane_mut(root, id) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && let Some(root) = tab.root.as_mut()
+                && let Some(p) = find_pane_mut(root, id) {
                     let mut bytes = Vec::new();
                     if p.term.bracketed_paste {
                         bytes.extend_from_slice(b"\x1b[200~");
@@ -1490,8 +1483,6 @@ impl App {
                     }
                     p.pty.write(&bytes);
                 }
-            }
-        }
     }
 
     /// render one frame: window title + every visible pane
@@ -2472,17 +2463,15 @@ impl App {
                     self.find_recompute();
                 }
                 _ => {
-                    if !self.mods.control_key() {
-                        if let Some(t) = event.text.as_ref() {
-                            if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
+                    if !self.mods.control_key()
+                        && let Some(t) = event.text.as_ref()
+                            && !t.is_empty() && !t.chars().any(|c| c.is_control()) {
                                 let t = t.to_string();
                                 if let Some(f) = self.find.as_mut() {
                                     f.query.push_str(&t);
                                 }
                                 self.find_recompute();
                             }
-                        }
-                    }
                 }
             }
             return true;
@@ -2512,11 +2501,10 @@ impl App {
                         .as_ref()
                         .map(|p| palette_filter(&p.query).len())
                         .unwrap_or(0);
-                    if let Some(p) = self.palette.as_mut() {
-                        if len > 0 {
+                    if let Some(p) = self.palette.as_mut()
+                        && len > 0 {
                             p.selected = (p.selected + 1) % len;
                         }
-                    }
                     self.redraw();
                 }
                 Key::Named(NamedKey::ArrowUp) => {
@@ -2525,11 +2513,10 @@ impl App {
                         .as_ref()
                         .map(|p| palette_filter(&p.query).len())
                         .unwrap_or(0);
-                    if let Some(p) = self.palette.as_mut() {
-                        if len > 0 {
+                    if let Some(p) = self.palette.as_mut()
+                        && len > 0 {
                             p.selected = (p.selected + len - 1) % len;
                         }
-                    }
                     self.redraw();
                 }
                 Key::Named(NamedKey::Backspace) => {
@@ -2540,9 +2527,9 @@ impl App {
                     self.redraw();
                 }
                 _ => {
-                    if !self.mods.control_key() {
-                        if let Some(t) = event.text.as_ref() {
-                            if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
+                    if !self.mods.control_key()
+                        && let Some(t) = event.text.as_ref()
+                            && !t.is_empty() && !t.chars().any(|c| c.is_control()) {
                                 let t = t.to_string();
                                 if let Some(p) = self.palette.as_mut() {
                                     p.query.push_str(&t);
@@ -2550,8 +2537,6 @@ impl App {
                                 }
                                 self.redraw();
                             }
-                        }
-                    }
                 }
             }
             return true;
@@ -2709,8 +2694,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut in_sync = false;
                 let mut rang = false;
                 for tab in &mut self.tabs {
-                    if let Some(root) = tab.root.as_mut() {
-                        if let Some(p) = find_pane_mut(root, id) {
+                    if let Some(root) = tab.root.as_mut()
+                        && let Some(p) = find_pane_mut(root, id) {
                             p.parser.advance(&mut p.term, &bytes);
                             in_sync = p.term.sync_output;
                             if !p.term.responses.is_empty() {
@@ -2724,7 +2709,6 @@ impl ApplicationHandler<UserEvent> for App {
                             found = true;
                             break;
                         }
-                    }
                 }
                 // let plugins react to the bell (host -> plugin event direction)
                 if rang && !self.plugins.is_empty() {
@@ -2749,19 +2733,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(r) = responses {
                     let mut wrote = false;
                     for tab in &mut self.tabs {
-                        if let Some(root) = tab.root.as_mut() {
-                            if let Some(p) = find_pane_mut(root, id) {
+                        if let Some(root) = tab.root.as_mut()
+                            && let Some(p) = find_pane_mut(root, id) {
                                 p.pty.write(&r);
                                 wrote = true;
                                 break;
                             }
-                        }
                     }
-                    if !wrote {
-                        if let Some(sp) = self.pool.iter_mut().find(|sp| sp.id == id) {
+                    if !wrote
+                        && let Some(sp) = self.pool.iter_mut().find(|sp| sp.id == id) {
                             sp.pty.write(&r);
                         }
-                    }
                 }
                 // refresh tab labels when a cwd (OSC-7) likely just arrived
                 if bytes.windows(3).any(|w| w == b"\x1b]7") {
@@ -2885,21 +2867,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.focused = f;
                 // a held drag can't survive losing focus: release it so the TUI
                 // doesn't see a stuck button
-                if !f {
-                    if let Some((btn, id)) = self.mouse_down.take() {
+                if !f
+                    && let Some((btn, id)) = self.mouse_down.take() {
                         self.report_to_pane(id, btn, false, false);
                     }
-                }
                 // report focus in/out to a pane that enabled mode 1004
-                if let Some(id) = self.active_focused_id() {
-                    if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
-                        if let Some(p) = find_pane_mut(root, id) {
-                            if p.term.focus_events {
+                if let Some(id) = self.active_focused_id()
+                    && let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut())
+                        && let Some(p) = find_pane_mut(root, id)
+                            && p.term.focus_events {
                                 p.pty.write(if f { b"\x1b[I" } else { b"\x1b[O" });
                             }
-                        }
-                    }
-                }
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -3025,19 +3003,16 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y * 3.0,
                     MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as f32,
                 };
-                if let Some(id) = self.pane_at(cx, cy) {
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        if let Some(root) = tab.root.as_mut() {
-                            if let Some(p) = find_pane_mut(root, id) {
+                if let Some(id) = self.pane_at(cx, cy)
+                    && let Some(tab) = self.tabs.get_mut(self.active_tab)
+                        && let Some(root) = tab.root.as_mut()
+                            && let Some(p) = find_pane_mut(root, id) {
                                 // alt screen has no scrollback — don't local-scroll it
                                 if !p.term.using_alt {
                                     p.term.grid.scroll_view(lines.round() as isize);
                                     self.redraw();
                                 }
                             }
-                        }
-                    }
-                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -3060,12 +3035,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let hit = self.renderer.as_ref().map(|r| r.hit_test(cx, cy));
                 // always finalize a forwarded press with a release report, even if
                 // the cursor left the pane (else the TUI sees a stuck drag)
-                if state == ElementState::Released {
-                    if let Some((btn, id)) = self.mouse_down.take() {
+                if state == ElementState::Released
+                    && let Some((btn, id)) = self.mouse_down.take() {
                         self.report_to_pane(id, btn, false, false);
                         return;
                     }
-                }
                 // while the settings panel is open, a press outside it dismisses it
                 // (and is consumed); presses inside fall through to its controls
                 if self.settings_open && state == ElementState::Pressed {
@@ -3105,10 +3079,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         ElementState::Released => {
-                            if self.drag_divider.take().is_none() {
-                                if let Some(src) = self.drag_pane.take() {
-                                    if let Some(dst) = self.pane_at(cx, cy) {
-                                        if dst != src {
+                            if self.drag_divider.take().is_none()
+                                && let Some(src) = self.drag_pane.take()
+                                    && let Some(dst) = self.pane_at(cx, cy)
+                                        && dst != src {
                                             if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
                                                 swap_panes(root, src, dst);
                                             }
@@ -3116,35 +3090,28 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.sync_tabs();
                                             self.redraw();
                                         }
-                                    }
-                                }
-                            }
                         }
                     }
                     return;
                 }
                 // ctrl+click opens a web link under the cursor (before any TUI
                 // forwarding, so it works inside mouse-reporting apps too)
-                if state == ElementState::Pressed && self.mods.control_key() {
-                    if let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
+                if state == ElementState::Pressed && self.mods.control_key()
+                    && let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
                         win::open_url(&url);
                         return;
                     }
-                }
                 // forward a press to a TUI with mouse reporting on (Shift bypasses
                 // for manual selection); release is finalized at the top of the arm
                 if matches!(hit, Some(Hit::Content))
                     && !self.mods.shift_key()
                     && state == ElementState::Pressed
-                {
-                    if let Some(id) = self.pane_at(cx, cy) {
-                        if self.report_to_pane(id, 0, true, false) {
+                    && let Some(id) = self.pane_at(cx, cy)
+                        && self.report_to_pane(id, 0, true, false) {
                             self.focus_pane_at(cx, cy);
                             self.mouse_down = Some((0, id));
                             return;
                         }
-                    }
-                }
                 // drag a split divider directly to resize it (no pane mode needed)
                 if matches!(hit, Some(Hit::Content)) && !self.mods.shift_key() {
                     match state {
@@ -3269,11 +3236,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.copy_selection();
                             }
                         }
-                        if let Some(h) = self.pressed.take() {
-                            if matches!(hit, Some(Hit::Button(hh)) if hh == h) {
+                        if let Some(h) = self.pressed.take()
+                            && matches!(hit, Some(Hit::Button(hh)) if hh == h) {
                                 self.button_action(event_loop, h);
                             }
-                        }
                     }
                 }
             }
@@ -3301,8 +3267,8 @@ impl ApplicationHandler<UserEvent> for App {
                     .unwrap_or(false);
                 if let Some(bytes) = input::key_to_bytes(&event, self.mods, app_cursor) {
                     self.selection = None; // typing clears the selection
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        if let Some(root) = tab.root.as_mut() {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab)
+                        && let Some(root) = tab.root.as_mut() {
                             if self.broadcast {
                                 // send to every pane in the tab (cockpit mode)
                                 each_pane_mut(root, &mut |p| p.pty.write(&bytes));
@@ -3310,7 +3276,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 p.pty.write(&bytes);
                             }
                         }
-                    }
                 }
             }
             WindowEvent::RedrawRequested => self.paint(),
@@ -3331,11 +3296,10 @@ impl ApplicationHandler<UserEvent> for App {
                     let s = r.ensure_system_fonts();
                     // a persisted system font couldn't resolve before the scan;
                     // apply it now that the db has it
-                    if s {
-                        if let Some(f) = want.as_deref() {
+                    if s
+                        && let Some(f) = want.as_deref() {
                             r.set_font_by_name(f);
                         }
-                    }
                     s
                 } else {
                     false
@@ -3362,12 +3326,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // first shell hasn't spawned yet after a failure: wake at the backoff
         // deadline to retry, rather than hot-looping or sleeping indefinitely
-        if self.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS {
-            if let Some(t) = self.warm_backoff_until {
+        if self.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS
+            && let Some(t) = self.warm_backoff_until {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(t));
                 return;
             }
-        }
         // a synchronized-output frame is open: hold the paint until it closes,
         // but force one if it stalls (~100ms) so a crash mid-frame can't freeze us
         if let Some(t) = self.sync_redraw_pending {
