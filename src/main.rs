@@ -460,56 +460,55 @@ fn each_pane(node: &Node, f: &mut impl FnMut(&Pane)) {
 /// missing dir or malformed manifests are skipped silently — a bad plugin must
 /// never block startup. (the marketplace + enable/disable arrive in later
 /// phases; for now every installed plugin with a valid manifest is launched)
-fn discover_plugins() -> Vec<(String, String, Vec<String>)> {
-    let Some(base) = config_path().and_then(|p| p.parent().map(|d| d.join("plugins"))) else {
+/// scan the plugins dir, returning every plugin with a valid manifest (enabled
+/// or not — the marketplace UI needs to see disabled ones too). the directory
+/// name is the trusted id; the manifest is validated against it so a plugin can
+/// never claim another identity or escape its directory
+fn discover_plugins() -> Vec<Discovered> {
+    let Some(base) = plugins_dir() else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Vec::new();
     };
+    let states = load_plugin_states();
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        let manifest = dir.join("plugin.json");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some(json) = plugin::Json::parse(&text) else {
-            log::warn!("plugin manifest {} is not valid json", manifest.display());
+        let Ok(text) = std::fs::read_to_string(dir.join("plugin.json")) else {
             continue;
         };
-        let id = json
-            .get_str("id")
-            .map(str::to_string)
-            .or_else(|| dir.file_name().and_then(|n| n.to_str()).map(str::to_string))
-            .unwrap_or_default();
-        // entry: { "cmd": "program", "args": ["..."] } — args optional. the
-        // program is resolved relative to the plugin dir if not absolute
-        let Some(entry_obj) = json.get("entry") else {
-            log::warn!("plugin {id} manifest has no entry");
+        let Some(manifest) = plugin::Manifest::parse(&text, dir_name) else {
+            // parse() already logged the reason
             continue;
         };
-        let Some(cmd) = entry_obj.get_str("cmd") else {
-            log::warn!("plugin {id} entry has no cmd");
-            continue;
-        };
+        // resolve the entry program: relative paths stay inside the plugin dir;
+        // an absolute cmd is allowed only for locally hand-installed plugins
         let prog = {
-            let p = std::path::Path::new(cmd);
+            let p = std::path::Path::new(&manifest.cmd);
             if p.is_absolute() {
-                cmd.to_string()
+                manifest.cmd.clone()
             } else {
-                dir.join(cmd).to_string_lossy().into_owned()
+                dir.join(&manifest.cmd).to_string_lossy().into_owned()
             }
         };
-        let args = entry_obj
-            .get("args")
-            .and_then(plugin::Json::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        out.push((id, prog, args));
+        // unknown-to-cfg plugins default to enabled, no granted perms
+        let st = states.get(&manifest.id).cloned().unwrap_or(PluginState {
+            enabled: true,
+            granted: Vec::new(),
+        });
+        out.push(Discovered {
+            manifest,
+            program: prog,
+            enabled: st.enabled,
+            granted: st.granted,
+        });
     }
     out
 }
@@ -664,6 +663,97 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(base).join("termie").join("config"))
 }
 
+/// %APPDATA%\termie\plugins — one subdirectory per installed plugin
+fn plugins_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(base).join("termie").join("plugins"))
+}
+
+/// %APPDATA%\termie\plugins.cfg — per-plugin enabled state + granted perms.
+/// one line per plugin: `id=on` or `id=off`, optionally `;perms=a,b`
+fn plugins_cfg_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(base).join("termie").join("plugins.cfg"))
+}
+
+/// persisted per-plugin state, keyed by plugin id
+#[derive(Clone, Default)]
+struct PluginState {
+    enabled: bool,
+    granted: Vec<String>,
+}
+
+/// load the plugins.cfg map (id -> state). missing file = empty map; a plugin
+/// not present in the map defaults to enabled with no granted permissions, so
+/// dropping a plugin into the dir Just Works while installs can persist choices
+fn load_plugin_states() -> std::collections::HashMap<String, PluginState> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = plugins_cfg_path() else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let Some((id, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let id = id.trim();
+        if !plugin::id_is_safe(id) {
+            continue;
+        }
+        let mut st = PluginState::default();
+        for (i, part) in rest.split(';').enumerate() {
+            let part = part.trim();
+            if i == 0 {
+                st.enabled = part == "on";
+            } else if let Some(perms) = part.strip_prefix("perms=") {
+                st.granted = perms
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| plugin::KNOWN_PERMISSIONS.contains(p))
+                    .map(str::to_string)
+                    .collect();
+            }
+        }
+        map.insert(id.to_string(), st);
+    }
+    map
+}
+
+/// write the plugins.cfg map back to disk
+fn save_plugin_states(map: &std::collections::HashMap<String, PluginState>) {
+    use std::fmt::Write as _;
+    let Some(path) = plugins_cfg_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut s = String::new();
+    // stable order so the file doesn't churn between writes
+    let mut ids: Vec<&String> = map.keys().collect();
+    ids.sort();
+    for id in ids {
+        let st = &map[id];
+        let _ = write!(s, "{}={}", id, if st.enabled { "on" } else { "off" });
+        if !st.granted.is_empty() {
+            let _ = write!(s, ";perms={}", st.granted.join(","));
+        }
+        s.push('\n');
+    }
+    let _ = std::fs::write(&path, s);
+}
+
+/// an installed plugin discovered on disk, with its validated manifest, the
+/// resolved entry program path, and its persisted enable/permission state
+struct Discovered {
+    manifest: plugin::Manifest,
+    program: String,
+    enabled: bool,
+    granted: Vec<String>,
+}
+
 fn load_persisted() -> Persisted {
     let mut p = Persisted::default();
     let Some(path) = config_path() else {
@@ -779,6 +869,9 @@ struct App {
     /// manifest id per plugin, parallel to `plugins`, used as the `from` on
     /// bus messages so subscribers know who published
     plugin_ids: Vec<String>,
+    /// granted permissions per plugin, parallel to `plugins`; gates the
+    /// permissioned verbs (write_pty) and events (output_chunk)
+    plugin_granted: Vec<Vec<String>>,
     /// declared Tier-1 widgets keyed by (plugin index, widget id) so two
     /// plugins can't clobber each other; rendered in the right-side dock
     plugin_widgets: Vec<(usize, String, render::DockWidget)>,
@@ -833,6 +926,7 @@ impl App {
             plugins: Vec::new(),
             plugins_started: false,
             plugin_ids: Vec::new(),
+            plugin_granted: Vec::new(),
             plugin_widgets: Vec::new(),
             plugin_subs: Vec::new(),
             settings_open: false,
@@ -1021,21 +1115,35 @@ impl App {
     /// plugin's stdout line arrives as UserEvent::Plugin. failures are logged and
     /// skipped so a broken plugin can never block startup or the core
     fn start_plugins(&mut self) {
-        for (idx, (id, program, args)) in discover_plugins().into_iter().enumerate() {
+        // only launch enabled plugins; disabled ones still appear in the
+        // marketplace UI but never spawn a process
+        for d in discover_plugins().into_iter().filter(|d| d.enabled) {
+            let id = d.manifest.id.clone();
+            // the index this plugin will occupy once pushed
+            let idx = self.plugins.len();
             let proxy = self.proxy.clone();
-            match plugin::Plugin::spawn(id.clone(), &program, &args, move |msg| {
+            match plugin::Plugin::spawn(id.clone(), &d.program, &d.manifest.args, move |msg| {
                 let _ = proxy.send_event(UserEvent::Plugin { id: idx, msg });
             }) {
                 Ok(mut p) => {
-                    // handshake: tell the plugin our api version + granted perms
+                    // handshake: tell the plugin our api version + the perms the
+                    // user actually granted (intersected with what it declared)
+                    let granted: Vec<String> = d
+                        .granted
+                        .iter()
+                        .filter(|g| d.manifest.permissions.contains(g))
+                        .cloned()
+                        .collect();
                     p.send(&plugin::HostEvent::Hello {
                         api_version: plugin::API_VERSION,
-                        permissions: Vec::new(),
+                        permissions: granted.clone(),
                     });
+                    // keep ids/granted parallel to `plugins` (push together so
+                    // indices never skew) so a publisher can be named and
+                    // permissioned verbs can be checked
                     self.plugins.push(p);
-                    // keep ids parallel to `plugins` (only on success) so a
-                    // publisher can be named on bus messages
                     self.plugin_ids.push(id);
+                    self.plugin_granted.push(granted);
                 }
                 Err(e) => log::warn!("plugin {id} failed to spawn: {e}"),
             }
@@ -1055,11 +1163,12 @@ impl App {
         }
         self.plugins.clear();
         self.plugin_ids.clear();
+        self.plugin_granted.clear();
         self.plugin_subs.clear();
     }
 
-    /// handle one command from plugin `pidx` (Tier-1 widgets + safe verbs only;
-    /// write_pty/read_output are gated by permissions, not yet granted in v1)
+    /// handle one command from plugin `pidx`. widgets, notify, and the bus are
+    /// unprivileged; write_pty requires the granted permission (see plugin_granted)
     fn handle_plugin_cmd(&mut self, pidx: usize, cmd: plugin::PluginCmd) {
         use plugin::PluginCmd as C;
         match cmd {
@@ -1112,7 +1221,26 @@ impl App {
                     }
                 }
             }
-            C::WritePty { .. } => log::warn!("plugin write_pty denied (no permission)"),
+            // permissioned: only honor write_pty if the user granted it to this
+            // plugin; the bytes are sent to the focused pane like a paste
+            C::WritePty { data } => {
+                let allowed = self
+                    .plugin_granted
+                    .get(pidx)
+                    .map(|g| g.iter().any(|p| p == "write_pty"))
+                    .unwrap_or(false);
+                if !allowed {
+                    log::warn!("plugin {pidx} write_pty denied (permission not granted)");
+                    return;
+                }
+                if let Some(id) = self.active_focused_id() {
+                    if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+                        if let Some(p) = find_pane_mut(root, id) {
+                            p.pty.write(data.as_bytes());
+                        }
+                    }
+                }
+            }
             C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
         }
     }

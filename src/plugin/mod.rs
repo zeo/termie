@@ -8,9 +8,11 @@
 //! the install-time permission display, not by this boundary
 
 mod json;
+mod manifest;
 mod proto;
 
 pub use json::Json;
+pub use manifest::{id_is_safe, Manifest, KNOWN_PERMISSIONS};
 pub use proto::{HostEvent, PluginCmd, API_VERSION};
 
 use std::io::{BufRead, BufReader, Write};
