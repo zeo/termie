@@ -4,6 +4,7 @@
 mod color;
 mod grid;
 mod input;
+mod plugin;
 mod pty;
 mod render;
 mod term;
@@ -41,6 +42,8 @@ enum UserEvent {
     Exited { id: usize },
     /// a pool shell finished spawning on a worker thread (None = spawn failed)
     PaneReady(Option<Box<Pane>>),
+    /// a plugin process emitted a protocol message (id = plugin index)
+    Plugin { id: usize, msg: plugin::PluginMsg },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -452,6 +455,65 @@ fn each_pane(node: &Node, f: &mut impl FnMut(&Pane)) {
     }
 }
 
+/// discover enabled plugins under %APPDATA%\termie\plugins\<id>\, reading each
+/// plugin.json for its entry command. returns (id, program, args) per plugin.
+/// missing dir or malformed manifests are skipped silently — a bad plugin must
+/// never block startup. (the marketplace + enable/disable arrive in later
+/// phases; for now every installed plugin with a valid manifest is launched)
+fn discover_plugins() -> Vec<(String, String, Vec<String>)> {
+    let Some(base) = config_path().and_then(|p| p.parent().map(|d| d.join("plugins"))) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest = dir.join("plugin.json");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Some(json) = plugin::Json::parse(&text) else {
+            log::warn!("plugin manifest {} is not valid json", manifest.display());
+            continue;
+        };
+        let id = json
+            .get_str("id")
+            .map(str::to_string)
+            .or_else(|| dir.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .unwrap_or_default();
+        // entry: { "cmd": "program", "args": ["..."] } — args optional. the
+        // program is resolved relative to the plugin dir if not absolute
+        let Some(entry_obj) = json.get("entry") else {
+            log::warn!("plugin {id} manifest has no entry");
+            continue;
+        };
+        let Some(cmd) = entry_obj.get_str("cmd") else {
+            log::warn!("plugin {id} entry has no cmd");
+            continue;
+        };
+        let prog = {
+            let p = std::path::Path::new(cmd);
+            if p.is_absolute() {
+                cmd.to_string()
+            } else {
+                dir.join(cmd).to_string_lossy().into_owned()
+            }
+        };
+        let args = entry_obj
+            .get("args")
+            .and_then(plugin::Json::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        out.push((id, prog, args));
+    }
+    out
+}
+
 /// build a pane (pty + child + screen) without starting its reader thread.
 /// the slow part (process spawn) — safe to run off the main thread
 fn build_pane(
@@ -710,6 +772,10 @@ struct App {
     /// set when a paint is deferred because a pane is mid synchronized-output
     /// (DEC 2026) frame; the safety deadline forces a paint if the frame stalls
     sync_redraw_pending: Option<Instant>,
+    /// running plugin processes (out-of-process, supervised); spawned deferred
+    /// after the window is shown so disabled/no plugins cost nothing at boot
+    plugins: Vec<plugin::Plugin>,
+    plugins_started: bool,
 }
 
 impl App {
@@ -755,6 +821,8 @@ impl App {
             warm_fails: 0,
             warm_backoff_until: None,
             sync_redraw_pending: None,
+            plugins: Vec::new(),
+            plugins_started: false,
             settings_open: false,
             settings_anim: None,
             pending_warm: 0,
@@ -932,6 +1000,62 @@ impl App {
             p.pty.kill();
         }
         self.pool.clear();
+    }
+
+    /// discover + spawn enabled plugins once, after the window is shown. each
+    /// plugin is a separate process wired to the event loop via the proxy; a
+    /// plugin's stdout line arrives as UserEvent::Plugin. failures are logged and
+    /// skipped so a broken plugin can never block startup or the core
+    fn start_plugins(&mut self) {
+        for (idx, (id, program, args)) in discover_plugins().into_iter().enumerate() {
+            let proxy = self.proxy.clone();
+            match plugin::Plugin::spawn(id.clone(), &program, &args, move |msg| {
+                let _ = proxy.send_event(UserEvent::Plugin { id: idx, msg });
+            }) {
+                Ok(mut p) => {
+                    // handshake: tell the plugin our api version + granted perms
+                    p.send(&plugin::HostEvent::Hello {
+                        api_version: plugin::API_VERSION,
+                        permissions: Vec::new(),
+                    });
+                    self.plugins.push(p);
+                }
+                Err(e) => log::warn!("plugin {id} failed to spawn: {e}"),
+            }
+        }
+    }
+
+    /// broadcast a host event to every running plugin
+    fn plugins_broadcast(&mut self, ev: &plugin::HostEvent) {
+        for p in &mut self.plugins {
+            p.send(ev);
+        }
+    }
+
+    fn kill_plugins(&mut self) {
+        for p in &mut self.plugins {
+            p.kill();
+        }
+        self.plugins.clear();
+    }
+
+    /// handle one command a plugin sent us (Tier-1 widget + safe verbs only;
+    /// write_pty/read_output are gated by permissions, not yet granted in v1)
+    fn handle_plugin_cmd(&mut self, cmd: plugin::PluginCmd) {
+        use plugin::PluginCmd as C;
+        match cmd {
+            C::Ready { name, api_version } => {
+                log::info!("plugin ready: {name} (api {api_version})");
+            }
+            C::Notify { text } => {
+                log::info!("plugin notify: {text}");
+            }
+            // widget rendering (Tier 1), the bus, and permissioned verbs land in
+            // later phases; accept + ignore for now so plugins don't error out
+            C::DeclareWidget(_) | C::UpdateWidget(_) | C::Publish { .. } | C::Subscribe { .. } => {}
+            C::WritePty { .. } => log::warn!("plugin write_pty denied (no permission)"),
+            C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
+        }
     }
 
     /// push the current scrollback limit onto every live pane + the warm pool
@@ -1454,6 +1578,9 @@ impl App {
             // tab label + git track the focused pane
             self.sync_tabs();
             self.redraw();
+            if let (Some(id), false) = (hit, self.plugins.is_empty()) {
+                self.plugins_broadcast(&plugin::HostEvent::FocusChanged { pane: id as u64 });
+            }
         }
     }
 
@@ -1943,6 +2070,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut responses: Option<Vec<u8>> = None;
                 let mut found = false;
                 let mut in_sync = false;
+                let mut rang = false;
                 for tab in &mut self.tabs {
                     if let Some(root) = tab.root.as_mut() {
                         if let Some(p) = find_pane_mut(root, id) {
@@ -1954,11 +2082,16 @@ impl ApplicationHandler<UserEvent> for App {
                             if p.term.bell {
                                 p.term.bell = false;
                                 p.flash = Some(Instant::now());
+                                rang = true;
                             }
                             found = true;
                             break;
                         }
                     }
+                }
+                // let plugins react to the bell (host -> plugin event direction)
+                if rang && !self.plugins.is_empty() {
+                    self.plugins_broadcast(&plugin::HostEvent::Bell { pane: id as u64 });
                 }
                 if !found {
                     // route to a warm pool shell; first output means it's started,
@@ -2066,6 +2199,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::Plugin { id, msg } => match msg {
+                plugin::PluginMsg::Cmd(cmd) => self.handle_plugin_cmd(cmd),
+                plugin::PluginMsg::Exited => log::info!("plugin {id} exited"),
+            },
         }
     }
 
