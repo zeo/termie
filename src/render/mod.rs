@@ -1856,6 +1856,9 @@ impl Renderer {
 
         // ---- title bar (flat opaque instrument) ----
         Self::push_rect(&mut out, 0.0, 0.0, w, self.title_bar_h, INK_1, 1.0);
+        // two-tone trim under the bar: a brighter seam over a darker shadow line
+        // reads as a machined edge between chrome and content (instrument depth)
+        Self::push_rect(&mut out, 0.0, self.title_bar_h - hair * 2.0, w, hair, RULE_2, 1.0);
         Self::push_rect(&mut out, 0.0, self.title_bar_h - hair, w, hair, RULE, 1.0);
 
         // app-icon badge (the ">_<" mark) + wordmark
