@@ -86,6 +86,12 @@ pub struct Grid {
     pub region_bottom: usize,
     /// scrollback view offset (lines scrolled up from the live bottom)
     pub view_offset: usize,
+    /// total lines ever pushed into scrollback (monotonic); lets prompt marks
+    /// use stable absolute indices that survive eviction
+    total_scrolled: u64,
+    /// absolute line indices of OSC 133 prompt starts, ascending; pruned as
+    /// history is evicted
+    prompts: Vec<u64>,
 }
 
 fn blank_line(cols: usize) -> Line {
@@ -137,6 +143,8 @@ impl Grid {
             region_top: 0,
             region_bottom: rows - 1,
             view_offset: 0,
+            total_scrolled: 0,
+            prompts: Vec::new(),
         }
     }
 
@@ -399,8 +407,57 @@ impl Grid {
 
     fn push_scrollback(&mut self, line: Line) {
         self.scrollback.push_back(line);
+        self.total_scrolled += 1;
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
+        }
+        self.prune_prompts();
+    }
+
+    /// absolute index of the oldest retained line (scrollback front)
+    fn prompt_base(&self) -> u64 {
+        self.total_scrolled - self.scrollback.len() as u64
+    }
+
+    fn prune_prompts(&mut self) {
+        let base = self.prompt_base();
+        if self.prompts.first().is_some_and(|&p| p < base) {
+            self.prompts.retain(|&p| p >= base);
+        }
+    }
+
+    /// record a prompt start (OSC 133 ;A) at the current cursor row; keeps the
+    /// list strictly ascending, dropping any later marks an in-place redraw
+    /// (e.g. a screen clear) has invalidated
+    pub fn mark_prompt(&mut self) {
+        let abs = self.total_scrolled + self.cursor.row as u64;
+        while self.prompts.last().is_some_and(|&l| l >= abs) {
+            self.prompts.pop();
+        }
+        self.prompts.push(abs);
+    }
+
+    /// scroll to the next (forward) or previous prompt mark relative to the
+    /// current viewport top; returns true if the view moved
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        if self.prompts.is_empty() {
+            return false;
+        }
+        let base = self.prompt_base();
+        let total = self.total_lines() as u64;
+        let top_g = total.saturating_sub((self.rows + self.view_offset) as u64);
+        let cur_abs = base + top_g;
+        let target = if forward {
+            self.prompts.iter().copied().find(|&p| p > cur_abs)
+        } else {
+            self.prompts.iter().copied().rev().find(|&p| p < cur_abs)
+        };
+        if let Some(abs) = target {
+            let g = abs.saturating_sub(base) as usize;
+            self.scroll_to_global(g);
+            true
+        } else {
+            false
         }
     }
 
@@ -411,6 +468,7 @@ impl Grid {
         while self.scrollback.len() > n {
             self.scrollback.pop_front();
         }
+        self.prune_prompts();
         self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 

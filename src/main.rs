@@ -2636,6 +2636,23 @@ impl App {
                 self.open_find();
                 true
             }
+            // jump between shell prompts (OSC 133 marks): Ctrl+Up prev, Ctrl+Down
+            // next. when there are no marks (no shell hook) the key passes
+            // through to the app unchanged
+            Key::Named(NamedKey::ArrowUp) => {
+                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(false)).unwrap_or(false);
+                if moved {
+                    self.redraw();
+                }
+                moved
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(true)).unwrap_or(false);
+                if moved {
+                    self.redraw();
+                }
+                moved
+            }
             Key::Character(c) if !shift && c.eq_ignore_ascii_case("p") => {
                 self.palette = Some(PaletteState {
                     query: String::new(),

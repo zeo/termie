@@ -432,7 +432,14 @@ impl Perform for Terminal {
             b"133" => {
                 if let Some(m) = params.get(1) {
                     self.last_osc133 = match m.first() {
-                        Some(b'A') => Some(Osc133::PromptStart),
+                        Some(b'A') => {
+                            // record the prompt row for jump nav; skip on the alt
+                            // screen (full-screen apps aren't a command history)
+                            if !self.using_alt {
+                                self.grid.mark_prompt();
+                            }
+                            Some(Osc133::PromptStart)
+                        }
                         Some(b'B') => Some(Osc133::PromptEnd),
                         Some(b'C') => Some(Osc133::CommandStart),
                         Some(b'D') => {
