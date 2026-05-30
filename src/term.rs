@@ -366,19 +366,22 @@ impl Perform for Terminal {
                     self.responses.extend_from_slice(b"\x1b[?6c");
                 }
             }
-            'q' => {
-                // DECSCUSR cursor shape; 0 reverts to the user's configured shape
-                let n = param_at(params, 0, 1);
-                if n == 0 {
-                    self.grid.cursor.shape_set = false;
-                } else {
-                    self.grid.cursor.shape = match n {
-                        3 | 4 => CursorShape::Underline,
-                        5 | 6 => CursorShape::Bar,
-                        _ => CursorShape::Block,
-                    };
-                    self.grid.cursor.shape_set = true;
-                }
+            'q' if intermediates.first() == Some(&b' ') => {
+                // DECSCUSR (CSI Ps SP q) cursor shape. read the raw param: 0 and 1
+                // are both "blinking block" per spec, 2 steady block, 3/4
+                // underline, 5/6 bar. param_at would coerce an explicit 0 to the
+                // default and mishandle the 0 = block case, so read it directly
+                let n = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
+                self.grid.cursor.shape = match n {
+                    3 | 4 => CursorShape::Underline,
+                    5 | 6 => CursorShape::Bar,
+                    _ => CursorShape::Block,
+                };
+                self.grid.cursor.shape_set = true;
             }
             's' => self.grid.save_cursor(),
             'u' => self.grid.restore_cursor(),
@@ -483,6 +486,24 @@ mod tests {
         let mut t = Terminal::new(4, 20);
         feed(&mut t, b"\x1b[2;5H\x1b[6n");
         assert_eq!(t.responses, b"\x1b[2;5R");
+    }
+
+    #[test]
+    fn decscusr_sets_shape_and_block_on_zero() {
+        // CSI 2 SP q -> steady block; the SP (0x20) is the DECSCUSR intermediate
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[2 q");
+        assert_eq!(t.grid.cursor.shape, CursorShape::Block);
+        assert!(t.grid.cursor.shape_set);
+        // CSI 5 SP q -> bar
+        feed(&mut t, b"\x1b[5 q");
+        assert_eq!(t.grid.cursor.shape, CursorShape::Bar);
+        // CSI 0 SP q -> default, which is a block (this was dead code before)
+        feed(&mut t, b"\x1b[0 q");
+        assert_eq!(t.grid.cursor.shape, CursorShape::Block);
+        // CSI 4 SP q -> underline
+        feed(&mut t, b"\x1b[4 q");
+        assert_eq!(t.grid.cursor.shape, CursorShape::Underline);
     }
 
     #[test]
