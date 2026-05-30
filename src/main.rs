@@ -776,9 +776,15 @@ struct App {
     /// after the window is shown so disabled/no plugins cost nothing at boot
     plugins: Vec<plugin::Plugin>,
     plugins_started: bool,
+    /// manifest id per plugin, parallel to `plugins`, used as the `from` on
+    /// bus messages so subscribers know who published
+    plugin_ids: Vec<String>,
     /// declared Tier-1 widgets keyed by (plugin index, widget id) so two
     /// plugins can't clobber each other; rendered in the right-side dock
     plugin_widgets: Vec<(usize, String, render::DockWidget)>,
+    /// in-process bus subscriptions: (subscriber plugin index, topic); topic
+    /// "*" matches every published topic
+    plugin_subs: Vec<(usize, String)>,
 }
 
 impl App {
@@ -826,7 +832,9 @@ impl App {
             sync_redraw_pending: None,
             plugins: Vec::new(),
             plugins_started: false,
+            plugin_ids: Vec::new(),
             plugin_widgets: Vec::new(),
+            plugin_subs: Vec::new(),
             settings_open: false,
             settings_anim: None,
             pending_warm: 0,
@@ -1025,6 +1033,9 @@ impl App {
                         permissions: Vec::new(),
                     });
                     self.plugins.push(p);
+                    // keep ids parallel to `plugins` (only on success) so a
+                    // publisher can be named on bus messages
+                    self.plugin_ids.push(id);
                 }
                 Err(e) => log::warn!("plugin {id} failed to spawn: {e}"),
             }
@@ -1043,6 +1054,8 @@ impl App {
             p.kill();
         }
         self.plugins.clear();
+        self.plugin_ids.clear();
+        self.plugin_subs.clear();
     }
 
     /// handle one command from plugin `pidx` (Tier-1 widgets + safe verbs only;
@@ -1069,8 +1082,36 @@ impl App {
                 }
                 self.rebuild_dock();
             }
-            // the bus lands in phase 3; permissioned verbs are denied in v1
-            C::Publish { .. } | C::Subscribe { .. } => {}
+            // in-process bus: record a subscription (topic "*" = all)
+            C::Subscribe { topic } => {
+                if !self.plugin_subs.iter().any(|(p, t)| *p == pidx && *t == topic) {
+                    self.plugin_subs.push((pidx, topic));
+                }
+            }
+            // in-process bus: fan a published message out to every subscriber of
+            // this topic (or "*"), tagged with the publisher's manifest id. the
+            // publisher doesn't receive its own message
+            C::Publish { topic, body } => {
+                let from = self.plugin_ids.get(pidx).cloned().unwrap_or_default();
+                let targets: Vec<usize> = self
+                    .plugin_subs
+                    .iter()
+                    .filter(|(p, t)| *p != pidx && (t == &topic || t == "*"))
+                    .map(|(p, _)| *p)
+                    .collect();
+                if !targets.is_empty() {
+                    let ev = plugin::HostEvent::Message {
+                        from,
+                        topic,
+                        body,
+                    };
+                    for p in targets {
+                        if let Some(plugin) = self.plugins.get_mut(p) {
+                            plugin.send(&ev);
+                        }
+                    }
+                }
+            }
             C::WritePty { .. } => log::warn!("plugin write_pty denied (no permission)"),
             C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
         }
@@ -2236,9 +2277,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Plugin { id, msg } => match msg {
                 plugin::PluginMsg::Cmd(cmd) => self.handle_plugin_cmd(id, cmd),
                 plugin::PluginMsg::Exited => {
-                    // drop this plugin's widgets so a dead plugin doesn't linger
+                    // drop this plugin's widgets + bus subscriptions so a dead
+                    // plugin doesn't linger. the slot in `plugins`/`plugin_ids`
+                    // stays (indices must stay stable as bus/widget keys)
                     let before = self.plugin_widgets.len();
                     self.plugin_widgets.retain(|(p, _, _)| *p != id);
+                    self.plugin_subs.retain(|(p, _)| *p != id);
                     if self.plugin_widgets.len() != before {
                         self.rebuild_dock();
                     }

@@ -32,6 +32,7 @@ impl Widget {
         Some(Widget { id, title, lines })
     }
 
+    #[cfg(test)]
     fn to_json(&self) -> Json {
         Json::obj([
             ("id", Json::Str(self.id.clone())),
@@ -211,6 +212,21 @@ mod tests {
         let v = Json::parse(&line).unwrap();
         assert_eq!(v.get_str("t"), Some("hello"));
         assert_eq!(v.get("api_version").and_then(Json::as_f64), Some(1.0));
+    }
+
+    #[test]
+    fn message_event_carries_from_topic_body() {
+        let line = HostEvent::Message {
+            from: "chat".into(),
+            topic: "say".into(),
+            body: Json::Str("hi".into()),
+        }
+        .to_line();
+        let v = Json::parse(&line).unwrap();
+        assert_eq!(v.get_str("t"), Some("message"));
+        assert_eq!(v.get_str("from"), Some("chat"));
+        assert_eq!(v.get_str("topic"), Some("say"));
+        assert_eq!(v.get("body").and_then(Json::as_str), Some("hi"));
     }
 
     #[test]
