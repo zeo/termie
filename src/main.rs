@@ -2607,7 +2607,6 @@ impl App {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
     // stop child shells (esp. pool shells racing exit) from popping OS error dialogs
     win::suppress_child_error_dialogs();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
