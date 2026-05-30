@@ -776,6 +776,9 @@ struct App {
     /// after the window is shown so disabled/no plugins cost nothing at boot
     plugins: Vec<plugin::Plugin>,
     plugins_started: bool,
+    /// declared Tier-1 widgets keyed by (plugin index, widget id) so two
+    /// plugins can't clobber each other; rendered in the right-side dock
+    plugin_widgets: Vec<(usize, String, render::DockWidget)>,
 }
 
 impl App {
@@ -823,6 +826,7 @@ impl App {
             sync_redraw_pending: None,
             plugins: Vec::new(),
             plugins_started: false,
+            plugin_widgets: Vec::new(),
             settings_open: false,
             settings_anim: None,
             pending_warm: 0,
@@ -1000,6 +1004,8 @@ impl App {
             p.pty.kill();
         }
         self.pool.clear();
+        // shutdown chokepoint (hit on every exit path) — tear down plugins too
+        self.kill_plugins();
     }
 
     /// discover + spawn enabled plugins once, after the window is shown. each
@@ -1039,9 +1045,9 @@ impl App {
         self.plugins.clear();
     }
 
-    /// handle one command a plugin sent us (Tier-1 widget + safe verbs only;
+    /// handle one command from plugin `pidx` (Tier-1 widgets + safe verbs only;
     /// write_pty/read_output are gated by permissions, not yet granted in v1)
-    fn handle_plugin_cmd(&mut self, cmd: plugin::PluginCmd) {
+    fn handle_plugin_cmd(&mut self, pidx: usize, cmd: plugin::PluginCmd) {
         use plugin::PluginCmd as C;
         match cmd {
             C::Ready { name, api_version } => {
@@ -1050,12 +1056,40 @@ impl App {
             C::Notify { text } => {
                 log::info!("plugin notify: {text}");
             }
-            // widget rendering (Tier 1), the bus, and permissioned verbs land in
-            // later phases; accept + ignore for now so plugins don't error out
-            C::DeclareWidget(_) | C::UpdateWidget(_) | C::Publish { .. } | C::Subscribe { .. } => {}
+            // Tier-1 widgets: upsert by (plugin, id) and rebuild the dock
+            C::DeclareWidget(w) | C::UpdateWidget(w) => {
+                let dw = render::DockWidget { title: w.title, lines: w.lines };
+                match self
+                    .plugin_widgets
+                    .iter_mut()
+                    .find(|(p, id, _)| *p == pidx && *id == w.id)
+                {
+                    Some(slot) => slot.2 = dw,
+                    None => self.plugin_widgets.push((pidx, w.id, dw)),
+                }
+                self.rebuild_dock();
+            }
+            // the bus lands in phase 3; permissioned verbs are denied in v1
+            C::Publish { .. } | C::Subscribe { .. } => {}
             C::WritePty { .. } => log::warn!("plugin write_pty denied (no permission)"),
             C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
         }
+    }
+
+    /// push the current widget set into the renderer's dock; if the dock's
+    /// presence toggled it changed content_rect, so panes must relayout
+    fn rebuild_dock(&mut self) {
+        let widgets: Vec<render::DockWidget> =
+            self.plugin_widgets.iter().map(|(_, _, w)| w.clone()).collect();
+        let toggled = self
+            .renderer
+            .as_mut()
+            .map(|r| r.set_dock(widgets))
+            .unwrap_or(false);
+        if toggled {
+            self.relayout_all();
+        }
+        self.redraw();
     }
 
     /// push the current scrollback limit onto every live pane + the warm pool
@@ -2200,8 +2234,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Plugin { id, msg } => match msg {
-                plugin::PluginMsg::Cmd(cmd) => self.handle_plugin_cmd(cmd),
-                plugin::PluginMsg::Exited => log::info!("plugin {id} exited"),
+                plugin::PluginMsg::Cmd(cmd) => self.handle_plugin_cmd(id, cmd),
+                plugin::PluginMsg::Exited => {
+                    // drop this plugin's widgets so a dead plugin doesn't linger
+                    let before = self.plugin_widgets.len();
+                    self.plugin_widgets.retain(|(p, _, _)| *p != id);
+                    if self.plugin_widgets.len() != before {
+                        self.rebuild_dock();
+                    }
+                    log::info!("plugin {id} exited");
+                }
             },
         }
     }
@@ -2642,6 +2684,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(r) = self.renderer.as_mut() {
                     r.prewarm_glyphs();
                 }
+            }
+            // spawn enabled plugins once, deferred off the boot path so a window
+            // with no/disabled plugins pays nothing at startup
+            if !self.plugins_started {
+                self.plugins_started = true;
+                self.start_plugins();
             }
         }
         // first shell hasn't spawned yet after a failure: wake at the backoff

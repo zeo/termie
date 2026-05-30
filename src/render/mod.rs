@@ -128,6 +128,15 @@ pub struct PaletteView {
     pub selected: usize,
 }
 
+/// a plugin-declared Tier-1 widget to draw in the side dock. render-side mirror
+/// of the plugin protocol's Widget, so the renderer doesn't depend on the
+/// plugin module
+#[derive(Clone, Default)]
+pub struct DockWidget {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
 pub enum Hit {
     Button(Hot),
     TitleBar,
@@ -351,6 +360,9 @@ pub struct Renderer {
     status_clock: String,
     status_sessions: usize,
     palette_view: Option<PaletteView>,
+    /// plugin-declared Tier-1 widgets shown in the right-side dock; when
+    /// non-empty the dock carves width off content_rect so panes reflow
+    dock: Vec<DockWidget>,
 
     pub cols: usize,
     pub rows: usize,
@@ -705,6 +717,7 @@ impl Renderer {
             status_clock: String::new(),
             status_sessions: 1,
             palette_view: None,
+            dock: Vec::new(),
             cols: 0,
             rows: 0,
         };
@@ -744,14 +757,34 @@ impl Renderer {
         (self.cols, self.rows)
     }
 
-    /// the pixel rect available for terminal panes (between the bars)
+    /// the pixel rect available for terminal panes (between the bars). the
+    /// plugin dock, when present, carves its width off the right so panes reflow
     pub fn content_rect(&self) -> (f32, f32, f32, f32) {
         let x = self.pad;
         let y = self.title_bar_h;
-        let w = (self.config.width as f32 - self.pad * 2.0).max(1.0);
+        let w = (self.config.width as f32 - self.pad * 2.0 - self.dock_w()).max(1.0);
         let h = (self.config.height as f32 - self.title_bar_h - self.status_bar_h - self.pad)
             .max(1.0);
         (x, y, w, h)
+    }
+
+    /// width reserved for the right-side plugin dock (0 when no widgets). capped
+    /// so the dock can never crowd out the terminal on a narrow window
+    fn dock_w(&self) -> f32 {
+        if self.dock.is_empty() {
+            0.0
+        } else {
+            (224.0 * self.scale).round().min(self.config.width as f32 * 0.4)
+        }
+    }
+
+    /// replace the dock's widget list. returns true if the dock's presence
+    /// toggled (empty<->non-empty), since that changes content_rect and the
+    /// caller must relayout panes
+    pub fn set_dock(&mut self, widgets: Vec<DockWidget>) -> bool {
+        let was = !self.dock.is_empty();
+        self.dock = widgets;
+        was != !self.dock.is_empty()
     }
 
     /// inner padding inside each pane rect (keeps text off the dividers)
@@ -1789,6 +1822,11 @@ impl Renderer {
             }
         }
 
+        // ---- plugin dock (Tier-1 widgets) on the right of the content area ----
+        if !self.dock.is_empty() {
+            self.draw_dock(&mut out, track);
+        }
+
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let cw_c = self.atlas.metrics(FontId::Chrome).cell_w;
         let text_top = ((self.title_bar_h - chrome_h) / 2.0).round();
@@ -2158,6 +2196,53 @@ impl Renderer {
             let ya = g.about_start_y + i as f32 * 28.0 * s;
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, ya, k, MUTE, 1.0, wide);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx + about_dx, ya, v, TEXT_2, 1.0, track);
+        }
+    }
+
+    /// the right-side plugin dock: a flat instrument panel listing each Tier-1
+    /// widget (title in the accent color, then its text lines). drawn in the
+    /// content band, to the right of the reflowed panes
+    #[allow(non_snake_case)]
+    fn draw_dock(&mut self, out: &mut Vec<Instance>, track: f32) {
+        let s = self.scale;
+        let hair = s.max(1.0);
+        let dock_w = self.dock_w();
+        let (cx, cy, cw, ch) = self.content_rect();
+        // the dock sits just right of the content rect, filling the carved band
+        let dx = (cx + cw).round();
+        let dw = (dock_w - self.pad).max(1.0);
+        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+
+        let INK_1 = self.palette.ink1;
+        let RULE = self.palette.rule;
+        let TEXT_2 = self.palette.text2;
+        let PAPER = self.palette.paper;
+
+        // panel ground + a left hairline that reads as the seam to the terminal
+        Self::push_rect(out, dx, cy, dw, ch, INK_1, 1.0);
+        Self::push_rect(out, dx, cy, hair, ch, RULE, 1.0);
+
+        let pad = (12.0 * s).round();
+        let row = (chrome_h + 6.0 * s).round();
+        let mut y = cy + pad;
+        // snapshot widget data so the atlas can be borrowed mutably while drawing
+        let widgets: Vec<(String, Vec<String>)> =
+            self.dock.iter().map(|w| (w.title.clone(), w.lines.clone())).collect();
+        for (i, (title, lines)) in widgets.iter().enumerate() {
+            if i > 0 {
+                let ry = (y - pad * 0.5).round();
+                Self::push_rect(out, dx + pad, ry, dw - pad * 2.0, hair, RULE, 1.0);
+            }
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, dx + pad, y.round(), title, PAPER, 1.0, track);
+            y += row;
+            for line in lines {
+                if y > cy + ch - row {
+                    break; // clip to dock height; no scroll in v1
+                }
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, dx + pad, y.round(), line, TEXT_2, 1.0, track);
+                y += row;
+            }
+            y += pad * 0.5;
         }
     }
 

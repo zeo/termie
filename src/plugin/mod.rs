@@ -23,9 +23,10 @@ pub enum PluginMsg {
     Exited,
 }
 
-/// a running plugin process. dropping or calling kill() stops it
+/// a running plugin process. dropping or calling kill() stops it. the App
+/// tracks plugins by their Vec index, so no id is stored here; `id` is only
+/// used to label this plugin's log lines from the reader thread
 pub struct Plugin {
-    pub id: String,
     child: Child,
     writer: Option<Box<dyn Write + Send>>,
 }
@@ -52,10 +53,9 @@ impl Plugin {
         let writer = child.stdin.take().map(|w| Box::new(w) as Box<dyn Write + Send>);
 
         // reader thread: parse each line, forward to the event loop. a line that
-        // isn't valid json is dropped (logged) rather than killing the plugin
-        let log_id = id.clone();
+        // isn't valid json is dropped (logged, labeled by id) rather than
+        // killing the plugin
         thread::spawn(move || {
-            let id = log_id;
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             loop {
@@ -82,7 +82,7 @@ impl Plugin {
             }
         });
 
-        Ok(Plugin { id, child, writer })
+        Ok(Plugin { child, writer })
     }
 
     /// send a host event to the plugin (newline-delimited). best-effort: a write

@@ -1,0 +1,8 @@
+{
+  "id": "tamagotchi",
+  "name": "Tamagotchi",
+  "version": "0.1.0",
+  "api_version": 1,
+  "entry": { "cmd": "tamagotchi.exe", "args": [] },
+  "permissions": []
+}
