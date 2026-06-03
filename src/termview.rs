@@ -468,6 +468,15 @@ mod golden {
                 bytes: b"hello world\x1b[1;1H\x1b[6P\x1b[2;1Habcdefg\x1b[2;1H\x1b[3@",
                 resize: None,
             },
+            // scroll region (DECSTBM): rows 2-5 scroll, rows 1 and 6 are frozen.
+            // a linefeed at the bottom of the region scrolls only the region
+            Case {
+                name: "scroll_region",
+                rows: 6,
+                cols: 8,
+                bytes: b"r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\x1b[2;5r\x1b[5;1H\nNEW",
+                resize: None,
+            },
         ]
     }
 

@@ -1,0 +1,16 @@
+== termview ==
+fed 38 bytes: "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\u{1b}[2;5r\u{1b}[5;1H\nNEW"
+size 6x8  cursor (r4, c3) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0       
+    01234567
+   +--------+
+  0|r1      |
+  1|r3      |
+  2|r4      |
+  3|r5      |
+  4|NEW     | <-- cursor row
+  5|r6      |
+   +--------+
+styles: (all default)
