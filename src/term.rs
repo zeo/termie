@@ -823,4 +823,27 @@ mod tests {
             b"\x1b]11;rgb:1414/1414/1414\x1b\\"
         );
     }
+
+    #[test]
+    fn pathological_input_does_not_panic() {
+        let mut t = Terminal::new(24, 80);
+        let inputs: &[&[u8]] = &[
+            b"\x1b[999999999;999999999H",
+            b"\x1b[999999999X\x1b[999999999@\x1b[999999999P",
+            b"\x1b[999999999S\x1b[999999999T\x1b[999999999L\x1b[999999999M",
+            b"\x1b[999999999;999999999r",
+            b"\x1b]0;\x1b\\\x1b]8;;\x1b\\\x1b]52;c;@@@@\x1b\\\x1b]4;99999;?\x1b\\",
+            b"\x1b[?99999h\x1b[?99999l\x1b[38;2;999;999;999m",
+            b"\xff\xfe\x00\x01\x02 junk \x1b[ \x1b] partial",
+            b"\x1b[>999999u\x1b[=999999;999999u\x1b[<999999u",
+        ];
+        for chunk in inputs {
+            feed(&mut t, chunk);
+        }
+        // a flood of wide chars, combining marks, tabs, and newlines
+        let flood: Vec<u8> = (0..3000).flat_map(|_| "\u{1f680}a\u{0301}\r\n\t".bytes()).collect();
+        feed(&mut t, &flood);
+        // reaching here without panicking is the assertion
+        assert_eq!(t.grid.cols, 80);
+    }
 }

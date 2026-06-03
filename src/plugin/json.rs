@@ -68,7 +68,7 @@ impl Json {
         let bytes = input.as_bytes();
         let mut p = Parser { b: bytes, i: 0 };
         p.skip_ws();
-        let v = p.value()?;
+        let v = p.value(0)?;
         p.skip_ws();
         // trailing garbage is a parse failure
         if p.i != bytes.len() {
@@ -143,6 +143,10 @@ fn write_escaped(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// max json nesting depth accepted by the parser; bounds stack recursion so a
+/// hostile or buggy plugin can't overflow the stack with `[[[[...`
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
@@ -155,11 +159,14 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self) -> Option<Json> {
+    fn value(&mut self, depth: usize) -> Option<Json> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         self.skip_ws();
         match self.b.get(self.i)? {
-            b'{' => self.object(),
-            b'[' => self.array(),
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
             b'"' => self.string().map(Json::Str),
             b't' | b'f' => self.boolean(),
             b'n' => self.null(),
@@ -167,7 +174,7 @@ impl Parser<'_> {
         }
     }
 
-    fn object(&mut self) -> Option<Json> {
+    fn object(&mut self, depth: usize) -> Option<Json> {
         self.i += 1; // {
         let mut m = BTreeMap::new();
         self.skip_ws();
@@ -186,7 +193,7 @@ impl Parser<'_> {
                 return None;
             }
             self.i += 1;
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             m.insert(key, val);
             self.skip_ws();
             match self.b.get(self.i)? {
@@ -202,7 +209,7 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self) -> Option<Json> {
+    fn array(&mut self, depth: usize) -> Option<Json> {
         self.i += 1; // [
         let mut a = Vec::new();
         self.skip_ws();
@@ -211,7 +218,7 @@ impl Parser<'_> {
             return Some(Json::Arr(a));
         }
         loop {
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             a.push(val);
             self.skip_ws();
             match self.b.get(self.i)? {
@@ -401,5 +408,17 @@ mod tests {
         assert_eq!(Json::parse("{}").unwrap(), Json::Obj(BTreeMap::new()));
         assert_eq!(Json::parse("[]").unwrap(), Json::Arr(vec![]));
         assert_eq!(Json::parse("  [ ]  ").unwrap(), Json::Arr(vec![]));
+    }
+
+    #[test]
+    fn deep_nesting_rejected_not_overflowed() {
+        // thousands of open brackets must return None (depth bound), not overflow
+        assert!(Json::parse(&"[".repeat(10_000)).is_none());
+        // a complete nest just past the limit also fails cleanly
+        let over = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        assert!(Json::parse(&over).is_none());
+        // a modest nest still parses
+        let ok = format!("{}1{}", "[".repeat(10), "]".repeat(10));
+        assert!(Json::parse(&ok).is_some());
     }
 }
