@@ -15,9 +15,11 @@ termie is a from-scratch terminal emulator + multiplexer written in Rust. It ren
 - **GPU-rendered, lightweight.** wgpu glyph-atlas rendering, an instrument-panel aesthetic, a ~7.6 MB stripped release binary, and a lean dependency tree.
 - **Fast to open shells.** A pre-warmed shell pool keeps a started PowerShell ready so new tabs/splits feel instant; the window appears before any shell finishes spawning.
 - **Tabs + recursive split panes.** Split vertically/horizontally, drag dividers, swap panes, and broadcast input to every pane in a tab (cockpit mode).
+- **Built for many repos.** Splits and a "new tab here" command open in the focused pane's directory; per-tab shell choice (`pwsh` / `cmd` / `wsl`) from the palette; drag a file in to type its path; right-click to copy the selection or paste.
 - **Command palette.** `Ctrl+Shift+P` for fuzzy access to every action.
+- **Faithful keyboard + modern escapes.** The kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs, plus accurate modified-key reporting), OSC 8 clickable hyperlinks, OSC 52 clipboard writes, OSC 4/10/11/12 color queries, and curly/double/dotted underline styles, strikethrough, and blink.
 - **Real terminal emulation.** [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting (SGR + legacy), bracketed paste, OSC-7 cwd (tab labels + window title), URL detection (Ctrl-click to open), DECSCUSR cursor shapes, and DEC 2026 synchronized output for tear-free frames.
-- **Themes + fonts.** Three built-in themes (Instrument / Koi / Paper), bundled Maple Mono Nerd Font, lazy system-font discovery, adjustable font size, padding, cursor shape/blink, and window opacity — all in an in-app settings panel.
+- **Themes, fonts, and customization.** Three built-in themes (Instrument / Koi / Paper), bundled Maple Mono Nerd Font, lazy system-font discovery, adjustable font size, padding, cursor shape/blink, and window opacity in an in-app settings panel — plus per-user color overrides (`colors.conf`) and rebindable keys (`keybindings.conf`).
 - **Plugin system + in-app marketplace.** Extend termie without bloating the core: plugins run as separate OS processes over a small JSON protocol, so they can be written in any language and can't slow startup or crash the app. See [docs/plugin-system-plan.md](docs/plugin-system-plan.md) and [plugins/README.md](plugins/README.md).
 
 ## Install
@@ -61,7 +63,14 @@ Open the command palette (`Ctrl+Shift+P`) for settings, theme cycling, pane mode
 
 ## Shells
 
-Auto-detects and prefers `pwsh` → `powershell` → `cmd`; the shell is selectable in settings. PowerShell launches with `-NoLogo -NoProfile` (profile loading is opt-in) and telemetry/update-check disabled for a fast prompt.
+Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with **WSL** also selectable; the default shell is set in settings, and the palette's "new tab: pwsh / cmd / wsl" opens a one-off tab in any shell. PowerShell launches with `-NoLogo -NoProfile` (profile loading is opt-in) and telemetry/update-check disabled for a fast prompt.
+
+## Customization
+
+Drop files in `%APPDATA%\termie\`:
+
+- **`colors.conf`** — override theme colors, one `key=color` per line. Keys include `fg`, `bg`, `cursor`, `sel`, and `ansi0`..`ansi255`; colors are `#rrggbb`, `#rgb`, or `r,g,b`. Overrides apply on top of the selected built-in theme.
+- **`keybindings.conf`** — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`. Action names match the command-palette entries; bindings take precedence over the built-in defaults.
 
 ## Plugins
 
@@ -91,6 +100,10 @@ src/
   color.rs        themes + sRGB conversion
 plugins/          first-party reference plugins (independent crates)
 ```
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Bundled fonts and other third-party material are covered by their own licenses — see [THIRDPARTY.md](THIRDPARTY.md).
 
 ## Built with
 
