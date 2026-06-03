@@ -99,6 +99,7 @@ struct Sel {
 enum PaletteAction {
     NewTab,
     NewTabHere,
+    NewShell(ShellKind),
     SplitV,
     SplitH,
     NextTab,
@@ -114,6 +115,9 @@ enum PaletteAction {
 const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("new tab", PaletteAction::NewTab),
     ("new tab here", PaletteAction::NewTabHere),
+    ("new tab: pwsh", PaletteAction::NewShell(ShellKind::Pwsh)),
+    ("new tab: cmd", PaletteAction::NewShell(ShellKind::Cmd)),
+    ("new tab: wsl", PaletteAction::NewShell(ShellKind::Wsl)),
     ("split vertical", PaletteAction::SplitV),
     ("split horizontal", PaletteAction::SplitH),
     ("next tab", PaletteAction::NextTab),
@@ -1053,14 +1057,15 @@ impl App {
     }
 
     /// build a pane synchronously and start its reader (boot + split fallback)
-    fn spawn_pane(&mut self, cols: usize, rows: usize, cwd: Option<String>) -> Result<Pane> {
+    fn spawn_pane(&mut self, cols: usize, rows: usize, cwd: Option<String>, shell: Option<ShellKind>) -> Result<Pane> {
         let id = self.next_id;
         self.next_id += 1;
+        let shell = shell.unwrap_or(self.config.shell);
         let mut pane = build_pane(
             id,
             cols,
             rows,
-            self.config.shell,
+            shell,
             self.config.load_profile,
             self.config.scrollback,
             cwd.as_deref(),
@@ -1703,17 +1708,18 @@ impl App {
     }
 
     fn new_tab(&mut self) {
-        self.new_tab_cwd(None);
+        self.new_tab_cwd(None, None);
     }
 
-    /// open a new tab; Some(cwd) opens a fresh shell there (a "new tab here"),
-    /// None grabs a warm pool shell for an instant home-dir tab
-    fn new_tab_cwd(&mut self, cwd: Option<String>) {
+    /// open a new tab; a Some(cwd) or Some(shell) spawns a fresh shell, while
+    /// None/None grabs a warm pool shell for an instant default-shell home tab
+    fn new_tab_cwd(&mut self, cwd: Option<String>, shell: Option<ShellKind>) {
         if self.renderer.is_none() {
             return;
         }
         let (cols, rows) = self.content_pane_size();
         let pane = if cwd.is_none()
+            && shell.is_none()
             && let Some(i) = self
                 .pool
                 .iter()
@@ -1721,7 +1727,7 @@ impl App {
         {
             Ok(self.pool.remove(i))
         } else {
-            self.spawn_pane(cols, rows, cwd)
+            self.spawn_pane(cols, rows, cwd, shell)
         };
         if let Ok(pane) = pane {
             let fid = pane.id;
@@ -1795,7 +1801,11 @@ impl App {
             PaletteAction::NewTab => self.new_tab(),
             PaletteAction::NewTabHere => {
                 let cwd = self.focused_cwd();
-                self.new_tab_cwd(cwd);
+                self.new_tab_cwd(cwd, None);
+            }
+            PaletteAction::NewShell(s) => {
+                let cwd = self.focused_cwd();
+                self.new_tab_cwd(cwd, Some(s));
             }
             PaletteAction::SplitV => self.split_focused(Dir::Vertical),
             PaletteAction::SplitH => self.split_focused(Dir::Horizontal),
@@ -2131,7 +2141,7 @@ impl App {
                 }
                 _ => self.content_pane_size(),
             };
-            let Ok(p) = self.spawn_pane(cols, rows, cwd) else {
+            let Ok(p) = self.spawn_pane(cols, rows, cwd, None) else {
                 return;
             };
             p
