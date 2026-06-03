@@ -1397,6 +1397,30 @@ impl Renderer {
 
         let w = self.config.width as f32;
         let h = self.config.height as f32;
+
+        // chrome buttons sit flush against the top/corner resize border, so they
+        // must win over it — otherwise clicking the top-right X (or the top edge
+        // of any control) grabs a resize handle instead of closing the window
+        if y < self.title_bar_h {
+            for (c, x0, x1) in self.control_rects() {
+                if x >= x0 && x < x1 {
+                    return Hit::Button(c);
+                }
+            }
+            let tl = self.tab_layout();
+            if in_rect(x, y, tl.newtab) {
+                return Hit::Button(Hot::NewTab);
+            }
+            for (i, rect, close) in &tl.tabs {
+                if in_rect(x, y, *close) {
+                    return Hit::Button(Hot::TabClose(*i));
+                }
+                if in_rect(x, y, *rect) {
+                    return Hit::Button(Hot::Tab(*i));
+                }
+            }
+        }
+
         let e = (6.0 * self.scale).max(4.0);
         let left = x <= e;
         let right = x >= w - e;
@@ -1418,23 +1442,6 @@ impl Renderer {
         }
 
         if y < self.title_bar_h {
-            for (c, x0, x1) in self.control_rects() {
-                if x >= x0 && x < x1 {
-                    return Hit::Button(c);
-                }
-            }
-            let tl = self.tab_layout();
-            if in_rect(x, y, tl.newtab) {
-                return Hit::Button(Hot::NewTab);
-            }
-            for (i, rect, close) in &tl.tabs {
-                if in_rect(x, y, *close) {
-                    return Hit::Button(Hot::TabClose(*i));
-                }
-                if in_rect(x, y, *rect) {
-                    return Hit::Button(Hot::Tab(*i));
-                }
-            }
             return Hit::TitleBar;
         }
         Hit::Content
