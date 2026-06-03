@@ -2225,11 +2225,18 @@ impl Renderer {
                 // ease-out sweep across the title-bar rule: a faint trail behind
                 // a bright leading segment, the whole thing fading as it lands
                 let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                let seg = (96.0 * self.scale).min(w * ease);
                 let y = self.title_bar_h - hair * 2.0;
                 let head = w * ease;
                 Self::push_rect(&mut out, 0.0, y, head, hair * 2.0, PAPER, 0.12 * (1.0 - t));
-                let seg = (96.0 * self.scale).min(head);
                 Self::push_rect(&mut out, head - seg, y, seg, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
+                // mirror on the status-bar rule, sweeping the other way, so the
+                // instrument powers on from both rails toward the centre
+                let yb = h - self.status_bar_h;
+                let headx = w * (1.0 - ease);
+                Self::push_rect(&mut out, headx, yb, w - headx, hair * 2.0, PAPER, 0.12 * (1.0 - t));
+                let segb = (96.0 * self.scale).min(w - headx);
+                Self::push_rect(&mut out, headx, yb, segb, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
             }
         }
 
