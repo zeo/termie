@@ -87,6 +87,23 @@ cargo build --release  # optimized, ~7.6 MB
 
 CI (GitHub Actions) runs build + tests, clippy, a `cargo-audit` security scan, and builds the bundled example plugins on every push.
 
+### Headless rendering harness
+
+Terminal and rendering changes are verifiable without opening a window — they run through the real parser, grid, and glyph atlas:
+
+```powershell
+cargo run -- --termview --scenario sgr      # dump the grid + state as text
+cargo run -- --termview --seq "\e[31mhi"    # feed an escape sequence (also --file, --resize COLSxROWS)
+cargo run -- --termview --scenario wrap --png out.png   # render the same scene to an image
+```
+
+`cargo test golden` checks a set of fixed scenarios (SGR, diff bars, soft-wrap, reflow grow/shrink, background-color erase, kitty queries, OSC, cursor moves, underline styles) against checked-in snapshots in [`tests/golden/`](tests/golden). A terminal or rendering change shows up as a diff in the failing test. After an **intended** change, re-bless the snapshots and review the diff before committing:
+
+```powershell
+$env:BLESS=1; cargo test golden; $env:BLESS=$null
+git diff tests/golden    # read exactly what changed
+```
+
 ### Layout
 
 ```

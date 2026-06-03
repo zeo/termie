@@ -1,0 +1,16 @@
+== termview ==
+fed 31 bytes: "\u{1b}[44mfilled\u{1b}[K\r\nsecond\u{1b}[42m\u{1b}[2K"
+size 4x20  cursor (r1, c6) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         
+    01234567890123456789
+   +--------------------+
+  0|filled              |
+  1|                    | <-- cursor row
+  2|                    |
+  3|                    |
+   +--------------------+
+styles:
+  r0 c0-19: fg=def bg=idx4 attrs=-
+  r1 c0-19: fg=def bg=idx2 attrs=-

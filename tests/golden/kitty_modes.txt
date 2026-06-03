@@ -1,0 +1,14 @@
+== termview ==
+fed 9 bytes: "\u{1b}[>1u\u{1b}[?u"
+size 3x16  cursor (r0, c0) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=1  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+responses: 1b 5b 3f 31 75  ("\u{1b}[?1u")
+    0         1     
+    0123456789012345
+   +----------------+
+  0|                | <-- cursor row
+  1|                |
+  2|                |
+   +----------------+
+styles: (all default)

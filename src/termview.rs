@@ -341,3 +341,158 @@ fn attrs(a: Attrs) -> String {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
 }
+
+// golden-snapshot suite: render fixed scenarios through the real parser/grid
+// and compare the dump to a checked-in text snapshot. this is how a terminal or
+// rendering change can be reviewed headlessly — a regression shows up as a diff
+// in the snapshot. run `BLESS=1 cargo test golden` to (re)write the snapshots
+// after an intended change, then read the diff before committing
+#[cfg(test)]
+mod golden {
+    use super::dump;
+    use crate::term::Terminal;
+    use vte::Parser;
+
+    struct Case {
+        name: &'static str,
+        rows: usize,
+        cols: usize,
+        bytes: &'static [u8],
+        // (rows, cols) applied after feeding, to exercise reflow
+        resize: Option<(usize, usize)>,
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "sgr_styles",
+                rows: 4,
+                cols: 40,
+                bytes: b"\x1b[1;31mred-bold\x1b[0m \x1b[4munder\x1b[0m \x1b[9mstrike\x1b[0m \x1b[5mblink\x1b[0m \x1b[38;2;0;200;100mtruecol\x1b[0m",
+                resize: None,
+            },
+            // a TUI-style diff: bg-colored added/removed lines filled to the
+            // edge with EL, plus a line that wraps — locks the diff-bar rendering
+            // that the transposed-pty bug made look broken
+            Case {
+                name: "diff_bars",
+                rows: 8,
+                cols: 40,
+                bytes: b"\x1b[48;2;30;70;40m+ added line of code\x1b[K\x1b[0m\r\n\x1b[48;2;90;30;30m- removed line here\x1b[K\x1b[0m\r\n\x1b[48;2;30;70;40m+ a very long added line that exceeds the forty column width\x1b[K\x1b[0m\r\nplain context line\r\n",
+                resize: None,
+            },
+            Case {
+                name: "soft_wrap",
+                rows: 5,
+                cols: 20,
+                bytes: b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN",
+                resize: None,
+            },
+            Case {
+                name: "reflow_grow",
+                rows: 5,
+                cols: 20,
+                bytes: b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN",
+                resize: Some((5, 40)),
+            },
+            Case {
+                name: "reflow_shrink",
+                rows: 5,
+                cols: 40,
+                bytes: b"012345678901234567890123456789",
+                resize: Some((5, 20)),
+            },
+            // background-color erase: EL/ED must fill with the active bg
+            Case {
+                name: "erase_bce",
+                rows: 4,
+                cols: 20,
+                bytes: b"\x1b[44mfilled\x1b[K\r\nsecond\x1b[42m\x1b[2K",
+                resize: None,
+            },
+            Case {
+                name: "kitty_modes",
+                rows: 3,
+                cols: 16,
+                bytes: b"\x1b[>1u\x1b[?u",
+                resize: None,
+            },
+            Case {
+                name: "osc_title_cwd",
+                rows: 3,
+                cols: 30,
+                bytes: b"\x1b]0;My Title\x1b\\\x1b]7;file:///C:/dev/proj\x1b\\hello",
+                resize: None,
+            },
+            Case {
+                name: "cursor_cup_el",
+                rows: 5,
+                cols: 20,
+                bytes: b"line1\r\nline2\r\nline3\x1b[2;1H\x1b[Kreplaced",
+                resize: None,
+            },
+            Case {
+                name: "underline_variants",
+                rows: 3,
+                cols: 40,
+                bytes: b"\x1b[4:3mcurly\x1b[0m \x1b[4:2mdouble\x1b[0m \x1b[4:4mdotted\x1b[0m",
+                resize: None,
+            },
+        ]
+    }
+
+    fn render(c: &Case) -> String {
+        let mut term = Terminal::new(c.rows, c.cols);
+        let mut parser = Parser::new();
+        parser.advance(&mut term, c.bytes);
+        if let Some((rows, cols)) = c.resize {
+            term.resize(rows, cols);
+        }
+        dump(&term, c.bytes)
+    }
+
+    fn golden_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    }
+
+    #[test]
+    fn golden_snapshots() {
+        let dir = golden_dir();
+        let bless = std::env::var_os("BLESS").is_some();
+        if bless {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        let mut mismatches = Vec::new();
+        for c in cases() {
+            let got = render(&c);
+            let path = dir.join(format!("{}.txt", c.name));
+            if bless {
+                std::fs::write(&path, got).unwrap();
+                continue;
+            }
+            let want = std::fs::read_to_string(&path).unwrap_or_default();
+            if want != got {
+                mismatches.push((c.name, want, got));
+            }
+        }
+        if bless {
+            return;
+        }
+        for (name, want, got) in &mismatches {
+            eprintln!("\n=== golden mismatch: {name} ===");
+            let (wl, gl): (Vec<&str>, Vec<&str>) = (want.lines().collect(), got.lines().collect());
+            for i in 0..wl.len().max(gl.len()) {
+                let (w, g) = (wl.get(i).copied().unwrap_or(""), gl.get(i).copied().unwrap_or(""));
+                if w != g {
+                    eprintln!("  -{w}");
+                    eprintln!("  +{g}");
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} golden snapshot mismatch(es); re-run with BLESS=1 after verifying the change is intended",
+            mismatches.len()
+        );
+    }
+}

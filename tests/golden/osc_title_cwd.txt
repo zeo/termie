@@ -1,0 +1,13 @@
+== termview ==
+fed 44 bytes: "\u{1b}]0;My Title\u{1b}\\\u{1b}]7;file:///C:/dev/proj\u{1b}\\hello"
+size 3x30  cursor (r0, c5) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title="My Title"  cwd=Some("file:///C:/dev/proj")  scrollback=0 lines  view_offset=0
+    0         1         2         
+    012345678901234567890123456789
+   +------------------------------+
+  0|hello                         | <-- cursor row
+  1|                              |
+  2|                              |
+   +------------------------------+
+styles: (all default)

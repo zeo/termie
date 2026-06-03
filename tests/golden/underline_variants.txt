@@ -1,0 +1,16 @@
+== termview ==
+fed 49 bytes: "\u{1b}[4:3mcurly\u{1b}[0m \u{1b}[4:2mdouble\u{1b}[0m \u{1b}[4:4mdotted\u{1b}[0m"
+size 3x40  cursor (r0, c19) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         2         3         
+    0123456789012345678901234567890123456789
+   +----------------------------------------+
+  0|curly double dotted                     | <-- cursor row
+  1|                                        |
+  2|                                        |
+   +----------------------------------------+
+styles:
+  r0 c0-4: fg=def bg=defbg attrs=~
+  r0 c6-11: fg=def bg=defbg attrs=2
+  r0 c13-18: fg=def bg=defbg attrs=.

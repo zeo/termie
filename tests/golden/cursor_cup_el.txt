@@ -1,0 +1,15 @@
+== termview ==
+fed 36 bytes: "line1\r\nline2\r\nline3\u{1b}[2;1H\u{1b}[Kreplaced"
+size 5x20  cursor (r1, c8) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         
+    01234567890123456789
+   +--------------------+
+  0|line1               |
+  1|replaced            | <-- cursor row
+  2|line3               |
+  3|                    |
+  4|                    |
+   +--------------------+
+styles: (all default)

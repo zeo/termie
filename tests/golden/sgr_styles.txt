@@ -1,0 +1,19 @@
+== termview ==
+fed 91 bytes: "\u{1b}[1;31mred-bold\u{1b}[0m \u{1b}[4munder\u{1b}[0m \u{1b}[9mstrike\u{1b}[0m \u{1b}[5mblink\u{1b}[0m \u{1b}[38;2;0;200;100mtruecol\u{1b}[0m"
+size 4x40  cursor (r0, c35) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         2         3         
+    0123456789012345678901234567890123456789
+   +----------------------------------------+
+  0|red-bold under strike blink truecol     | <-- cursor row
+  1|                                        |
+  2|                                        |
+  3|                                        |
+   +----------------------------------------+
+styles:
+  r0 c0-7: fg=idx1 bg=defbg attrs=b
+  r0 c9-13: fg=def bg=defbg attrs=u
+  r0 c15-20: fg=def bg=defbg attrs=s
+  r0 c22-26: fg=def bg=defbg attrs=*
+  r0 c28-34: fg=#00c864 bg=defbg attrs=-

@@ -1,0 +1,22 @@
+== termview ==
+fed 194 bytes: "\u{1b}[48;2;30;70;40m+ added line of code\u{1b}[K\u{1b}[0m\r\n\u{1b}[48;2;90;30;30m- removed line here\u{1b}[K\u{1b}[0m\r\n\u{1b}[48;2;30;70;40m+ a very long added line that exceeds the forty column width\u{1b}[K\u{1b}[0m\r\nplain context line\r\n"
+size 8x40  cursor (r5, c0) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         2         3         
+    0123456789012345678901234567890123456789
+   +----------------------------------------+
+  0|+ added line of code                    |
+  1|- removed line here                     |
+  2|+ a very long added line that exceeds th|
+  3|e forty column width                    |
+  4|plain context line                      |
+  5|                                        | <-- cursor row
+  6|                                        |
+  7|                                        |
+   +----------------------------------------+
+styles:
+  r0 c0-39: fg=def bg=#1e4628 attrs=-
+  r1 c0-39: fg=def bg=#5a1e1e attrs=-
+  r2 c0-39: fg=def bg=#1e4628 attrs=-
+  r3 c0-39: fg=def bg=#1e4628 attrs=-

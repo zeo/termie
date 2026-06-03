@@ -1,0 +1,15 @@
+== termview ==
+fed 50 bytes: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN"
+size 5x20  cursor (r2, c10) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         
+    01234567890123456789
+   +--------------------+
+  0|abcdefghijklmnopqrst|
+  1|uvwxyz0123456789ABCD|
+  2|EFGHIJKLMN          | <-- cursor row
+  3|                    |
+  4|                    |
+   +--------------------+
+styles: (all default)
