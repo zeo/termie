@@ -485,3 +485,42 @@ fn to_alpha(data: &[u8], w: usize, h: usize, content: SwashContent) -> Vec<u8> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // on a machine with a color emoji font (Windows ships Segoe UI Emoji) a
+    // color glyph must route to the RGBA atlas with non-zero pixels and leave
+    // the alpha-atlas slot empty. where no emoji font exists (e.g. CI) the
+    // glyph isn't color and there is nothing to assert — the test still passes
+    #[test]
+    fn color_emoji_routes_to_rgba_atlas() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None);
+        atlas.load_system_fonts();
+        let Some(g) = atlas.get(GlyphKey {
+            font: FontId::Content,
+            c: '\u{1F680}', // rocket
+            bold: false,
+            italic: false,
+        }) else {
+            return;
+        };
+        if !g.color {
+            return; // no color emoji font on this machine
+        }
+        let dim = atlas.dim as usize;
+        let ax = (g.uv_min[0] * atlas.dim as f32).round() as usize;
+        let ay = (g.uv_min[1] * atlas.dim as f32).round() as usize;
+        let (mut color_alpha, mut alpha_cov) = (0u32, 0u32);
+        for gy in 0..g.height as usize {
+            for gx in 0..g.width as usize {
+                let p = (ay + gy) * dim + ax + gx;
+                color_alpha += atlas.color_data[p * 4 + 3] as u32;
+                alpha_cov += atlas.data[p] as u32;
+            }
+        }
+        assert!(color_alpha > 0, "color glyph must have non-zero rgba in the color atlas");
+        assert_eq!(alpha_cov, 0, "color glyph must not also be stored in the alpha atlas");
+    }
+}
