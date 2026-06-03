@@ -127,6 +127,10 @@ impl Palette {
         }
     }
 
+    pub fn ansi_color(&self, i: u8) -> Rgb {
+        self.ansi[i as usize]
+    }
+
     fn instrument() -> Self {
         // restrained "instrument panel" signal colors on a hard greyscale ground:
         // clay / sage / brass / steel / mauve / teal, paired normal→bright

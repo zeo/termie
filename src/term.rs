@@ -1,6 +1,6 @@
 use vte::{Params, Perform};
 
-use crate::color::Color;
+use crate::color::{Color, Palette};
 use crate::grid::{CursorShape, Grid, UnderlineStyle};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,6 +21,31 @@ pub enum MouseProto {
     Button,
     /// 1003: any motion
     Any,
+}
+
+/// a pending color query (OSC 4/10/11/12); the app layer answers from the palette
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorReq {
+    Fg,
+    Bg,
+    Cursor,
+    Ansi(u8),
+}
+
+/// format the OSC reply to a color query as rgb:RRRR/GGGG/BBBB (8-bit values
+/// doubled to 16-bit per xterm), terminated with ST
+pub fn format_color_reply(req: ColorReq, pal: &Palette) -> Vec<u8> {
+    let (code, c) = match req {
+        ColorReq::Fg => ("10".to_string(), pal.fg),
+        ColorReq::Bg => ("11".to_string(), pal.bg),
+        ColorReq::Cursor => ("12".to_string(), pal.cursor),
+        ColorReq::Ansi(n) => (format!("4;{n}"), pal.ansi_color(n)),
+    };
+    format!(
+        "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+        code, c.r, c.r, c.g, c.g, c.b, c.b
+    )
+    .into_bytes()
 }
 
 /// kitty keyboard protocol flags termie honors: disambiguate (1) + report
@@ -57,6 +82,8 @@ pub struct Terminal {
     kbd_stack: Vec<u8>,
     /// pending OSC 52 clipboard write, drained by the app to the OS clipboard
     pub clipboard: Option<String>,
+    /// pending OSC 4/10/11/12 color queries, answered by the app from the palette
+    pub color_queries: Vec<ColorReq>,
 }
 
 impl Terminal {
@@ -79,6 +106,7 @@ impl Terminal {
             sync_output: false,
             kbd_stack: vec![0],
             clipboard: None,
+            color_queries: Vec::new(),
         }
     }
 
@@ -566,6 +594,32 @@ impl Perform for Terminal {
                     self.clipboard = Some(String::from_utf8_lossy(&bytes).into_owned());
                 }
             }
+            b"10" | b"11" | b"12" => {
+                // OSC 10/11/12 ; ?  — query the default fg / bg / cursor color
+                if let Some(p) = params.get(1)
+                    && p.len() == 1
+                    && p[0] == b'?'
+                {
+                    self.color_queries.push(match kind {
+                        b"10" => ColorReq::Fg,
+                        b"11" => ColorReq::Bg,
+                        _ => ColorReq::Cursor,
+                    });
+                }
+            }
+            b"4" => {
+                // OSC 4 ; n ; ?  — query palette color n
+                if let Some(q) = params.get(2)
+                    && q.len() == 1
+                    && q[0] == b'?'
+                    && let Some(n) = params
+                        .get(1)
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(|s| s.parse::<u8>().ok())
+                {
+                    self.color_queries.push(ColorReq::Ansi(n));
+                }
+            }
             b"133" => {
                 if let Some(m) = params.get(1) {
                     self.last_osc133 = match m.first() {
@@ -753,5 +807,20 @@ mod tests {
         t.clipboard = None;
         feed(&mut t, b"\x1b]52;c;?\x1b\\");
         assert_eq!(t.clipboard, None);
+    }
+
+    #[test]
+    fn osc_color_query_and_reply() {
+        let mut t = Terminal::new(2, 10);
+        feed(&mut t, b"\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;1;?\x1b\\");
+        assert_eq!(t.color_queries, vec![ColorReq::Bg, ColorReq::Fg, ColorReq::Ansi(1)]);
+        // a SET (no '?') is ignored, not recorded as a query
+        feed(&mut t, b"\x1b]11;rgb:00/00/00\x1b\\");
+        assert_eq!(t.color_queries.len(), 3);
+        let pal = crate::color::Palette::from_theme(crate::color::ThemeId::Instrument);
+        assert_eq!(
+            format_color_reply(ColorReq::Bg, &pal),
+            b"\x1b]11;rgb:1414/1414/1414\x1b\\"
+        );
     }
 }

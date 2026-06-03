@@ -183,6 +183,9 @@ fn dump(t: &Terminal, fed: &[u8]) -> String {
     if let Some(cb) = &t.clipboard {
         let _ = writeln!(s, "clipboard: {cb:?}");
     }
+    if !t.color_queries.is_empty() {
+        let _ = writeln!(s, "color_queries: {:?}", t.color_queries);
+    }
 
     // column rulers (tens digit every 10, units below)
     let gut = 3usize;

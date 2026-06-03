@@ -845,6 +845,10 @@ impl Renderer {
 
     /// the pixel rect available for terminal panes (between the bars). the
     /// plugin dock, when present, carves its width off the right so panes reflow
+    pub fn palette(&self) -> &crate::color::Palette {
+        &self.palette
+    }
+
     pub fn content_rect(&self) -> (f32, f32, f32, f32) {
         let x = self.pad;
         let y = self.title_bar_h;

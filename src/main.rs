@@ -2720,6 +2720,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Pty { id, bytes } => {
                 let mut responses: Option<Vec<u8>> = None;
                 let mut clip: Option<String> = None;
+                let mut color_reqs: Vec<term::ColorReq> = Vec::new();
                 let mut found = false;
                 let mut in_sync = false;
                 let mut rang = false;
@@ -2733,6 +2734,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if let Some(text) = p.term.clipboard.take() {
                                 clip = Some(text);
+                            }
+                            if !p.term.color_queries.is_empty() {
+                                color_reqs = std::mem::take(&mut p.term.color_queries);
                             }
                             if p.term.bell {
                                 p.term.bell = false;
@@ -2764,10 +2768,24 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(text) = sp.term.clipboard.take() {
                             clip = Some(text);
                         }
+                        if !sp.term.color_queries.is_empty() {
+                            color_reqs = std::mem::take(&mut sp.term.color_queries);
+                        }
                     }
                 }
                 if let Some(t) = clip {
                     win::clipboard_set(&t);
+                }
+                // answer OSC 4/10/11/12 color queries from the active palette
+                if !color_reqs.is_empty()
+                    && let Some(rend) = self.renderer.as_ref()
+                {
+                    let pal = rend.palette();
+                    let mut buf = responses.take().unwrap_or_default();
+                    for q in &color_reqs {
+                        buf.extend_from_slice(&term::format_color_reply(*q, pal));
+                    }
+                    responses = Some(buf);
                 }
                 if let Some(r) = responses {
                     let mut wrote = false;
