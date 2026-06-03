@@ -848,6 +848,43 @@ mod tests {
     }
 
     #[test]
+    fn random_streams_keep_grid_consistent() {
+        // deterministic xorshift so the corpus is reproducible without a dep
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // weighted toward control/escape bytes so the CSI/OSC/SGR machinery is
+        // exercised, not just printable text
+        let alphabet: &[u8] = b"\x1b[]0123456789;:?>=<mHJKABCDsuhlr \x07\r\n\t\x08\xff\xc2\x80\xf0\x9f";
+        for _ in 0..500 {
+            let rows = 1 + (next() % 40) as usize;
+            let cols = 1 + (next() % 120) as usize;
+            let mut t = Terminal::new(rows, cols);
+            let len = (next() % 800) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect();
+            feed(&mut t, &buf);
+            // a random reflow, then assert consistency right away (a later in-band
+            // mode change could legitimately resize the grid again)
+            let (r2, c2) = (1 + (next() % 40) as usize, 1 + (next() % 120) as usize);
+            t.resize(r2, c2);
+            assert_eq!(t.grid.rows, r2);
+            assert_eq!(t.grid.cols, c2);
+            assert_eq!(t.grid.lines.len(), r2, "live line count must equal rows");
+            for line in &t.grid.lines {
+                assert_eq!(line.len(), c2, "every live line must be cols wide");
+            }
+            assert!(t.grid.cursor.row < r2, "cursor row in bounds");
+            assert!(t.grid.cursor.col <= c2, "cursor col in bounds");
+            // keep feeding to exercise post-resize transitions (no dim assert)
+            feed(&mut t, &buf);
+        }
+    }
+
+    #[test]
     fn renders_a_box_drawing_frame() {
         let mut t = Terminal::new(4, 8);
         feed(
