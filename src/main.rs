@@ -3380,6 +3380,24 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                // typing a dropped file's path at the prompt; quote it if it has
+                // spaces so the shell treats it as a single argument
+                if let Some(id) = self.active_focused_id() {
+                    let s = path.to_string_lossy();
+                    let text = if s.contains(' ') {
+                        format!("\"{s}\" ")
+                    } else {
+                        format!("{s} ")
+                    };
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab)
+                        && let Some(root) = tab.root.as_mut()
+                        && let Some(p) = find_pane_mut(root, id)
+                    {
+                        p.pty.write(text.as_bytes());
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => self.paint(),
             _ => {}
         }
