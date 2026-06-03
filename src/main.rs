@@ -3370,6 +3370,19 @@ impl ApplicationHandler<UserEvent> for App {
                         win::open_url(&url);
                         return;
                     }
+                // a click on a plugin dock widget notifies the owning plugin
+                if state == ElementState::Pressed {
+                    let di = self.renderer.as_ref().and_then(|r| r.widget_at(cx, cy));
+                    if let Some(di) = di
+                        && let Some((pidx, wid, _)) = self.plugin_widgets.get(di)
+                    {
+                        let (pidx, id) = (*pidx, wid.clone());
+                        if let Some(p) = self.plugins.get_mut(pidx) {
+                            p.send(&plugin::HostEvent::WidgetClicked { id });
+                        }
+                        return;
+                    }
+                }
                 // forward a press to a TUI with mouse reporting on (Shift bypasses
                 // for manual selection); release is finalized at the top of the arm
                 if matches!(hit, Some(Hit::Content))

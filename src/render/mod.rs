@@ -449,6 +449,9 @@ pub struct Renderer {
     /// plugin-declared Tier-1 widgets shown in the right-side dock; when
     /// non-empty the dock carves width off content_rect so panes reflow
     dock: Vec<DockWidget>,
+    /// per-widget clickable band (x, y, w, h), parallel to `dock`; rebuilt each
+    /// frame by draw_dock so widget_at can route clicks to the owning plugin
+    dock_hitboxes: Vec<(f32, f32, f32, f32)>,
 
     pub cols: usize,
     pub rows: usize,
@@ -807,6 +810,7 @@ impl Renderer {
             find_view: None,
             market_view: None,
             dock: Vec::new(),
+            dock_hitboxes: Vec::new(),
             cols: 0,
             rows: 0,
         };
@@ -877,7 +881,21 @@ impl Renderer {
     pub fn set_dock(&mut self, widgets: Vec<DockWidget>) -> bool {
         let was = !self.dock.is_empty();
         self.dock = widgets;
+        // draw_dock repopulates these each frame, but an emptied dock never
+        // draws, so drop the stale bands now
+        if self.dock.is_empty() {
+            self.dock_hitboxes.clear();
+        }
         was == self.dock.is_empty()
+    }
+
+    /// dock index of the widget whose clickable band contains (px, py), if any.
+    /// the index is parallel to the widget set passed to set_dock, so the caller
+    /// can map it back to the owning plugin
+    pub fn widget_at(&self, px: f32, py: f32) -> Option<usize> {
+        self.dock_hitboxes
+            .iter()
+            .position(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h)
     }
 
     /// inner padding inside each pane rect (keeps text off the dividers)
@@ -2409,10 +2427,12 @@ impl Renderer {
         let pad = (12.0 * s).round();
         let row = (chrome_h + 6.0 * s).round();
         let mut y = cy + pad;
+        self.dock_hitboxes.clear();
         // snapshot widget data so the atlas can be borrowed mutably while drawing
         let widgets: Vec<(String, Vec<String>)> =
             self.dock.iter().map(|w| (w.title.clone(), w.lines.clone())).collect();
         for (i, (title, lines)) in widgets.iter().enumerate() {
+            let band_top = if i == 0 { cy } else { y - pad * 0.5 };
             if i > 0 {
                 let ry = (y - pad * 0.5).round();
                 Self::push_rect(out, dx + pad, ry, dw - pad * 2.0, hair, RULE, 1.0);
@@ -2427,6 +2447,7 @@ impl Renderer {
                 y += row;
             }
             y += pad * 0.5;
+            self.dock_hitboxes.push((dx, band_top, dw, (y - band_top).max(0.0)));
         }
     }
 

@@ -219,6 +219,14 @@ mod tests {
     }
 
     #[test]
+    fn widget_clicked_serializes() {
+        let line = HostEvent::WidgetClicked { id: "pet".into() }.to_line();
+        let v = Json::parse(&line).unwrap();
+        assert_eq!(v.get_str("t"), Some("widget_clicked"));
+        assert_eq!(v.get_str("id"), Some("pet"));
+    }
+
+    #[test]
     fn message_event_carries_from_topic_body() {
         let line = HostEvent::Message {
             from: "chat".into(),
