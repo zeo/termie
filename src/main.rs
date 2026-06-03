@@ -68,6 +68,15 @@ struct Pane {
     flash: Option<Instant>,
 }
 
+impl Pane {
+    // resize the screen and the pty together so the two can never diverge or be
+    // transposed; both take (rows, cols)
+    fn resize(&mut self, rows: usize, cols: usize) {
+        self.term.resize(rows, cols);
+        self.pty.resize(rows as u16, cols as u16);
+    }
+}
+
 // Leaf is the common, hot variant (walked every frame to paint panes); boxing
 // it to shrink the enum would add an indirection to that path for no real gain
 #[allow(clippy::large_enum_variant)]
@@ -1780,8 +1789,7 @@ impl App {
         // mid-PSReadLine-startup wedges it, so only touch ready ones
         for sp in &mut self.pool {
             if sp.ready && (sp.term.grid.cols != pool_cols || sp.term.grid.rows != pool_rows) {
-                sp.term.resize(pool_rows, pool_cols);
-                sp.pty.resize(pool_rows as u16, pool_cols as u16);
+                sp.resize(pool_rows, pool_cols);
             }
         }
         for (ti, tab) in self.tabs.iter_mut().enumerate() {
@@ -1795,8 +1803,7 @@ impl App {
                 if let Some(p) = find_pane_mut(root, *id) {
                     // skip redundant resizes — resizing pwsh mid-startup wedges PSReadLine
                     if p.term.grid.rows != rows || p.term.grid.cols != cols {
-                        p.term.resize(rows, cols);
-                        p.pty.resize(rows as u16, cols as u16);
+                        p.resize(rows, cols);
                     }
                 }
             }
@@ -2956,8 +2963,7 @@ impl ApplicationHandler<UserEvent> for App {
                         sp.parser.advance(&mut sp.term, &bytes);
                         sp.ready = true;
                         if sp.term.grid.cols != ccols || sp.term.grid.rows != crows {
-                            sp.term.resize(crows, ccols);
-                            sp.pty.resize(crows as u16, ccols as u16);
+                            sp.resize(crows, ccols);
                         }
                         if !sp.term.responses.is_empty() {
                             responses = Some(std::mem::take(&mut sp.term.responses));
