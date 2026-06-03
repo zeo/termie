@@ -23,6 +23,13 @@ pub enum MouseProto {
     Any,
 }
 
+/// kitty keyboard protocol flags termie honors: disambiguate (1) + report
+/// event types (2). bits an app requests outside this mask are dropped, so a
+/// CSI ? u query always reports exactly what we apply
+const KBD_SUPPORTED: u8 = 0b11;
+/// bound the flag stack so a misbehaving app can't grow it without limit
+const KBD_STACK_CAP: usize = 16;
+
 pub struct Terminal {
     pub grid: Grid,
     saved_primary: Option<Grid>,
@@ -45,6 +52,9 @@ pub struct Terminal {
     /// DEC 2026 synchronized output: while true an app is mid-frame, so the
     /// renderer holds off painting until the frame ends (no torn/flickering UI)
     pub sync_output: bool,
+    /// kitty keyboard protocol flag stack; the last entry is active. starts as
+    /// [0] (legacy encoding) and apps push/set richer reporting onto it
+    kbd_stack: Vec<u8>,
 }
 
 impl Terminal {
@@ -65,6 +75,43 @@ impl Terminal {
             responses: Vec::new(),
             dirty: true,
             sync_output: false,
+            kbd_stack: vec![0],
+        }
+    }
+
+    /// active kitty keyboard protocol flags (top of the stack)
+    pub fn kbd_flags(&self) -> u8 {
+        *self.kbd_stack.last().unwrap_or(&0)
+    }
+
+    /// CSI = flags ; mode u: modify the active entry in place. mode 1 replaces,
+    /// 2 sets the given bits, 3 clears them
+    fn kbd_set(&mut self, flags: u8, mode: u16) {
+        if let Some(top) = self.kbd_stack.last_mut() {
+            match mode {
+                3 => *top &= !flags,
+                2 => *top |= flags & KBD_SUPPORTED,
+                _ => *top = flags & KBD_SUPPORTED,
+            }
+        }
+    }
+
+    /// CSI > flags u: push a new active entry
+    fn kbd_push(&mut self, flags: u8) {
+        if self.kbd_stack.len() >= KBD_STACK_CAP {
+            self.kbd_stack.remove(0);
+        }
+        self.kbd_stack.push(flags & KBD_SUPPORTED);
+    }
+
+    /// CSI < number u: pop entries, never removing the base entry
+    fn kbd_pop(&mut self, n: usize) {
+        for _ in 0..n {
+            if self.kbd_stack.len() > 1 {
+                self.kbd_stack.pop();
+            } else {
+                break;
+            }
         }
     }
 
@@ -384,7 +431,26 @@ impl Perform for Terminal {
                 self.grid.cursor.shape_set = true;
             }
             's' => self.grid.save_cursor(),
-            'u' => self.grid.restore_cursor(),
+            'u' => match intermediates.first() {
+                // kitty keyboard: report the active flags (CSI ? u)
+                Some(&b'?') => {
+                    let f = self.kbd_flags();
+                    self.responses
+                        .extend_from_slice(format!("\x1b[?{}u", f).as_bytes());
+                }
+                // kitty keyboard: set flags on the active entry (CSI = flags ; mode u)
+                Some(&b'=') => {
+                    let flags = param_at(params, 0, 0) as u8;
+                    let mode = param_at(params, 1, 1);
+                    self.kbd_set(flags, mode);
+                }
+                // kitty keyboard: push a flags entry (CSI > flags u)
+                Some(&b'>') => self.kbd_push(param_at(params, 0, 0) as u8),
+                // kitty keyboard: pop flags entries (CSI < number u)
+                Some(&b'<') => self.kbd_pop(param_at(params, 0, 1) as usize),
+                // plain CSI u: SCO restore cursor
+                _ => self.grid.restore_cursor(),
+            },
             _ => {}
         }
         self.dirty = true;
@@ -408,6 +474,7 @@ impl Perform for Terminal {
                 self.using_alt = false;
                 self.app_cursor_keys = false;
                 self.bracketed_paste = false;
+                self.kbd_stack = vec![0];
             }
             _ => {}
         }
@@ -522,5 +589,47 @@ mod tests {
         feed(&mut t, b"\x1b[?1049l");
         assert!(!t.using_alt);
         assert_eq!(t.grid.lines[0][0].c, 'p');
+    }
+
+    #[test]
+    fn kitty_push_query_pop() {
+        let mut t = Terminal::new(4, 20);
+        assert_eq!(t.kbd_flags(), 0);
+        feed(&mut t, b"\x1b[>1u");
+        assert_eq!(t.kbd_flags(), 1);
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(t.responses, b"\x1b[?1u");
+        t.responses.clear();
+        feed(&mut t, b"\x1b[<u");
+        assert_eq!(t.kbd_flags(), 0);
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(t.responses, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn kitty_set_modes_and_mask() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[=3;1u");
+        assert_eq!(t.kbd_flags(), 3);
+        feed(&mut t, b"\x1b[=2;3u"); // mode 3 clears bit 2
+        assert_eq!(t.kbd_flags(), 1);
+        feed(&mut t, b"\x1b[=8;2u"); // mode 2 OR-in flag 8, which is unsupported -> masked off
+        assert_eq!(t.kbd_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_unsupported_bits_masked_on_push() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[>13u"); // 1|4|8; only disambiguate(1) is supported
+        assert_eq!(t.kbd_flags(), 1);
+    }
+
+    #[test]
+    fn plain_csi_u_still_restores_cursor() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[3;4H\x1b[s"); // save cursor at row 2, col 3
+        feed(&mut t, b"\x1b[1;1H\x1b[u"); // move home, then restore
+        assert_eq!(t.grid.cursor.row, 2);
+        assert_eq!(t.grid.cursor.col, 3);
     }
 }

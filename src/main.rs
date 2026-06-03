@@ -3278,14 +3278,22 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(id) => id,
                     None => return,
                 };
-                let app_cursor = self
+                let (app_cursor, kbd_flags) = self
                     .tabs
                     .get(self.active_tab)
                     .and_then(|t| t.root.as_ref())
                     .and_then(|r| find_pane(r, id))
-                    .map(|p| p.term.app_cursor_keys)
-                    .unwrap_or(false);
-                if let Some(bytes) = input::key_to_bytes(&event, self.mods, app_cursor) {
+                    .map(|p| (p.term.app_cursor_keys, p.term.kbd_flags()))
+                    .unwrap_or((false, 0));
+                if let Some(bytes) = input::key_to_bytes(
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    event.state,
+                    event.repeat,
+                    self.mods,
+                    app_cursor,
+                    kbd_flags,
+                ) {
                     self.selection = None; // typing clears the selection
                     if let Some(tab) = self.tabs.get_mut(self.active_tab)
                         && let Some(root) = tab.root.as_mut() {
