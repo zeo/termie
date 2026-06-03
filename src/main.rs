@@ -1154,6 +1154,7 @@ impl App {
             .with_visible(false)
             .with_inner_size(LogicalSize::new(1000.0, 640.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
+        timing("window created");
 
         if let Ok(handle) = window.window_handle()
             && let RawWindowHandle::Win32(h) = handle.as_raw() {
@@ -1161,6 +1162,7 @@ impl App {
             }
 
         let renderer = Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend)?;
+        timing("renderer ready (gpu init)");
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
 
@@ -1187,6 +1189,7 @@ impl App {
         // window appearing. the first pool shell to arrive becomes tab one.
         self.paint();
         window.set_visible(true);
+        timing("window shown");
         self.shown = true;
         self.warm_pool();
         window.request_redraw();
@@ -3065,6 +3068,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.relayout_all();
                         self.sync_tabs();
                         self.redraw();
+                        timing("first shell on screen");
                     } else {
                         self.pool.push(*pane);
                     }
@@ -3643,6 +3647,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.relayout_all();
                     self.redraw();
                 }
+                timing("system fonts scanned");
             }
             // spawn enabled plugins once, deferred off the boot path so a window
             // with no/disabled plugins pays nothing at startup
@@ -3748,12 +3753,30 @@ impl App {
     }
 }
 
+/// opt-in startup timing: when TERMIE_TIMING names a file, append "<ms> label"
+/// lines at key milestones so startup latency can be measured. release is a
+/// windowed subsystem with no console, so this writes to a file, not stderr
+fn timing(label: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    static SINK: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    let sink = SINK.get_or_init(|| std::env::var_os("TERMIE_TIMING").map(Into::into));
+    if let Some(path) = sink
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(f, "{:>8.1} ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 fn main() -> Result<()> {
     // dev-only headless screen dumper; never compiled into release
     #[cfg(debug_assertions)]
     if termview::maybe_run() {
         return Ok(());
     }
+    timing("process start");
     // stop child shells (esp. pool shells racing exit) from popping OS error dialogs
     win::suppress_child_error_dialogs();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
