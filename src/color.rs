@@ -131,6 +131,37 @@ impl Palette {
         self.ansi[i as usize]
     }
 
+    /// patch palette fields by name from user color overrides (ansi0..ansi255
+    /// target the 256-color table); unknown keys are ignored
+    pub fn apply_overrides(&mut self, overrides: &[(String, Rgb)]) {
+        for (k, c) in overrides {
+            let c = *c;
+            match k.as_str() {
+                "fg" => self.fg = c,
+                "bg" => self.bg = c,
+                "bg2" => self.bg2 = c,
+                "cursor" => self.cursor = c,
+                "sel" => self.sel = c,
+                "paper" => self.paper = c,
+                "mute" => self.mute = c,
+                "text2" => self.text2 = c,
+                "ink0" => self.ink0 = c,
+                "ink1" => self.ink1 = c,
+                "ink3" => self.ink3 = c,
+                "ink4" => self.ink4 = c,
+                "rule" => self.rule = c,
+                "rule2" => self.rule2 = c,
+                _ => {
+                    if let Some(n) = k.strip_prefix("ansi").and_then(|n| n.parse::<usize>().ok())
+                        && n < 256
+                    {
+                        self.ansi[n] = c;
+                    }
+                }
+            }
+        }
+    }
+
     fn instrument() -> Self {
         // restrained "instrument panel" signal colors on a hard greyscale ground:
         // clay / sage / brass / steel / mauve / teal, paired normal→bright

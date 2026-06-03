@@ -270,6 +270,58 @@ fn cwd_path(cwd: Option<&str>) -> Option<String> {
     Some(path.strip_prefix('/').unwrap_or(path).replace("%20", " "))
 }
 
+/// parse a color as #rrggbb, #rgb, or r,g,b
+fn parse_color(s: &str) -> Option<color::Rgb> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return match hex.len() {
+            6 => Some(color::Rgb::new((v >> 16) as u8, (v >> 8) as u8, v as u8)),
+            3 => Some(color::Rgb::new(
+                (((v >> 8) & 0xf) * 17) as u8,
+                (((v >> 4) & 0xf) * 17) as u8,
+                ((v & 0xf) * 17) as u8,
+            )),
+            _ => None,
+        };
+    }
+    let p: Vec<&str> = s.split(',').collect();
+    if p.len() == 3 {
+        Some(color::Rgb::new(
+            p[0].trim().parse().ok()?,
+            p[1].trim().parse().ok()?,
+            p[2].trim().parse().ok()?,
+        ))
+    } else {
+        None
+    }
+}
+
+/// load user color overrides from %APPDATA%\termie\colors.conf (key=color lines,
+/// e.g. `bg=#101216`, `ansi1=#bf6360`); missing file yields no overrides
+fn load_color_overrides() -> Vec<(String, color::Rgb)> {
+    let mut out = Vec::new();
+    let Some(dir) = std::env::var_os("APPDATA") else {
+        return out;
+    };
+    let path = std::path::Path::new(&dir).join("termie").join("colors.conf");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && let Some(c) = parse_color(v)
+        {
+            out.push((k.trim().to_string(), c));
+        }
+    }
+    out
+}
+
 /// the git branch (or short detached hash) for a cwd, walking up to the repo root.
 /// reads at most a few hundred bytes of .git/HEAD and caps the walk depth so a
 /// hostile cwd / oversized HEAD can't hang or OOM the UI thread
@@ -1018,6 +1070,7 @@ impl App {
             let p = &self.persisted;
             if let Some(r) = self.renderer.as_mut() {
                 r.set_theme(p.theme);
+                r.set_color_overrides(load_color_overrides());
                 r.set_cursor_style(p.cursor);
                 r.set_cursor_blink(p.cursor_blink);
                 r.set_pane_pad_px(p.padding);
@@ -3582,5 +3635,13 @@ mod tests {
         assert_eq!(cwd_path(Some("file://host/C:/dev")).as_deref(), Some("C:/dev"));
         assert_eq!(cwd_path(Some("file:///C:/a%20b")).as_deref(), Some("C:/a b"));
         assert_eq!(cwd_path(None), None);
+    }
+
+    #[test]
+    fn parse_color_forms() {
+        assert_eq!(parse_color("#ff8800"), Some(color::Rgb::new(255, 136, 0)));
+        assert_eq!(parse_color("#f80"), Some(color::Rgb::new(255, 136, 0)));
+        assert_eq!(parse_color("255, 136, 0"), Some(color::Rgb::new(255, 136, 0)));
+        assert_eq!(parse_color("nope"), None);
     }
 }

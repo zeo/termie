@@ -431,6 +431,8 @@ pub struct Renderer {
     font_idx: usize,
     settings_view: SettingsView,
     theme: ThemeId,
+    /// user color overrides loaded from disk, applied on top of the theme
+    color_overrides: Vec<(String, Rgb)>,
     broadcast: bool,
     /// cached background gradient quads, rebuilt only on size/theme change
     gradient_cache: Vec<Instance>,
@@ -769,6 +771,7 @@ impl Renderer {
             atlas,
             palette: Palette::from_theme(ThemeId::Instrument),
             theme: ThemeId::Instrument,
+            color_overrides: Vec::new(),
             broadcast: false,
             gradient_cache: Vec::new(),
             gradient_key: (0, 0, ThemeId::Instrument),
@@ -934,14 +937,26 @@ impl Renderer {
 
     pub fn cycle_theme(&mut self) {
         self.theme = self.theme.next();
-        self.palette = Palette::from_theme(self.theme);
+        self.palette = self.themed_palette();
         self.atlas.dirty = true;
+    }
+
+    fn themed_palette(&self) -> Palette {
+        let mut p = Palette::from_theme(self.theme);
+        p.apply_overrides(&self.color_overrides);
+        p
+    }
+
+    /// install user color overrides (from disk) and rebuild the active palette
+    pub fn set_color_overrides(&mut self, overrides: Vec<(String, Rgb)>) {
+        self.color_overrides = overrides;
+        self.palette = self.themed_palette();
     }
 
     pub fn set_theme(&mut self, id: ThemeId) {
         if self.theme != id {
             self.theme = id;
-            self.palette = Palette::from_theme(id);
+            self.palette = self.themed_palette();
             self.atlas.dirty = true;
         }
     }
