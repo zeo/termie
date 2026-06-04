@@ -462,6 +462,11 @@ impl Renderer {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
 
+        // build the bundled-font glyph atlas on a worker thread so its font load
+        // overlaps the gpu adapter/device request below (mostly driver wait)
+        // instead of running sequentially after it — shaves startup latency
+        let atlas_handle = std::thread::spawn(move || GlyphAtlas::new(content_pt, chrome_pt, scale, None));
+
         // build instance+surface+adapter for a backend set; DX12 is the Windows
         // default (Vulkan is slow under injected overlay layers — OBS/Overwolf)
         let try_init = |backends: wgpu::Backends| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
@@ -534,7 +539,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let atlas = GlyphAtlas::new(content_pt, chrome_pt, scale, None);
+        let atlas = atlas_handle.join().expect("atlas build thread panicked");
         // the bundled default plus any common monospace families present on the
         // system (initially just the bundled one — system fonts load lazily)
         let fonts = Self::detect_fonts(&atlas);
