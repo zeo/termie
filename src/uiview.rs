@@ -6,7 +6,7 @@
 
 use vte::Parser;
 
-use crate::render::{self, Hot, PaneView};
+use crate::render::{self, Hot, PaneMenuView, PaneView};
 use crate::term::Terminal;
 
 /// returns true if `--uiview` was requested and handled (caller should exit)
@@ -34,6 +34,13 @@ pub fn maybe_run() -> bool {
         "gear" => {
             r.set_hovered(Some(Hot::Gear));
         }
+        "panemode" => {
+            r.set_pane_mode(true);
+            r.set_hovered(Some(Hot::PaneMode));
+        }
+        "menu" => {
+            r.set_pane_menu(Some(PaneMenuView { x: 90.0, y: 150.0, hovered: Some(0) }));
+        }
         _ => {}
     }
 
@@ -44,8 +51,12 @@ pub fn maybe_run() -> bool {
 
     // build the panes for the requested layout, sizing each terminal's grid to
     // its rect so the sample content fills it like the real app
-    let single = scene == "single";
-    let rects: Vec<(f32, f32, f32, f32)> = if single {
+    // satellite = a torn-off pane in its own bare window (no chrome)
+    let bare = scene == "satellite";
+    let single = bare || scene == "single";
+    let rects: Vec<(f32, f32, f32, f32)> = if bare {
+        vec![(pad, pad, w as f32 - pad * 2.0, h as f32 - pad * 2.0)]
+    } else if single {
         vec![(pad, tb + pad, w as f32 - pad * 2.0, content_h)]
     } else {
         let cw = (w as f32 - pad * 3.0) / 2.0;
@@ -83,7 +94,7 @@ pub fn maybe_run() -> bool {
         })
         .collect();
 
-    match r.render_png(&panes, true, false, &out) {
+    match r.render_png(&panes, true, false, bare, &out) {
         Ok(()) => println!("wrote {out} (scene {scene}, {w}x{h})"),
         Err(e) => println!("uiview error: {e}"),
     }

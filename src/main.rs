@@ -98,6 +98,14 @@ struct Tab {
     root: Option<Node>,
 }
 
+/// a torn-off pane living in its own OS-decorated window. its pty reader still
+/// routes output by pane id, so the UserEvent handlers also search here
+struct Satellite {
+    window: Arc<Window>,
+    renderer: render::Renderer,
+    pane: Pane,
+}
+
 /// an active text selection within one pane's viewport (row, col)
 #[derive(Clone, Copy)]
 struct Sel {
@@ -153,6 +161,13 @@ fn palette_filter(query: &str) -> Vec<(&'static str, PaletteAction)> {
 struct PaletteState {
     query: String,
     selected: usize,
+}
+
+/// right-click pane context menu state: anchor point + hovered item
+struct PaneMenu {
+    x: f32,
+    y: f32,
+    hovered: Option<usize>,
 }
 
 /// find-in-scrollback overlay state for the focused pane; matches are
@@ -473,6 +488,30 @@ fn split_pane(node: Node, id: usize, dir: Dir, new: &mut Option<Pane>) -> Node {
     }
 }
 
+/// remove the leaf with `id`, collapsing its parent, and hand the pane back
+/// (alive — for tearing it off into its own window) via `out`
+fn extract_pane(node: Node, id: usize, out: &mut Option<Pane>) -> Option<Node> {
+    match node {
+        Node::Leaf(p) => {
+            if p.id == id {
+                *out = Some(p);
+                None
+            } else {
+                Some(Node::Leaf(p))
+            }
+        }
+        Node::Split { dir, ratio, a, b } => {
+            let a2 = extract_pane(*a, id, out);
+            let b2 = extract_pane(*b, id, out);
+            match (a2, b2) {
+                (Some(a), Some(b)) => Some(Node::Split { dir, ratio, a: Box::new(a), b: Box::new(b) }),
+                (Some(n), None) | (None, Some(n)) => Some(n),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
 /// remove the leaf with `id`, collapsing its parent; returns the surviving tree
 fn close_pane(node: Node, id: usize) -> Option<Node> {
     match node {
@@ -584,6 +623,26 @@ fn set_divider_ratio(node: &mut Node, rect: Rect, path: &[usize], x: f32, y: f32
         set_divider_ratio(a, ar, &path[1..], x, y);
     } else {
         set_divider_ratio(b, br, &path[1..], x, y);
+    }
+}
+
+/// grow or shrink the pane with `id` by nudging the ratio of its nearest
+/// ancestor split of orientation `dir`. returns true if a split was adjusted
+fn grow_focused(node: &mut Node, id: usize, dir: Dir, grow: bool, step: f32, done: &mut bool) -> bool {
+    match node {
+        Node::Leaf(p) => p.id == id,
+        Node::Split { dir: d, ratio, a, b } => {
+            let in_a = grow_focused(a, id, dir, grow, step, done);
+            let in_b = !in_a && grow_focused(b, id, dir, grow, step, done);
+            if (in_a || in_b) && !*done && *d == dir {
+                *done = true;
+                // ratio is the A child's fraction: growing a pane on the A side
+                // raises it, on the B side lowers it (and vice-versa for shrink)
+                let delta = if in_a == grow { step } else { -step };
+                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+            }
+            in_a || in_b
+        }
     }
 }
 
@@ -1004,6 +1063,8 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     tabs: Vec<Tab>,
+    /// torn-off panes, each in its own window (keyed by window id at routing)
+    satellites: Vec<Satellite>,
     active_tab: usize,
     next_id: usize,
     layout_cache: Vec<(usize, Rect)>,
@@ -1011,6 +1072,8 @@ struct App {
     focused: bool,
     maximized: bool,
     pane_mode: bool,
+    /// open right-click pane context menu (None = closed)
+    pane_menu: Option<PaneMenu>,
     shown: bool,
     pool: Vec<Pane>,
     selection: Option<Sel>,
@@ -1099,6 +1162,7 @@ impl App {
             window: None,
             renderer: None,
             tabs: Vec::new(),
+            satellites: Vec::new(),
             active_tab: 0,
             next_id: 0,
             layout_cache: Vec::new(),
@@ -1107,6 +1171,7 @@ impl App {
             focused: true,
             maximized: false,
             pane_mode: false,
+            pane_menu: None,
             shown: false,
             pool: Vec::new(),
             selection: None,
@@ -1722,9 +1787,15 @@ impl App {
         let config = self.config;
         let settings_open = self.settings_open;
         let settings_p = self.settings_p();
+        let pane_menu_view = self.pane_menu.as_ref().map(|m| render::PaneMenuView {
+            x: m.x,
+            y: m.y,
+            hovered: m.hovered,
+        });
         if let Some(r) = self.renderer.as_mut() {
             r.set_status(git, clock, sessions);
             r.set_palette(palette_view);
+            r.set_pane_menu(pane_menu_view);
             r.set_find(find_view);
             r.set_market(market_view);
             r.set_settings(render::SettingsView {
@@ -1793,7 +1864,7 @@ impl App {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            if let Err(e) = r.render(&views, *focused, *maximized, focus_ease) {
+            if let Err(e) = r.render(&views, *focused, *maximized, focus_ease, false) {
                 log::error!("render error: {e:#}");
             }
         }
@@ -2458,6 +2529,7 @@ impl App {
             }
             Hot::SplitV => self.split_focused(Dir::Vertical),
             Hot::SplitH => self.split_focused(Dir::Horizontal),
+            Hot::PaneMode => self.set_pane_mode(!self.pane_mode),
             Hot::NewTab => self.new_tab(),
             Hot::Tab(i) => self.switch_tab(i),
             Hot::TabClose(i) => self.close_tab(i, event_loop),
@@ -2581,6 +2653,160 @@ impl App {
         self.redraw();
     }
 
+    /// run a pane context-menu item (index into render::PANE_MENU_ITEMS:
+    /// 0 split vertical, 1 split horizontal, 2 pop out, 3 close pane, 4 paste)
+    fn pane_menu_action(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
+        match idx {
+            0 => self.split_focused(Dir::Vertical),
+            1 => self.split_focused(Dir::Horizontal),
+            2 => self.pop_out_focused(event_loop),
+            3 => self.close_focused_pane(event_loop),
+            4 => self.paste(),
+            _ => {}
+        }
+    }
+
+    /// grow/shrink the focused pane along `dir` (pane-mode keyboard resize)
+    fn resize_focused(&mut self, dir: Dir, grow: bool) {
+        let Some(fid) = self.tabs.get(self.active_tab).map(|t| t.focused) else {
+            return;
+        };
+        let mut done = false;
+        if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+            grow_focused(root, fid, dir, grow, 0.04, &mut done);
+        }
+        if done {
+            self.relayout_all();
+            self.redraw();
+        }
+    }
+
+    /// tear the focused pane off into its own OS window (multi-window)
+    fn pop_out_focused(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(fid) = self.tabs.get(self.active_tab).map(|t| t.focused) else {
+            return;
+        };
+        let count = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.root.as_ref())
+            .map(|r| {
+                let mut n = 0;
+                each_pane(r, &mut |_| n += 1);
+                n
+            })
+            .unwrap_or(0);
+        if count < 2 {
+            return; // don't strip a tab's only pane
+        }
+        let mut popped: Option<Pane> = None;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && let Some(root) = tab.root.take()
+        {
+            tab.root = extract_pane(root, fid, &mut popped);
+            if let Some(r) = tab.root.as_ref() {
+                tab.focused = first_leaf(r);
+            }
+        }
+        let Some(pane) = popped else {
+            return;
+        };
+        let attrs = Window::default_attributes()
+            .with_title("termie — pane")
+            .with_inner_size(LogicalSize::new(760.0, 480.0));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(_) => {
+                self.dock_loose_pane(pane);
+                return;
+            }
+        };
+        let renderer = match render::Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend) {
+            Ok(mut r) => {
+                r.set_theme(self.persisted.theme);
+                r
+            }
+            Err(_) => {
+                self.dock_loose_pane(pane);
+                return;
+            }
+        };
+        self.satellites.push(Satellite { window, renderer, pane });
+        self.relayout_all();
+        self.sync_tabs();
+        let idx = self.satellites.len() - 1;
+        self.paint_satellite(idx);
+        self.redraw();
+    }
+
+    /// re-attach a loose pane as a new tab (used if a satellite window won't open)
+    fn dock_loose_pane(&mut self, pane: Pane) {
+        let fid = pane.id;
+        self.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)) });
+        self.active_tab = self.tabs.len() - 1;
+        self.relayout_all();
+        self.sync_tabs();
+        self.redraw();
+    }
+
+    /// render one satellite window: its single pane filling the client area
+    fn paint_satellite(&mut self, idx: usize) {
+        let Some(sat) = self.satellites.get_mut(idx) else {
+            return;
+        };
+        let size = sat.window.inner_size();
+        sat.renderer.resize(size.width, size.height);
+        let pad = 4.0f32;
+        let rect = (pad, pad, (size.width as f32 - pad * 2.0).max(1.0), (size.height as f32 - pad * 2.0).max(1.0));
+        let (_, _, cols, rows) = sat.renderer.pane_metrics(rect);
+        if sat.pane.term.grid.cols != cols || sat.pane.term.grid.rows != rows {
+            sat.pane.resize(rows, cols);
+        }
+        let pv = render::PaneView {
+            term: &sat.pane.term,
+            rect,
+            focused: true,
+            sel: None,
+            flash: 0.0,
+            link: None,
+        };
+        let _ = sat.renderer.render(&[pv], true, false, 1.0, true);
+    }
+
+    /// handle a window event addressed to satellite `idx`
+    fn satellite_event(&mut self, idx: usize, event: &WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                if idx < self.satellites.len() {
+                    let mut sat = self.satellites.remove(idx);
+                    sat.pane.pty.kill();
+                }
+            }
+            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.paint_satellite(idx),
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event: ke, .. } => {
+                if ke.state == ElementState::Pressed
+                    && let Some(sat) = self.satellites.get_mut(idx)
+                {
+                    let app_cursor = sat.pane.term.app_cursor_keys;
+                    let kbd = sat.pane.term.kbd_flags();
+                    if let Some(bytes) = input::key_to_bytes(
+                        &ke.logical_key,
+                        ke.text.as_deref(),
+                        ke.state,
+                        ke.repeat,
+                        self.mods,
+                        app_cursor,
+                        kbd,
+                    ) {
+                        sat.pane.pty.write(&bytes);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// report a mouse event to the pane under the cursor if it has mouse mode on;
     /// returns true if forwarded (caller should skip local selection/scroll)
     fn mouse_report(&mut self, btn: u8, pressed: bool, motion: bool) -> bool {
@@ -2692,6 +2918,12 @@ impl App {
     fn handle_shortcut(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) -> bool {
         if event.state != ElementState::Pressed {
             return false;
+        }
+        // Esc closes an open pane context menu before anything else sees it
+        if self.pane_menu.is_some() && event.logical_key == Key::Named(NamedKey::Escape) {
+            self.pane_menu = None;
+            self.redraw();
+            return true;
         }
         // user keybindings take precedence over the built-in shortcuts, but
         // never over an open overlay or pane mode
@@ -2827,6 +3059,11 @@ impl App {
         if self.pane_mode {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => self.set_pane_mode(false),
+                // shift+arrows resize the focused pane; plain arrows move focus
+                Key::Named(NamedKey::ArrowLeft) if self.mods.shift_key() => self.resize_focused(Dir::Vertical, false),
+                Key::Named(NamedKey::ArrowRight) if self.mods.shift_key() => self.resize_focused(Dir::Vertical, true),
+                Key::Named(NamedKey::ArrowUp) if self.mods.shift_key() => self.resize_focused(Dir::Horizontal, false),
+                Key::Named(NamedKey::ArrowDown) if self.mods.shift_key() => self.resize_focused(Dir::Horizontal, true),
                 Key::Named(NamedKey::ArrowLeft) => self.focus_dir(-1, 0),
                 Key::Named(NamedKey::ArrowRight) => self.focus_dir(1, 0),
                 Key::Named(NamedKey::ArrowUp) => self.focus_dir(0, -1),
@@ -2839,6 +3076,7 @@ impl App {
                     "v" => self.split_focused(Dir::Vertical),
                     "s" => self.split_focused(Dir::Horizontal),
                     "x" => self.close_focused_pane(event_loop),
+                    "o" => self.pop_out_focused(event_loop),
                     "n" => self.new_tab(),
                     "q" => self.set_pane_mode(false),
                     _ => {}
@@ -3011,6 +3249,22 @@ impl ApplicationHandler<UserEvent> for App {
                             break;
                         }
                 }
+                if !found
+                    && let Some(idx) = self.satellites.iter().position(|s| s.pane.id == id)
+                {
+                    let sat = &mut self.satellites[idx];
+                    sat.pane.parser.advance(&mut sat.pane.term, &bytes);
+                    if !sat.pane.term.responses.is_empty() {
+                        let resp = std::mem::take(&mut sat.pane.term.responses);
+                        sat.pane.pty.write(&resp);
+                    }
+                    if let Some(text) = sat.pane.term.clipboard.take() {
+                        clip = Some(text);
+                    }
+                    sat.pane.term.bell = false;
+                    self.paint_satellite(idx);
+                    found = true;
+                }
                 // let plugins react to the bell (host -> plugin event direction)
                 if rang && !self.plugins.is_empty() {
                     self.plugins_broadcast(&plugin::HostEvent::Bell { pane: id as u64 });
@@ -3085,6 +3339,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Exited { id } => {
                 // a warm pool shell that died — drop it so warm_pool respawns
                 self.pool.retain(|p| p.id != id);
+                // a torn-off pane whose shell exited — close its satellite window
+                if let Some(idx) = self.satellites.iter().position(|s| s.pane.id == id) {
+                    let mut sat = self.satellites.remove(idx);
+                    sat.pane.pty.kill();
+                    return;
+                }
                 // find which tab holds this pane, close that pane
                 let owner = self.tabs.iter().position(|t| {
                     t.root.as_ref().map(|r| find_pane(r, id).is_some()).unwrap_or(false)
@@ -3173,7 +3433,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // events for a torn-off pane's window go to its satellite handler
+        if let Some(idx) = self.satellites.iter().position(|s| s.window.id() == id) {
+            self.satellite_event(idx, &event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 for tab in &mut self.tabs {
@@ -3213,6 +3478,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let (px, py) = (position.x as f32, position.y as f32);
+                // while the pane menu is open, only track which item is hovered
+                if self.pane_menu.is_some() {
+                    let h = self.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
+                    if let Some(m) = self.pane_menu.as_mut()
+                        && m.hovered != h
+                    {
+                        m.hovered = h;
+                        self.redraw();
+                    }
+                    return;
+                }
                 // mouse-tracking motion (1002 drag / 1003 any-motion)
                 if self.drag_divider.is_none() && !self.settings_open && !self.mods.shift_key() {
                     if let Some((btn, id)) = self.mouse_down {
@@ -3340,14 +3616,16 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Right,
                 ..
             } => {
-                // right-click copies the active selection, or pastes when there
-                // is none — the familiar one-button terminal convenience
-                if self.selection.is_some() {
-                    self.copy_selection();
-                    self.selection = None;
+                // right-click on a pane opens the pane context menu (split / close
+                // / paste) at the cursor; focus the pane under it first so the
+                // actions target it
+                let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
+                let on_content =
+                    matches!(self.renderer.as_ref().map(|r| r.hit_test(cx, cy)), Some(Hit::Content));
+                if on_content {
+                    self.focus_pane_at(cx, cy);
+                    self.pane_menu = Some(PaneMenu { x: cx, y: cy, hovered: None });
                     self.redraw();
-                } else {
-                    self.paste();
                 }
             }
             WindowEvent::MouseInput {
@@ -3369,6 +3647,17 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
                 let hit = self.renderer.as_ref().map(|r| r.hit_test(cx, cy));
+                // a left-press while the pane menu is open runs the clicked item
+                // (or dismisses it when the click lands elsewhere)
+                if self.pane_menu.is_some() && state == ElementState::Pressed {
+                    let item = self.renderer.as_ref().and_then(|r| r.pane_menu_item_at(cx, cy));
+                    self.pane_menu = None;
+                    if let Some(i) = item {
+                        self.pane_menu_action(i, event_loop);
+                    }
+                    self.redraw();
+                    return;
+                }
                 // always finalize a forwarded press with a release report, even if
                 // the cursor left the pane (else the TUI sees a stuck drag)
                 if state == ElementState::Released
@@ -4013,5 +4302,26 @@ mod tests {
         // swapping an id with itself is a no-op
         swap_panes(&mut tree, 2, 2);
         assert_eq!(ids(&tree), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn extract_pane_hands_back_the_pane_and_collapses_the_tree() {
+        // pop pane 2 out: the remaining tree collapses like a close, but the
+        // pane comes back alive (its pty isn't killed) for the new window
+        let tree = split(Dir::Vertical, 0.5, leaf(1), split(Dir::Horizontal, 0.5, leaf(2), leaf(3)));
+        let mut popped = None;
+        let rest = extract_pane(tree, 2, &mut popped).expect("tree not empty");
+        assert_eq!(popped.map(|p| p.id), Some(2));
+        // 1 and 3 remain, 3 promoted into the collapsed right split
+        assert_eq!(ids(&rest), vec![1, 3]);
+        // popping the only pane leaves an empty tree but still yields the pane
+        let mut popped = None;
+        assert!(extract_pane(leaf(9), 9, &mut popped).is_none());
+        assert_eq!(popped.map(|p| p.id), Some(9));
+        // a missing id extracts nothing and keeps the tree
+        let mut popped = None;
+        let kept = extract_pane(leaf(9), 42, &mut popped).expect("kept");
+        assert!(popped.is_none());
+        assert_eq!(ids(&kept), vec![9]);
     }
 }

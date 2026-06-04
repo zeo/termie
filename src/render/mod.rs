@@ -85,6 +85,7 @@ pub enum Hot {
     Gear,
     SplitV,
     SplitH,
+    PaneMode,
     NewTab,
     Tab(usize),
     TabClose(usize),
@@ -129,6 +130,17 @@ pub struct PaletteView {
     pub items: Vec<String>,
     pub selected: usize,
 }
+
+/// right-click pane context menu: a small overlay at (x, y). the item index
+/// maps to a fixed action in main.rs's handler (kept in sync with PANE_MENU_ITEMS)
+pub struct PaneMenuView {
+    pub x: f32,
+    pub y: f32,
+    pub hovered: Option<usize>,
+}
+
+pub const PANE_MENU_ITEMS: [&str; 5] =
+    ["split vertical", "split horizontal", "pop out to window", "close pane", "paste"];
 
 /// find-in-scrollback overlay display state. `matches` are on-screen rects
 /// (viewport row, col, len, is_current) for the focused pane
@@ -451,6 +463,7 @@ pub struct Renderer {
     status_clock: String,
     status_sessions: usize,
     palette_view: Option<PaletteView>,
+    pane_menu_view: Option<PaneMenuView>,
     find_view: Option<FindView>,
     market_view: Option<MarketView>,
     /// plugin-declared Tier-1 widgets shown in the right-side dock; when
@@ -882,6 +895,7 @@ impl Renderer {
             status_clock: String::new(),
             status_sessions: 1,
             palette_view: None,
+            pane_menu_view: None,
             find_view: None,
             market_view: None,
             dock: Vec::new(),
@@ -1257,6 +1271,37 @@ impl Renderer {
         self.palette_view = p;
     }
 
+    pub fn set_pane_menu(&mut self, m: Option<PaneMenuView>) {
+        self.pane_menu_view = m;
+    }
+
+    /// clamped (x, y, width, row_h, pad) of the pane context menu, shared by the
+    /// renderer and the hit-test so the two never drift
+    fn pane_menu_geom(&self, mx: f32, my: f32) -> (f32, f32, f32, f32, f32) {
+        let s = self.scale;
+        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let row_h = chrome_h + 10.0 * s;
+        let pad = 8.0 * s;
+        let mw = (172.0 * s).round();
+        let mh = row_h * PANE_MENU_ITEMS.len() as f32 + pad * 2.0;
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        let bx = mx.min(w - mw - 4.0 * s).max(0.0).round();
+        let by = my.min(h - mh - 4.0 * s).max(self.title_bar_h).round();
+        (bx, by, mw, row_h, pad)
+    }
+
+    /// the menu item under (px, py), or None if outside the menu's rows
+    pub fn pane_menu_item_at(&self, px: f32, py: f32) -> Option<usize> {
+        let v = self.pane_menu_view.as_ref()?;
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v.x, v.y);
+        let rows = PANE_MENU_ITEMS.len() as f32;
+        if px < bx || px >= bx + mw || py < by + pad || py >= by + pad + row_h * rows {
+            return None;
+        }
+        Some((((py - by - pad) / row_h) as usize).min(PANE_MENU_ITEMS.len() - 1))
+    }
+
     pub fn set_market(&mut self, m: Option<MarketView>) {
         self.market_view = m;
     }
@@ -1270,12 +1315,13 @@ impl Renderer {
     }
 
     /// title-bar buttons, left→right: splitV, splitH, gear, minimize, maximize, close
-    fn control_rects(&self) -> [(Hot, f32, f32); 6] {
+    fn control_rects(&self) -> [(Hot, f32, f32); 7] {
         let cw = (46.0 * self.scale).round();
         let w = self.config.width as f32;
         [
-            (Hot::SplitV, w - cw * 6.0, w - cw * 5.0),
-            (Hot::SplitH, w - cw * 5.0, w - cw * 4.0),
+            (Hot::SplitV, w - cw * 7.0, w - cw * 6.0),
+            (Hot::SplitH, w - cw * 6.0, w - cw * 5.0),
+            (Hot::PaneMode, w - cw * 5.0, w - cw * 4.0),
             (Hot::Gear, w - cw * 4.0, w - cw * 3.0),
             (Hot::Minimize, w - cw * 3.0, w - cw * 2.0),
             (Hot::Maximize, w - cw * 2.0, w - cw),
@@ -2045,7 +2091,7 @@ impl Renderer {
     }
 
     #[allow(non_snake_case)]
-    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32) -> Vec<Instance> {
+    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32, bare: bool) -> Vec<Instance> {
         // chrome colors come from the active theme's palette
         let INK_0 = self.palette.ink0;
         let INK_1 = self.palette.ink1;
@@ -2144,6 +2190,12 @@ impl Renderer {
             }
         }
 
+        // a torn-off satellite window renders just its pane (the OS supplies the
+        // title bar / close / move), so skip all the chrome and overlays below
+        if bare {
+            return out;
+        }
+
         // ---- plugin dock (Tier-1 widgets) on the right of the content area ----
         if !self.dock.is_empty() {
             self.draw_dock(&mut out, track);
@@ -2240,6 +2292,7 @@ impl Renderer {
         let glyphs = [
             (Hot::SplitV, "\u{eb56}"),
             (Hot::SplitH, "\u{eb57}"),
+            (Hot::PaneMode, ""),
             (Hot::Gear, "\u{f013}"),
             (Hot::Minimize, "\u{f2d1}"),
             (Hot::Maximize, if maximized { "\u{f2d2}" } else { "\u{f2d0}" }),
@@ -2248,7 +2301,9 @@ impl Renderer {
         for ((c, x0, x1), (_, glyph)) in self.control_rects().into_iter().zip(glyphs) {
             Self::push_rect(&mut out, x0, hair, hair, self.title_bar_h - hair * 2.0, RULE, 1.0);
             let is_hover = self.hovered == Some(c);
-            let active = is_hover || (c == Hot::Gear && self.settings_open);
+            let active = is_hover
+                || (c == Hot::Gear && self.settings_open)
+                || (c == Hot::PaneMode && self.pane_mode);
             if active {
                 // fade the hover fill in; a settings-pinned gear stays at full
                 let ha = if is_hover { he } else { 1.0 };
@@ -2275,6 +2330,17 @@ impl Renderer {
                 let by = self.title_bar_h - arm - 3.0 * self.scale;
                 Self::push_rect(&mut out, bx - arm, by - th * 0.5, arm * 2.0, th, color, 1.0);
                 Self::push_rect(&mut out, bx - th * 0.5, by - arm, th, arm * 2.0, color, 1.0);
+            }
+            // pane-mode toggle: a 2x2 grid of panes, lit while the mode is active
+            if c == Hot::PaneMode {
+                let sz = (10.0 * self.scale).round();
+                let gap = (2.0 * self.scale).max(1.0);
+                let cell = ((sz - gap) / 2.0).max(1.0);
+                let gx0 = ((x0 + x1) / 2.0 - sz / 2.0).round();
+                let gy0 = (self.title_bar_h / 2.0 - sz / 2.0).round();
+                for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                    Self::push_rect(&mut out, gx0 + dx * (cell + gap), gy0 + dy * (cell + gap), cell, cell, color, 1.0);
+                }
             }
         }
 
@@ -2335,6 +2401,9 @@ impl Renderer {
         }
 
         // ---- overlays ----
+        if self.pane_menu_view.is_some() {
+            self.build_pane_menu(&mut out, track);
+        }
         if self.palette_view.is_some() {
             self.build_palette(&mut out, track);
         }
@@ -2598,6 +2667,39 @@ impl Renderer {
             }
             y += pad * 0.5;
             self.dock_hitboxes.push((dx, band_top, dw, (y - band_top).max(0.0)));
+        }
+    }
+
+    /// right-click pane context menu: a small panel of pane actions at the click
+    #[allow(non_snake_case)]
+    fn build_pane_menu(&mut self, out: &mut Vec<Instance>, track: f32) {
+        let Some(v) = self.pane_menu_view.as_ref() else {
+            return;
+        };
+        let (mx, my, hovered) = (v.x, v.y, v.hovered);
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mx, my);
+        let INK_0 = self.palette.ink0;
+        let INK_1 = self.palette.ink1;
+        let INK_3 = self.palette.ink3;
+        let RULE_2 = self.palette.rule2;
+        let TEXT_2 = self.palette.text2;
+        let PAPER = self.palette.paper;
+        let s = self.scale;
+        let hair = s.max(1.0);
+        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let mh = row_h * PANE_MENU_ITEMS.len() as f32 + pad * 2.0;
+        Self::push_rect(out, bx - 2.0 * s, by + 4.0 * s, mw + 4.0 * s, mh, INK_0, 0.5);
+        Self::push_rect(out, bx, by, mw, mh, INK_1, 1.0);
+        Self::stroke_rect(out, (bx, by, mw, mh), hair, RULE_2);
+        for (i, lbl) in PANE_MENU_ITEMS.iter().enumerate() {
+            let ry = by + pad + row_h * i as f32;
+            if hovered == Some(i) {
+                Self::push_rect(out, bx, ry, mw, row_h, INK_3, 1.0);
+                Self::push_rect(out, bx, ry, 2.0 * s, row_h, PAPER, 1.0);
+            }
+            let ty = (ry + (row_h - chrome_h) / 2.0).round();
+            let col = if hovered == Some(i) { PAPER } else { TEXT_2 };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad + 4.0 * s, ty, lbl, col, 1.0, track);
         }
     }
 
@@ -2981,8 +3083,8 @@ impl Renderer {
         Self::draw_text(&mut self.atlas, out, FontId::Chrome, px, y_top, val, val_c, 1.0, track)
     }
 
-    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32) -> Result<()> {
-        let instances = self.build(panes, focused, maximized, focus_ease);
+    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32, bare: bool) -> Result<()> {
+        let instances = self.build(panes, focused, maximized, focus_ease, bare);
         self.upload_atlas();
 
         let needed = instances.len() as u64;
@@ -3154,9 +3256,16 @@ impl Renderer {
     /// dev capture harness: render the scene into the offscreen target and write
     /// it to `path` as a PNG. only valid on a renderer from `new_headless`
     #[cfg(debug_assertions)]
-    pub fn render_png(&mut self, panes: &[PaneView], focused: bool, maximized: bool, path: &str) -> std::io::Result<()> {
+    pub fn render_png(
+        &mut self,
+        panes: &[PaneView],
+        focused: bool,
+        maximized: bool,
+        bare: bool,
+        path: &str,
+    ) -> std::io::Result<()> {
         use std::io::Error;
-        let instances = self.build(panes, focused, maximized, 1.0);
+        let instances = self.build(panes, focused, maximized, 1.0, bare);
         self.upload_atlas();
 
         let needed = instances.len() as u64;
