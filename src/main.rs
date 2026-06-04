@@ -11,6 +11,8 @@ mod term;
 mod win;
 #[cfg(debug_assertions)]
 mod termview;
+#[cfg(debug_assertions)]
+mod uiview;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -4153,6 +4155,11 @@ fn main() -> Result<()> {
     // dev-only headless screen dumper; never compiled into release
     #[cfg(debug_assertions)]
     if termview::maybe_run() {
+        return Ok(());
+    }
+    // dev-only headless chrome capture (full window to PNG)
+    #[cfg(debug_assertions)]
+    if uiview::maybe_run() {
         return Ok(());
     }
     timing("process start");

@@ -394,7 +394,11 @@ fn underline_rects(
 
 
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// None for a headless (offscreen) renderer used by the dev capture harness
+    surface: Option<wgpu::Surface<'static>>,
+    /// offscreen render target + readback buffer for the headless harness; None
+    /// for the normal windowed renderer, which draws straight to the surface
+    offscreen: Option<(wgpu::Texture, wgpu::Buffer)>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -662,6 +666,26 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let atlas = atlas_handle.join().expect("atlas build thread panicked");
+        Ok(Self::from_parts(
+            device, queue, Some(surface), format, config, atlas, scale, content_pt, chrome_pt, transparent,
+        ))
+    }
+
+    /// build the renderer from already-created gpu parts. shared by the windowed
+    /// `new` and the headless capture constructor; `surface` is None offscreen
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        surface: Option<wgpu::Surface<'static>>,
+        format: wgpu::TextureFormat,
+        config: wgpu::SurfaceConfiguration,
+        atlas: GlyphAtlas,
+        scale: f32,
+        content_pt: f32,
+        chrome_pt: f32,
+        transparent: bool,
+    ) -> Renderer {
         // the bundled default plus any common monospace families present on the
         // system (initially just the bundled one — system fonts load lazily)
         let fonts = Self::detect_fonts(&atlas);
@@ -820,6 +844,7 @@ impl Renderer {
 
         let mut r = Renderer {
             surface,
+            offscreen: None,
             device,
             queue,
             config,
@@ -879,7 +904,7 @@ impl Renderer {
             rows: 0,
         };
         r.recompute_grid_size();
-        Ok(r)
+        r
     }
 
     fn recompute_grid_size(&mut self) {
@@ -897,7 +922,9 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
         self.recompute_grid_size();
         // grow the GPU instance buffer eagerly here (off the render hot path) so
         // the first paint after a resize never reallocates mid-frame
@@ -3083,11 +3110,14 @@ impl Renderer {
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(());
+        };
+        let frame = match surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
             Cst::Outdated | Cst::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                match self.surface.get_current_texture() {
+                surface.configure(&self.device, &self.config);
+                match surface.get_current_texture() {
                     Cst::Success(f) | Cst::Suboptimal(f) => f,
                     _ => return Ok(()),
                 }
@@ -3164,6 +3194,177 @@ impl Renderer {
         self.scratch = instances;
         Ok(())
     }
+
+    /// dev capture harness: a surfaceless renderer that draws into an offscreen
+    /// texture so the full chrome (tab strip, buttons, menus, panes) can be
+    /// rendered to a PNG without a window. compiled out of release
+    #[cfg(debug_assertions)]
+    pub fn new_headless(width: u32, height: u32, content_pt: f32, chrome_pt: f32, scale: f32) -> Renderer {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("no gpu adapter for headless render");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("termie-headless"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("headless device");
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let atlas = GlyphAtlas::new(content_pt, chrome_pt, scale, None);
+        let mut r = Self::from_parts(device, queue, None, format, config, atlas, scale, content_pt, chrome_pt, false);
+
+        // offscreen target (COPY_SRC for readback) + a row-aligned readback buffer
+        let target = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-target"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let bpr = padded_bytes_per_row(width);
+        let readback = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: bpr as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        r.offscreen = Some((target, readback));
+        r
+    }
+
+    /// dev capture harness: render the scene into the offscreen target and write
+    /// it to `path` as a PNG. only valid on a renderer from `new_headless`
+    #[cfg(debug_assertions)]
+    pub fn render_png(&mut self, panes: &[PaneView], focused: bool, maximized: bool, path: &str) -> std::io::Result<()> {
+        use std::io::Error;
+        let instances = self.build(panes, focused, maximized, 1.0);
+        self.upload_atlas();
+
+        let needed = instances.len() as u64;
+        if needed > self.instance_capacity {
+            self.instance_capacity = (needed * 2).next_power_of_two();
+            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instances"),
+                size: self.instance_capacity * std::mem::size_of::<Instance>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !instances.is_empty() {
+            self.queue
+                .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        }
+        let uniforms = Uniforms {
+            screen: [self.config.width as f32, self.config.height as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let (width, height) = (self.config.width, self.config.height);
+        let Some((target, readback)) = self.offscreen.as_ref() else {
+            return Err(Error::other("render_png needs a headless renderer"));
+        };
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = self.palette.bg.to_linear_f32();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen-encoder") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: bg[0] as f64,
+                            g: bg[1] as f64,
+                            b: bg[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if !instances.is_empty() {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                pass.draw(0..6, 0..instances.len() as u32);
+            }
+        }
+        let bpr = padded_bytes_per_row(width);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // map the readback buffer (block until the gpu finishes) and un-pad rows
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let row = (width * 4) as usize;
+        let mut rgba = Vec::with_capacity(row * height as usize);
+        for y in 0..height as usize {
+            let start = y * bpr as usize;
+            rgba.extend_from_slice(&data[start..start + row]);
+        }
+        drop(data);
+        readback.unmap();
+        self.scratch = instances;
+        crate::render::preview::write_png(path, width, height, &rgba)
+    }
+}
+
+/// round a tightly-packed RGBA row up to wgpu's 256-byte copy alignment
+#[cfg(debug_assertions)]
+fn padded_bytes_per_row(width: u32) -> u32 {
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    unpadded.div_ceil(align) * align
 }
 
 #[cfg(test)]
