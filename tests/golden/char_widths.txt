@@ -1,0 +1,16 @@
+== termview ==
+fed 83 bytes: "0123456789|\r\n──────────|\r\n你好世界你|\r\n●◆■▲ABCDEF|"
+size 6x16  cursor (r3, c11) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1     
+    0123456789012345
+   +----------------+
+  0|0123456789|     |
+  1|──────────|     |
+  2|你 好 世 界 你 |     |
+  3|●◆■▲ABCDEF|     | <-- cursor row
+  4|                |
+  5|                |
+   +----------------+
+styles: (all default)

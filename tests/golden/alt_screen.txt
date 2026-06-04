@@ -1,0 +1,13 @@
+== termview ==
+fed 23 bytes: "primary\u{1b}[?1049halt text"
+size 3x10  cursor (r0, c8) shape=Block vis=true wrap_pending=false  alt=true
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         
+    0123456789
+   +----------+
+  0|alt text  | <-- cursor row
+  1|          |
+  2|          |
+   +----------+
+styles: (all default)

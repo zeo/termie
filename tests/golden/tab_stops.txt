@@ -1,0 +1,12 @@
+== termview ==
+fed 7 bytes: "a\tb\tc\td"
+size 2x28  cursor (r0, c25) shape=Block vis=true wrap_pending=false  alt=false
+kitty_flags=0  app_cursor=false  bracketed=false  mouse=Off sgr=false  focus_ev=false  sync=false  bell=false
+title=""  cwd=None  scrollback=0 lines  view_offset=0
+    0         1         2       
+    0123456789012345678901234567
+   +----------------------------+
+  0|a       b       c       d   | <-- cursor row
+  1|                            |
+   +----------------------------+
+styles: (all default)

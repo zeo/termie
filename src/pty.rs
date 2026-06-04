@@ -242,3 +242,91 @@ fn resolve_shell(kind: ShellKind) -> String {
             .unwrap_or_else(|| "wsl.exe".to_string()),
     }
 }
+
+#[cfg(test)]
+impl Pty {
+    /// a no-op pty for tests: build a Pane without spawning a real shell
+    pub(crate) fn null() -> Pty {
+        Pty {
+            master: Box::new(null_pty::NullMaster),
+            writer: Box::new(std::io::sink()),
+            child: Box::new(null_pty::NullChild),
+            reader: None,
+        }
+    }
+}
+
+// test-only null pty: lets a Pane be built without spawning a shell, so the
+// pane-tree and layout logic can be exercised headlessly. every operation is a
+// no-op (kill/resize/write do nothing; reads return EOF)
+#[cfg(test)]
+mod null_pty {
+    use super::*;
+    use portable_pty::{ChildKiller, ExitStatus};
+    use std::io::Result as IoResult;
+
+    #[derive(Debug)]
+    pub struct NullKiller;
+    impl ChildKiller for NullKiller {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NullKiller)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct NullChild;
+    impl ChildKiller for NullChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NullKiller)
+        }
+    }
+    impl Child for NullChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    pub struct NullMaster;
+    impl MasterPty for NullMaster {
+        fn resize(&self, _: PtySize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<portable_pty::unix::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+}

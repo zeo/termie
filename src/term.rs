@@ -452,15 +452,7 @@ impl Perform for Terminal {
             'M' => self.grid.delete_lines(param_at(params, 0, 1) as usize),
             '@' => self.grid.insert_chars(param_at(params, 0, 1) as usize),
             'P' => self.grid.delete_chars(param_at(params, 0, 1) as usize),
-            'X' => {
-                let n = param_at(params, 0, 1) as usize;
-                let row = self.grid.cursor.row;
-                let col = self.grid.cursor.col;
-                let end = (col + n).min(self.grid.cols);
-                for c in col..end {
-                    self.grid.lines[row][c] = Default::default();
-                }
-            }
+            'X' => self.grid.erase_chars(param_at(params, 0, 1) as usize),
             'S' => self.grid.scroll_up(param_at(params, 0, 1) as usize),
             'T' => self.grid.scroll_down(param_at(params, 0, 1) as usize),
             'm' => {

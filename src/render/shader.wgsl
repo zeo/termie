@@ -8,6 +8,8 @@ struct Uniforms {
 @group(1) @binding(1) var atlas_samp: sampler;
 @group(1) @binding(2) var icon_tex: texture_2d<f32>;
 @group(1) @binding(3) var icon_samp: sampler;
+@group(1) @binding(4) var color_tex: texture_2d<f32>;
+@group(1) @binding(5) var color_samp: sampler;
 
 struct InstanceIn {
     @location(0) pos: vec2<f32>,
@@ -59,6 +61,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let t = textureSample(icon_tex, icon_samp, in.uv);
         let ia = t.a * in.color.a;
         return vec4<f32>(t.rgb * ia, ia);
+    }
+    // kind 3: color (emoji) glyph from the RGBA atlas; carries its own color,
+    // so fg is not applied (only the alpha for the startup fade / opacity)
+    if (in.kind == 3u) {
+        let t = textureSample(color_tex, color_samp, in.uv);
+        let ca = t.a * in.color.a;
+        return vec4<f32>(t.rgb * ca, ca);
     }
     let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
     let a = in.color.a * cov;

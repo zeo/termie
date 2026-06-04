@@ -32,8 +32,27 @@ pub fn key_to_bytes(
     let alt = mods.alt_key();
     let shift = mods.shift_key();
 
-    // modifier code per the xterm/kitty spec (1 + bitfield)
-    let mod_code = 1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2);
+    // modifier code per the xterm/kitty spec (1 + bitfield: shift 1, alt 2,
+    // ctrl 4, super 8)
+    let mod_code = 1
+        + (shift as u8)
+        + ((alt as u8) << 1)
+        + ((ctrl as u8) << 2)
+        + ((mods.super_key() as u8) << 3);
+
+    // in legacy mode alt prefixes ESC (metaSendsEscape), the same convention the
+    // ordinary-text path uses; under the kitty protocol alt is folded into the
+    // modifier field instead, so the prefix is suppressed there
+    let legacy = |bytes: &[u8]| -> Option<Vec<u8>> {
+        pressed.then(|| {
+            let mut v = Vec::with_capacity(bytes.len() + 1);
+            if alt && !disambiguate {
+                v.push(0x1b);
+            }
+            v.extend_from_slice(bytes);
+            v
+        })
+    };
 
     // event type subparameter; forced to press (omitted) unless event reporting
     // is on, so legacy / flag-1-only output never carries a :evt field
@@ -55,7 +74,7 @@ pub fn key_to_bytes(
                 if disambiguate && mod_code > 1 {
                     return Some(csi_u(13, mod_code, evt));
                 }
-                return pressed.then(|| b"\r".to_vec());
+                return legacy(b"\r");
             }
             NamedKey::Tab => {
                 if disambiguate && mod_code > 1 {
@@ -64,13 +83,13 @@ pub fn key_to_bytes(
                 if !disambiguate && shift {
                     return pressed.then(|| b"\x1b[Z".to_vec());
                 }
-                return pressed.then(|| b"\t".to_vec());
+                return legacy(b"\t");
             }
             NamedKey::Backspace => {
                 if disambiguate && mod_code > 1 {
                     return Some(csi_u(127, mod_code, evt));
                 }
-                return pressed.then(|| b"\x7f".to_vec());
+                return legacy(b"\x7f");
             }
             // Escape is disambiguated even unmodified (so apps can tell a real
             // Esc keypress from the start of an escape sequence)
@@ -78,7 +97,7 @@ pub fn key_to_bytes(
                 if disambiguate {
                     return Some(csi_u(27, mod_code, evt));
                 }
-                return pressed.then(|| b"\x1b".to_vec());
+                return legacy(b"\x1b");
             }
             NamedKey::Space => {
                 if disambiguate && (ctrl || alt) {
@@ -87,7 +106,7 @@ pub fn key_to_bytes(
                 if ctrl && !disambiguate {
                     return pressed.then(|| vec![0u8]);
                 }
-                return pressed.then(|| b" ".to_vec());
+                return legacy(b" ");
             }
             NamedKey::ArrowUp => return Some(cursor_seq(b'A', mod_code, app_cursor, evt)),
             NamedKey::ArrowDown => return Some(cursor_seq(b'B', mod_code, app_cursor, evt)),
@@ -301,6 +320,33 @@ mod tests {
         assert_eq!(
             press(Key::Named(NamedKey::Escape), M::SHIFT, 1),
             Some(b"\x1b[27;2u".to_vec())
+        );
+    }
+
+    #[test]
+    fn alt_legacy_named_keys_get_esc_prefix() {
+        // metaSendsEscape: in legacy mode alt prefixes ESC on the C0 keys, the
+        // same as it does on ordinary characters
+        assert_eq!(
+            press(Key::Named(NamedKey::Backspace), M::ALT, 0),
+            Some(b"\x1b\x7f".to_vec())
+        );
+        assert_eq!(press(Key::Named(NamedKey::Enter), M::ALT, 0), Some(b"\x1b\r".to_vec()));
+        assert_eq!(press(Key::Named(NamedKey::Escape), M::ALT, 0), Some(b"\x1b\x1b".to_vec()));
+        // under the kitty protocol alt is folded into the modifier field, so the
+        // C0 keys disambiguate to CSI u instead of getting an ESC prefix
+        assert_eq!(
+            press(Key::Named(NamedKey::Backspace), M::ALT, 1),
+            Some(b"\x1b[127;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn super_modifier_reported_under_protocol() {
+        // super is kitty modifier bit 8 -> mod_code 9
+        assert_eq!(
+            press(Key::Named(NamedKey::ArrowLeft), M::SUPER, 1),
+            Some(b"\x1b[1;9D".to_vec())
         );
     }
 

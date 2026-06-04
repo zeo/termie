@@ -392,6 +392,7 @@ pub struct Renderer {
     uniform_bind_group: wgpu::BindGroup,
 
     atlas_texture: wgpu::Texture,
+    color_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     /// kept alive for the icon badge texture referenced by atlas_bind_group
     _icon_texture: wgpu::Texture,
@@ -418,6 +419,8 @@ pub struct Renderer {
     opacity: f32,
     start: Instant,
     hovered: Option<Hot>,
+    /// when the current hovered target was entered, for the hover fade-in
+    hover_since: Option<Instant>,
     settings_open: bool,
     settings_p: f32,
     settings_scroll: f32,
@@ -457,10 +460,119 @@ pub struct Renderer {
     pub rows: usize,
 }
 
+/// the uniform bind group layout (group 0): the screen-size uniform buffer
+fn build_uniform_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("uniform-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// the atlas bind group layout (group 1): alpha glyph atlas (0/1), app icon
+/// (2/3), and the color-emoji atlas (4/5). kept in sync with shader.wgsl
+fn build_atlas_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let samp = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("atlas-bgl"),
+        entries: &[tex(0), samp(1), tex(2), samp(3), tex(4), samp(5)],
+    })
+}
+
+/// the cell render pipeline (shader + layout + premultiplied-alpha blend),
+/// shared by Renderer::new and the headless pipeline-validation test so the
+/// test exercises the real layout-vs-shader binding match
+fn build_cell_pipeline(
+    device: &wgpu::Device,
+    uniform_bgl: &wgpu::BindGroupLayout,
+    atlas_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cell-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("pipeline-layout"),
+        bind_group_layouts: &[Some(uniform_bgl), Some(atlas_bgl)],
+        immediate_size: 0,
+    });
+    // premultiplied-alpha over operator
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cell-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Instance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &INSTANCE_ATTRS,
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 impl Renderer {
     pub fn new(window: Arc<Window>, content_pt: f32, chrome_pt: f32, backend: BackendChoice) -> Result<Renderer> {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
+
+        // build the bundled-font glyph atlas on a worker thread so its font load
+        // overlaps the gpu adapter/device request below (mostly driver wait)
+        // instead of running sequentially after it — shaves startup latency
+        let atlas_handle = std::thread::spawn(move || GlyphAtlas::new(content_pt, chrome_pt, scale, None));
 
         // build instance+surface+adapter for a backend set; DX12 is the Windows
         // default (Vulkan is slow under injected overlay layers — OBS/Overwolf)
@@ -528,13 +640,15 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            // a terminal renders far below a refresh of gpu work, so queue only
+            // one frame ahead — cuts up to a frame of input-to-photon latency
+            desired_maximum_frame_latency: 1,
             alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
 
-        let atlas = GlyphAtlas::new(content_pt, chrome_pt, scale, None);
+        let atlas = atlas_handle.join().expect("atlas build thread panicked");
         // the bundled default plus any common monospace families present on the
         // system (initially just the bundled one — system fonts load lazily)
         let fonts = Self::detect_fonts(&atlas);
@@ -545,19 +659,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("uniform-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let uniform_bgl = build_uniform_bgl(&device);
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniform-bg"),
             layout: &uniform_bgl,
@@ -632,43 +734,31 @@ impl Renderer {
             ..Default::default()
         });
 
-        let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("atlas-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+        // RGBA atlas for color (emoji) glyphs; srgb so the gpu linearizes on
+        // sample, matching the icon path
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color-glyph-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.dim,
+                height: atlas.dim,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
+        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("color-atlas-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let atlas_bgl = build_atlas_bgl(&device);
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas-bg"),
             layout: &atlas_bgl,
@@ -689,60 +779,18 @@ impl Renderer {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&icon_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&color_sampler),
+                },
             ],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cell-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline-layout"),
-            bind_group_layouts: &[Some(&uniform_bgl), Some(&atlas_bgl)],
-            immediate_size: 0,
-        });
-        // premultiplied-alpha over operator
-        let blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cell-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &INSTANCE_ATTRS,
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(blend),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = build_cell_pipeline(&device, &uniform_bgl, &atlas_bgl, format);
 
         let instance_capacity = 8192u64;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -766,6 +814,7 @@ impl Renderer {
             uniform_buffer,
             uniform_bind_group,
             atlas_texture,
+            color_texture,
             atlas_bind_group,
             _icon_texture: icon_texture,
             instance_buffer,
@@ -789,6 +838,7 @@ impl Renderer {
             opacity: 0.85,
             start: Instant::now(),
             hovered: None,
+            hover_since: None,
             settings_open: false,
             settings_p: 0.0,
             settings_scroll: 0.0,
@@ -925,8 +975,29 @@ impl Renderer {
 
     pub fn set_hovered(&mut self, h: Option<Hot>) -> bool {
         let changed = self.hovered != h;
+        if changed {
+            // restart the fade-in when entering a target; clear it when leaving
+            self.hover_since = h.is_some().then(Instant::now);
+        }
         self.hovered = h;
         changed
+    }
+
+    /// hover fade-in factor (0..1) for the currently hovered chrome target
+    fn hover_ease(&self) -> f32 {
+        const DUR: f32 = 0.11;
+        match self.hover_since {
+            None => 1.0,
+            Some(t) => {
+                let e = (t.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0);
+                1.0 - (1.0 - e).powi(3)
+            }
+        }
+    }
+
+    /// true while the hover fade-in is still in flight (drives redraws)
+    pub fn hover_animating(&self) -> bool {
+        self.hover_since.is_some_and(|t| t.elapsed().as_secs_f32() < 0.11)
     }
 
     pub fn set_pane_mode(&mut self, on: bool) {
@@ -1485,40 +1556,70 @@ impl Renderer {
     }
 
     fn upload_atlas(&mut self) {
-        if !self.atlas.dirty {
-            return;
-        }
         let dim = self.atlas.dim;
         // upload only the row band that changed; a freshly repacked atlas has no
         // band and uploads in full. width is the full atlas width (R8, so
         // bytes_per_row == dim, already 256-aligned for dim=1024)
-        let (y0, y1) = self.atlas.dirty_y.unwrap_or((0, dim));
-        let (y0, y1) = (y0.min(dim), y1.min(dim));
-        if y1 > y0 {
-            let off = (y0 * dim) as usize;
-            let end = (y1 * dim) as usize;
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.atlas.data[off..end],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(dim),
-                    rows_per_image: Some(y1 - y0),
-                },
-                wgpu::Extent3d {
-                    width: dim,
-                    height: y1 - y0,
-                    depth_or_array_layers: 1,
-                },
-            );
+        if self.atlas.dirty {
+            let (y0, y1) = self.atlas.dirty_y.unwrap_or((0, dim));
+            let (y0, y1) = (y0.min(dim), y1.min(dim));
+            if y1 > y0 {
+                let off = (y0 * dim) as usize;
+                let end = (y1 * dim) as usize;
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.atlas_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &self.atlas.data[off..end],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dim),
+                        rows_per_image: Some(y1 - y0),
+                    },
+                    wgpu::Extent3d {
+                        width: dim,
+                        height: y1 - y0,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            self.atlas.dirty = false;
+            self.atlas.dirty_y = None;
         }
-        self.atlas.dirty = false;
-        self.atlas.dirty_y = None;
+        // the color (emoji) atlas uploads independently; RGBA so bytes_per_row
+        // is dim*4 (16384 for dim=1024, still 256-aligned)
+        if self.atlas.color_dirty {
+            let (y0, y1) = self.atlas.color_dirty_y.unwrap_or((0, dim));
+            let (y0, y1) = (y0.min(dim), y1.min(dim));
+            if y1 > y0 {
+                let off = (y0 * dim * 4) as usize;
+                let end = (y1 * dim * 4) as usize;
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.color_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &self.atlas.color_data[off..end],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dim * 4),
+                        rows_per_image: Some(y1 - y0),
+                    },
+                    wgpu::Extent3d {
+                        width: dim,
+                        height: y1 - y0,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            self.atlas.color_dirty = false;
+            self.atlas.color_dirty_y = None;
+        }
     }
 
     fn push_rect(out: &mut Vec<Instance>, x: f32, y: f32, w: f32, h: f32, rgb: Rgb, alpha: f32) {
@@ -1831,7 +1932,7 @@ impl Renderer {
                             uv_min: g.uv_min,
                             uv_max: g.uv_max,
                             color: [lin[0], lin[1], lin[2], 1.0],
-                            kind: 1,
+                            kind: if g.color { 3 } else { 1 },
                             _pad: [0; 3],
                         });
                     }
@@ -1901,7 +2002,7 @@ impl Renderer {
                         uv_min: g.uv_min,
                         uv_max: g.uv_max,
                         color: [lin[0], lin[1], lin[2], alpha],
-                        kind: 1,
+                        kind: if g.color { 3 } else { 1 },
                         _pad: [0; 3],
                     });
                 }
@@ -1917,7 +2018,7 @@ impl Renderer {
     }
 
     #[allow(non_snake_case)]
-    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool) -> Vec<Instance> {
+    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32) -> Vec<Instance> {
         // chrome colors come from the active theme's palette
         let INK_0 = self.palette.ink0;
         let INK_1 = self.palette.ink1;
@@ -2003,7 +2104,8 @@ impl Renderer {
             }
             for (_, _, foc, rect) in &pane_info {
                 if *foc {
-                    Self::stroke_rect_a(&mut out, *rect, hair, PAPER, 0.55);
+                    // ease the accent border in on focus change (1.0 once settled)
+                    Self::stroke_rect_a(&mut out, *rect, hair, PAPER, 0.55 * focus_ease);
                 }
             }
         }
@@ -2060,6 +2162,7 @@ impl Renderer {
                 .collect();
         let newtab_rect = tl.newtab;
         let newtab_hover = self.hovered == Some(Hot::NewTab);
+        let he = self.hover_ease();
 
         for (_, rect, close, label, active, hov, close_hov) in &tab_items {
             let (tx, _ty, tw, _th) = *rect;
@@ -2068,7 +2171,7 @@ impl Renderer {
                 // accent underline on the active tab
                 Self::push_rect(&mut out, tx, self.title_bar_h - hair * 2.0, tw, hair * 2.0, PAPER, 1.0);
             } else if *hov {
-                Self::push_rect(&mut out, tx, hair, tw, self.title_bar_h - hair * 2.0, INK_3, 1.0);
+                Self::push_rect(&mut out, tx, hair, tw, self.title_bar_h - hair * 2.0, INK_3, he);
             }
             Self::push_rect(&mut out, tx, hair, hair, self.title_bar_h - hair * 2.0, RULE, 1.0);
 
@@ -2096,7 +2199,7 @@ impl Renderer {
         {
             let (nx, _ny, nw, _nh) = newtab_rect;
             if newtab_hover {
-                Self::push_rect(&mut out, nx, hair, nw, self.title_bar_h - hair * 2.0, INK_3, 1.0);
+                Self::push_rect(&mut out, nx, hair, nw, self.title_bar_h - hair * 2.0, INK_3, he);
             }
             let ngx = (nx + (nw - cw_c) / 2.0).round();
             let ncol = if newtab_hover { TEXT_2 } else { MUTE };
@@ -2117,9 +2220,12 @@ impl Renderer {
         ];
         for ((c, x0, x1), (_, glyph)) in self.control_rects().into_iter().zip(glyphs) {
             Self::push_rect(&mut out, x0, hair, hair, self.title_bar_h - hair * 2.0, RULE, 1.0);
-            let active = self.hovered == Some(c) || (c == Hot::Gear && self.settings_open);
+            let is_hover = self.hovered == Some(c);
+            let active = is_hover || (c == Hot::Gear && self.settings_open);
             if active {
-                let (hc, ha) = if c == Hot::Close { (PAPER, 1.0) } else { (INK_4, 1.0) };
+                // fade the hover fill in; a settings-pinned gear stays at full
+                let ha = if is_hover { he } else { 1.0 };
+                let hc = if c == Hot::Close { PAPER } else { INK_4 };
                 Self::push_rect(&mut out, x0, hair, x1 - x0, self.title_bar_h - hair * 2.0, hc, ha);
             }
             let gx = (x0 + (x1 - x0 - cw_c) / 2.0).round();
@@ -2133,6 +2239,16 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, gx, text_top, glyph, color, 1.0, track,
             );
+            // a small "+" badge on the split buttons so they read as "split —
+            // add a pane" rather than an ambiguous line icon
+            if c == Hot::SplitV || c == Hot::SplitH {
+                let arm = (3.5 * self.scale).max(2.0);
+                let th = hair.max(1.0);
+                let bx = x1 - arm - 3.0 * self.scale;
+                let by = self.title_bar_h - arm - 3.0 * self.scale;
+                Self::push_rect(&mut out, bx - arm, by - th * 0.5, arm * 2.0, th, color, 1.0);
+                Self::push_rect(&mut out, bx - th * 0.5, by - arm, th, arm * 2.0, color, 1.0);
+            }
         }
 
         // ---- status bar (flat) ----
@@ -2224,11 +2340,18 @@ impl Renderer {
                 // ease-out sweep across the title-bar rule: a faint trail behind
                 // a bright leading segment, the whole thing fading as it lands
                 let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                let seg = (96.0 * self.scale).min(w * ease);
                 let y = self.title_bar_h - hair * 2.0;
                 let head = w * ease;
                 Self::push_rect(&mut out, 0.0, y, head, hair * 2.0, PAPER, 0.12 * (1.0 - t));
-                let seg = (96.0 * self.scale).min(head);
                 Self::push_rect(&mut out, head - seg, y, seg, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
+                // mirror on the status-bar rule, sweeping the other way, so the
+                // instrument powers on from both rails toward the centre
+                let yb = h - self.status_bar_h;
+                let headx = w * (1.0 - ease);
+                Self::push_rect(&mut out, headx, yb, w - headx, hair * 2.0, PAPER, 0.12 * (1.0 - t));
+                let segb = (96.0 * self.scale).min(w - headx);
+                Self::push_rect(&mut out, headx, yb, segb, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
             }
         }
 
@@ -2831,8 +2954,8 @@ impl Renderer {
         Self::draw_text(&mut self.atlas, out, FontId::Chrome, px, y_top, val, val_c, 1.0, track)
     }
 
-    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool) -> Result<()> {
-        let instances = self.build(panes, focused, maximized);
+    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32) -> Result<()> {
+        let instances = self.build(panes, focused, maximized, focus_ease);
         self.upload_atlas();
 
         let needed = instances.len() as u64;
@@ -2938,5 +3061,62 @@ impl Renderer {
         // hand the buffer back so its capacity is reused next frame
         self.scratch = instances;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    // a surfaceless device, or None when no GPU adapter is present (e.g. CI),
+    // in which case the validation tests skip rather than fail
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("headless-test-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    // validate shader.wgsl through naga's front-end without a window — catches
+    // wgsl syntax/type errors (a malformed binding or fragment branch)
+    #[test]
+    fn shader_validates() {
+        let Some((device, _queue)) = headless_device() else {
+            return;
+        };
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cell-shader-test"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "shader.wgsl failed validation: {err:?}");
+    }
+
+    // build the real bind group layouts + cell pipeline headlessly: catches a
+    // shader/layout binding mismatch, e.g. if the color-emoji bindings 4/5 in
+    // shader.wgsl and build_atlas_bgl ever drift apart
+    #[test]
+    fn pipeline_validates() {
+        let Some((device, _queue)) = headless_device() else {
+            return;
+        };
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let uniform_bgl = super::build_uniform_bgl(&device);
+        let atlas_bgl = super::build_atlas_bgl(&device);
+        let _pipeline =
+            super::build_cell_pipeline(&device, &uniform_bgl, &atlas_bgl, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "cell pipeline failed validation: {err:?}");
     }
 }

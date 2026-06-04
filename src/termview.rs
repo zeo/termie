@@ -72,7 +72,9 @@ pub fn maybe_run() -> bool {
         };
         let pt = val("--pt").and_then(|v| v.parse().ok()).unwrap_or(16.0f32);
         let scale = val("--scale").and_then(|v| v.parse().ok()).unwrap_or(2.0f32);
-        match crate::render::preview::render_png(&term, theme, pt, scale, &path) {
+        // --system-fonts loads installed fonts so CJK/emoji fall back like the app
+        let system_fonts = args.iter().any(|a| a == "--system-fonts");
+        match crate::render::preview::render_png(&term, theme, pt, scale, system_fonts, &path) {
             Ok((w, h)) => println!("wrote {path} ({w}x{h})"),
             Err(e) => println!("png error: {e}"),
         }
@@ -436,6 +438,68 @@ mod golden {
                 rows: 3,
                 cols: 40,
                 bytes: b"\x1b[4:3mcurly\x1b[0m \x1b[4:2mdouble\x1b[0m \x1b[4:4mdotted\x1b[0m",
+                resize: None,
+            },
+            // cell-width correctness: each line is 10 cells of content then a
+            // `|` marker, which must land in the same column on every row.
+            // ascii (w1), box-drawing (w1), CJK (w2 x5), symbols (w1) + ascii
+            Case {
+                name: "char_widths",
+                rows: 6,
+                cols: 16,
+                bytes: b"0123456789|\r\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80|\r\n\xe4\xbd\xa0\xe5\xa5\xbd\xe4\xb8\x96\xe7\x95\x8c\xe4\xbd\xa0|\r\n\xe2\x97\x8f\xe2\x97\x86\xe2\x96\xa0\xe2\x96\xb2ABCDEF|",
+                resize: None,
+            },
+            // a wide char that won't fit in the last column must wrap whole to
+            // the next row, not split: col 9 stays blank and 你 starts row 1
+            Case {
+                name: "wide_at_edge",
+                rows: 4,
+                cols: 10,
+                bytes: b"123456789\xe4\xbd\xa0ABC",
+                resize: None,
+            },
+            // insert/delete chars: DCH shifts the tail left (blanks in at the
+            // right edge), ICH shifts it right (truncating at the edge)
+            Case {
+                name: "ich_dch",
+                rows: 3,
+                cols: 14,
+                bytes: b"hello world\x1b[1;1H\x1b[6P\x1b[2;1Habcdefg\x1b[2;1H\x1b[3@",
+                resize: None,
+            },
+            // scroll region (DECSTBM): rows 2-5 scroll, rows 1 and 6 are frozen.
+            // a linefeed at the bottom of the region scrolls only the region
+            Case {
+                name: "scroll_region",
+                rows: 6,
+                cols: 8,
+                bytes: b"r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\x1b[2;5r\x1b[5;1H\nNEW",
+                resize: None,
+            },
+            // tabs advance to the next 8-column stop
+            Case {
+                name: "tab_stops",
+                rows: 2,
+                cols: 28,
+                bytes: b"a\tb\tc\td",
+                resize: None,
+            },
+            // insert-line (IL) pushes the lines at/below the cursor down
+            Case {
+                name: "insert_line",
+                rows: 5,
+                cols: 8,
+                bytes: b"A\r\nB\r\nC\r\nD\x1b[2;1H\x1b[L",
+                resize: None,
+            },
+            // alt screen is a separate cleared buffer; entering it hides the
+            // primary content (which is restored on exit)
+            Case {
+                name: "alt_screen",
+                rows: 3,
+                cols: 10,
+                bytes: b"primary\x1b[?1049halt text",
                 resize: None,
             },
         ]

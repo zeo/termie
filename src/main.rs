@@ -1104,6 +1104,15 @@ struct App {
     keybindings: Vec<(ModifiersState, Key, PaletteAction)>,
     settings_open: bool,
     settings_anim: Option<Instant>,
+    /// set when the focused pane changes, so its accent border eases in instead
+    /// of snapping; cleared once the ease settles
+    focus_anim: Option<Instant>,
+    /// debug-only: TERMIE_BENCH=N auto-opens N tabs after startup to measure
+    /// warm-pool tab-open latency via the TERMIE_TIMING log
+    #[cfg(debug_assertions)]
+    bench_left: u32,
+    #[cfg(debug_assertions)]
+    bench_next: Option<Instant>,
     /// pool shells currently spawning on worker threads (not yet in `pool`)
     pending_warm: usize,
     /// set once the app is exiting so no new shells are spawned during teardown
@@ -1131,6 +1140,8 @@ struct App {
     link: Option<(usize, usize, usize)>,
     /// system fonts are scanned lazily after first paint to keep startup fast
     system_fonts_pending: bool,
+    /// the printable-ASCII glyph cache has been warmed once (off the boot path)
+    ascii_warmed: bool,
     /// consecutive failed pool spawns; backs off + gives up so a broken shell
     /// can't spin a busy respawn loop with a permanently empty window
     warm_fails: usize,
@@ -1201,6 +1212,7 @@ impl App {
             cursor_icon: CursorIcon::Default,
             link: None,
             system_fonts_pending: true,
+            ascii_warmed: false,
             warm_fails: 0,
             warm_backoff_until: None,
             sync_redraw_pending: None,
@@ -1212,6 +1224,11 @@ impl App {
             plugin_subs: Vec::new(),
             settings_open: false,
             settings_anim: None,
+            focus_anim: None,
+            #[cfg(debug_assertions)]
+            bench_left: std::env::var("TERMIE_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            #[cfg(debug_assertions)]
+            bench_next: None,
             pending_warm: 0,
             shutting_down: false,
             drag_divider: None,
@@ -1232,6 +1249,7 @@ impl App {
             .with_visible(false)
             .with_inner_size(LogicalSize::new(1000.0, 640.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
+        timing("window created");
 
         if let Ok(handle) = window.window_handle()
             && let RawWindowHandle::Win32(h) = handle.as_raw() {
@@ -1239,6 +1257,7 @@ impl App {
             }
 
         let renderer = Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend)?;
+        timing("renderer ready (gpu init)");
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
 
@@ -1273,13 +1292,15 @@ impl App {
                 log::warn!("quake hotkey unavailable (already in use by another app)");
             }
         }
-        // paint the chrome immediately (no pane yet) and reveal the window, then
-        // spawn the first shell asynchronously — pwsh startup never blocks the
-        // window appearing. the first pool shell to arrive becomes tab one.
+        // start the first shells now — the pane size is final once settings are
+        // applied, so the async pwsh spawn overlaps the first paint + reveal
+        // below instead of starting after them. the first pool shell becomes
+        // tab one. pwsh startup never blocks the window appearing
+        self.warm_pool();
         self.paint();
         window.set_visible(true);
+        timing("window shown");
         self.shown = true;
-        self.warm_pool();
         window.request_redraw();
         Ok(())
     }
@@ -1620,15 +1641,14 @@ impl App {
 
     fn focused_grid(&self) -> Option<&crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        self.pool.iter().find(|p| p.id == id).map(|p| &p.term.grid)
+        let root = self.tabs.get(self.active_tab)?.root.as_ref()?;
+        find_pane(root, id).map(|p| &p.term.grid)
     }
 
     fn focused_grid_mut(&mut self) -> Option<&mut crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        self.pool
-            .iter_mut()
-            .find(|p| p.id == id)
-            .map(|p| &mut p.term.grid)
+        let root = self.tabs.get_mut(self.active_tab)?.root.as_mut()?;
+        find_pane_mut(root, id).map(|p| &mut p.term.grid)
     }
 
     fn open_find(&mut self) {
@@ -1752,6 +1772,7 @@ impl App {
     /// render one frame: window title + every visible pane
     fn paint(&mut self) {
         let clock = win::local_hm();
+        let focus_ease = self.focus_ease();
         let git = self.git.clone();
         let sessions = self.tabs.len();
         let palette_view = self.palette.as_ref().map(|p| render::PaletteView {
@@ -1864,7 +1885,7 @@ impl App {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            if let Err(e) = r.render(&views, *focused, *maximized) {
+            if let Err(e) = r.render(&views, *focused, *maximized, focus_ease) {
                 log::error!("render error: {e:#}");
             }
         }
@@ -1958,7 +1979,14 @@ impl App {
         if self.renderer.is_none() {
             return;
         }
+        let t0 = Instant::now();
         let (cols, rows) = self.content_pane_size();
+        let from_pool = cwd.is_none()
+            && shell.is_none()
+            && self
+                .pool
+                .iter()
+                .any(|p| p.term.grid.cols == cols && p.term.grid.rows == rows);
         let pane = if cwd.is_none()
             && shell.is_none()
             && let Some(i) = self
@@ -1966,6 +1994,8 @@ impl App {
                 .iter()
                 .position(|p| p.term.grid.cols == cols && p.term.grid.rows == rows)
         {
+            // a ready pool shell already has its prompt — opening the tab is just
+            // a move + relayout, no shell spawn on the critical path
             Ok(self.pool.remove(i))
         } else {
             self.spawn_pane(cols, rows, cwd, shell)
@@ -1981,6 +2011,11 @@ impl App {
             self.sync_tabs();
             self.redraw();
             self.warm_pool();
+            timing(&format!(
+                "new tab ({}) in {:.2}ms",
+                if from_pool { "warm pool" } else { "fresh spawn" },
+                t0.elapsed().as_secs_f64() * 1000.0
+            ));
         }
     }
 
@@ -2033,6 +2068,19 @@ impl App {
                 } else {
                     1.0 - eased
                 }
+            }
+        }
+    }
+
+    /// 0→1 fade for the focused-pane accent border after a focus change, so it
+    /// eases in rather than snapping (1.0 once settled)
+    fn focus_ease(&self) -> f32 {
+        const DUR: f32 = 0.16;
+        match self.focus_anim {
+            None => 1.0,
+            Some(t) => {
+                let e = (t.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0);
+                1.0 - (1.0 - e).powi(3)
             }
         }
     }
@@ -2405,6 +2453,8 @@ impl App {
         } else {
             tab.focused = new_id;
         }
+        // ease the new pane's accent border in
+        self.focus_anim = Some(Instant::now());
         self.relayout_all();
         self.sync_tabs();
         self.redraw();
@@ -2423,6 +2473,8 @@ impl App {
             Some(node) => {
                 tab.focused = first_leaf(&node);
                 tab.root = Some(node);
+                // ease the surviving pane's accent border in
+                self.focus_anim = Some(Instant::now());
                 self.relayout_all();
                 self.redraw();
             }
@@ -2451,7 +2503,8 @@ impl App {
             false
         };
         if changed {
-            // tab label + git track the focused pane
+            // tab label + git track the focused pane; ease the accent border in
+            self.focus_anim = Some(Instant::now());
             self.sync_tabs();
             self.redraw();
             if let (Some(id), false) = (hit, self.plugins.is_empty()) {
@@ -2752,6 +2805,8 @@ impl App {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.focused = id;
             }
+            // ease the accent border in on the newly focused pane
+            self.focus_anim = Some(Instant::now());
             self.sync_tabs();
             self.redraw();
         }
@@ -2883,12 +2938,19 @@ impl App {
             }
             return true;
         }
+        // pane control mode is a toggle: the same chord (Ctrl+Shift+P) enters
+        // and exits it, so it stays on until you deliberately turn it off
+        if self.mods.control_key()
+            && self.mods.shift_key()
+            && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("p"))
+        {
+            self.set_pane_mode(!self.pane_mode);
+            return true;
+        }
         // pane control mode captures every key until exited
         if self.pane_mode {
             match &event.logical_key {
-                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
-                    self.set_pane_mode(false)
-                }
+                Key::Named(NamedKey::Escape) => self.set_pane_mode(false),
                 Key::Named(NamedKey::ArrowLeft) => self.focus_dir(-1, 0),
                 Key::Named(NamedKey::ArrowRight) => self.focus_dir(1, 0),
                 Key::Named(NamedKey::ArrowUp) => self.focus_dir(0, -1),
@@ -2955,10 +3017,6 @@ impl App {
                     self.sync_tabs();
                     self.redraw();
                 }
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("p") => {
-                self.set_pane_mode(true);
                 true
             }
             // broadcast input: type once, send to every pane in the tab
@@ -3188,6 +3246,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.relayout_all();
                         self.sync_tabs();
                         self.redraw();
+                        timing("first shell on screen");
                     } else {
                         self.pool.push(*pane);
                     }
@@ -3573,9 +3632,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 (self.active_focused_id(), self.cell_in_focused(cx, cy))
                             {
                                 let grid = self
-                                    .pool
-                                    .iter()
-                                    .find(|p| p.id == pane)
+                                    .tabs
+                                    .get(self.active_tab)
+                                    .and_then(|t| t.root.as_ref())
+                                    .and_then(|r| find_pane(r, pane))
                                     .map(|p| &p.term.grid);
                                 match self.click_seq {
                                     2 => {
@@ -3731,9 +3791,20 @@ impl ApplicationHandler<UserEvent> for App {
         // top up the warm pool once the window is up (one per tick, no spawn burst)
         if self.shown {
             self.warm_pool();
-            // scan system fonts once, deferred off the startup path so the window
-            // appears instantly; enables the font picker + non-Latin fallbacks
-            if self.system_fonts_pending {
+            // warm the printable-ASCII glyph cache as soon as the window is up, so
+            // the first shell output paints from a warm atlas instead of shaping
+            // ~95 glyphs on the first content frames. the bundled content font is
+            // already loaded, so this needs no system-font scan
+            if !self.ascii_warmed {
+                self.ascii_warmed = true;
+                if let Some(r) = self.renderer.as_mut() {
+                    r.prewarm_glyphs();
+                }
+            }
+            // scan system fonts once, deferred until the first shell is on screen
+            // so the prompt appears before this (event-loop-blocking) scan rather
+            // than after it; enables the font picker + non-Latin fallbacks
+            if self.system_fonts_pending && !self.tabs.is_empty() {
                 self.system_fonts_pending = false;
                 let want = self.persisted.font.clone();
                 let scanned = if let Some(r) = self.renderer.as_mut() {
@@ -3743,6 +3814,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if s
                         && let Some(f) = want.as_deref() {
                             r.set_font_by_name(f);
+                            // the switch cleared the cache; re-warm for the new font
+                            r.prewarm_glyphs();
                         }
                     s
                 } else {
@@ -3754,12 +3827,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.relayout_all();
                     self.redraw();
                 }
-                // warm the printable-ASCII glyph cache once the final content
-                // font is settled, so shell output paints from a warm atlas
-                // instead of shaping ~95 glyphs on the first content frames
-                if let Some(r) = self.renderer.as_mut() {
-                    r.prewarm_glyphs();
-                }
+                timing("system fonts scanned");
             }
             // spawn enabled plugins once, deferred off the boot path so a window
             // with no/disabled plugins pays nothing at startup
@@ -3767,6 +3835,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.plugins_started = true;
                 self.start_plugins();
             }
+        }
+        // debug-only: drive TERMIE_BENCH auto-opens once the first shell + pool
+        // are up, so warm-pool tab-open latency lands in the TERMIE_TIMING log
+        #[cfg(debug_assertions)]
+        if self.bench_left > 0 && !self.tabs.is_empty() {
+            match self.bench_next {
+                None => self.bench_next = Some(Instant::now() + Duration::from_millis(600)),
+                Some(t) if Instant::now() >= t => {
+                    self.new_tab();
+                    self.bench_left -= 1;
+                    self.bench_next = Some(Instant::now() + Duration::from_millis(600));
+                }
+                _ => {}
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50)));
+            return;
         }
         // first shell hasn't spawned yet after a failure: wake at the backoff
         // deadline to retry, rather than hot-looping or sleeping indefinitely
@@ -3805,6 +3889,27 @@ impl ApplicationHandler<UserEvent> for App {
                 ));
                 return;
             }
+        }
+        // focused-pane accent border ease: drive ~60fps until it settles, then
+        // fall back to the idle (event-driven) cadence
+        if let Some(t) = self.focus_anim {
+            if t.elapsed().as_secs_f32() >= 0.16 {
+                self.focus_anim = None;
+            } else {
+                self.redraw();
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ));
+                return;
+            }
+        }
+        // chrome-button hover fade-in: drive ~60fps only while it's in flight
+        if self.renderer.as_ref().is_some_and(|r| r.hover_animating()) {
+            self.redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
+            return;
         }
         // only tick (~2 redraws/sec) when a blinking cursor is actually on screen;
         // otherwise stay event-driven so idle panes cost nothing. content changes
@@ -3865,12 +3970,30 @@ impl App {
     }
 }
 
+/// opt-in startup timing: when TERMIE_TIMING names a file, append "<ms> label"
+/// lines at key milestones so startup latency can be measured. release is a
+/// windowed subsystem with no console, so this writes to a file, not stderr
+fn timing(label: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    static SINK: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    let sink = SINK.get_or_init(|| std::env::var_os("TERMIE_TIMING").map(Into::into));
+    if let Some(path) = sink
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(f, "{:>8.1} ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 fn main() -> Result<()> {
     // dev-only headless screen dumper; never compiled into release
     #[cfg(debug_assertions)]
     if termview::maybe_run() {
         return Ok(());
     }
+    timing("process start");
     // stop child shells (esp. pool shells racing exit) from popping OS error dialogs
     win::suppress_child_error_dialogs();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -3926,5 +4049,104 @@ mod tests {
         assert_eq!(parse_quake_key("grave"), None);
         assert_eq!(parse_quake_key(""), None);
         assert_eq!(parse_quake_key("ctrl+nonsense"), None);
+    }
+
+    // ---- headless pane-tree harness ----
+    // build real Panes (with a no-op pty) so the split/close/swap/layout logic
+    // can be exercised without a window or a shell
+
+    fn tp(id: usize) -> Pane {
+        Pane {
+            id,
+            term: Terminal::new(24, 80),
+            parser: Parser::new(),
+            pty: pty::Pty::null(),
+            ready: true,
+            flash: None,
+        }
+    }
+    fn leaf(id: usize) -> Node {
+        Node::Leaf(tp(id))
+    }
+    fn split(dir: Dir, ratio: f32, a: Node, b: Node) -> Node {
+        Node::Split { dir, ratio, a: Box::new(a), b: Box::new(b) }
+    }
+    fn ids(node: &Node) -> Vec<usize> {
+        let mut v = Vec::new();
+        each_pane(node, &mut |p| v.push(p.id));
+        v
+    }
+
+    #[test]
+    fn split_rects_partitions_without_gaps_or_overlap() {
+        let rect = (0.0, 0.0, 100.0, 60.0);
+        let (a, b) = split_rects(Dir::Vertical, rect, 0.5);
+        // left + right tile the width exactly, share full height, no overlap
+        assert_eq!(a, (0.0, 0.0, 50.0, 60.0));
+        assert_eq!(b, (50.0, 0.0, 50.0, 60.0));
+        assert_eq!(a.2 + b.2, rect.2);
+        let (t, btm) = split_rects(Dir::Horizontal, rect, 0.25);
+        assert_eq!(t, (0.0, 0.0, 100.0, 15.0));
+        assert_eq!(btm, (0.0, 15.0, 100.0, 45.0));
+        assert_eq!(t.3 + btm.3, rect.3);
+        // an extreme ratio is clamped so neither side collapses to zero
+        let (a2, b2) = split_rects(Dir::Vertical, rect, 0.0);
+        assert!(a2.2 >= 1.0 && b2.2 >= 1.0);
+    }
+
+    #[test]
+    fn layout_covers_every_leaf_once_and_tiles_the_rect() {
+        // a vertical split whose right child is itself split horizontally
+        let tree = split(
+            Dir::Vertical,
+            0.5,
+            leaf(1),
+            split(Dir::Horizontal, 0.5, leaf(2), leaf(3)),
+        );
+        let mut out = Vec::new();
+        layout(&tree, (0.0, 0.0, 100.0, 80.0), &mut out);
+        let got: Vec<usize> = out.iter().map(|(id, _)| *id).collect();
+        assert_eq!(got, vec![1, 2, 3]);
+        // total leaf area equals the parent rect area (a tiling, no overlap/gap)
+        let area: f32 = out.iter().map(|(_, r)| r.2 * r.3).sum();
+        assert!((area - 100.0 * 80.0).abs() < 1.0, "covered area {area}");
+        // pane 1 owns the left half; 2 and 3 share the right half stacked
+        assert_eq!(out[0].1, (0.0, 0.0, 50.0, 80.0));
+        assert_eq!(out[1].1.0, 50.0);
+        assert_eq!(out[2].1.0, 50.0);
+    }
+
+    #[test]
+    fn close_pane_promotes_the_sibling() {
+        let tree = split(Dir::Vertical, 0.5, leaf(1), split(Dir::Horizontal, 0.5, leaf(2), leaf(3)));
+        // closing pane 2 collapses its split so 3 takes the whole right side
+        let after = close_pane(tree, 2).expect("tree not empty");
+        assert_eq!(ids(&after), vec![1, 3]);
+        // the surviving structure is a single vertical split (1 | 3)
+        match &after {
+            Node::Split { a, b, .. } => {
+                assert!(matches!(**a, Node::Leaf(ref p) if p.id == 1));
+                assert!(matches!(**b, Node::Leaf(ref p) if p.id == 3));
+            }
+            _ => panic!("expected a split, got a leaf"),
+        }
+        // closing the last pane yields an empty tree
+        assert!(close_pane(leaf(7), 7).is_none());
+        // closing a missing id leaves the tree intact
+        let keep = close_pane(leaf(7), 99).expect("kept");
+        assert_eq!(ids(&keep), vec![7]);
+    }
+
+    #[test]
+    fn swap_panes_exchanges_two_leaves_in_place() {
+        let mut tree = split(Dir::Vertical, 0.5, leaf(1), split(Dir::Horizontal, 0.5, leaf(2), leaf(3)));
+        swap_panes(&mut tree, 1, 3);
+        // structure is unchanged, but the payloads at the 1 and 3 slots traded
+        assert_eq!(ids(&tree), vec![3, 2, 1]);
+        // first_leaf follows the a-side spine, now holding the swapped-in pane 3
+        assert_eq!(first_leaf(&tree), 3);
+        // swapping an id with itself is a no-op
+        swap_panes(&mut tree, 2, 2);
+        assert_eq!(ids(&tree), vec![3, 2, 1]);
     }
 }

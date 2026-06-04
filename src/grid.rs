@@ -759,12 +759,22 @@ impl Grid {
     }
 
     pub fn move_up(&mut self, n: usize) {
-        self.cursor.row = self.cursor.row.saturating_sub(n).max(self.region_top);
+        // cuu stops at the top margin only when the cursor starts at or below
+        // it; from above the margin it stops at the top of the screen (xterm)
+        let floor = if self.cursor.row >= self.region_top { self.region_top } else { 0 };
+        self.cursor.row = self.cursor.row.saturating_sub(n).max(floor);
         self.cursor.wrap_pending = false;
     }
 
     pub fn move_down(&mut self, n: usize) {
-        self.cursor.row = (self.cursor.row + n).min(self.region_bottom);
+        // symmetric to move_up: cud stops at the bottom margin only when the
+        // cursor starts at or above it, else at the bottom of the screen
+        let ceil = if self.cursor.row <= self.region_bottom {
+            self.region_bottom
+        } else {
+            self.rows - 1
+        };
+        self.cursor.row = (self.cursor.row + n).min(ceil);
         self.cursor.wrap_pending = false;
     }
 
@@ -856,6 +866,18 @@ impl Grid {
         for _ in 0..n {
             self.lines[row].remove(col);
             self.lines[row].push(blank);
+        }
+    }
+
+    /// erase n chars from the cursor in place (ECH); fills with the current
+    /// sgr background so erase-with-bce matches every other erase op
+    pub fn erase_chars(&mut self, n: usize) {
+        let row = self.cursor.row;
+        let col = self.cursor.col;
+        let blank = self.blank_cell();
+        let end = (col + n).min(self.cols);
+        for c in col..end {
+            self.lines[row][c] = blank;
         }
     }
 
@@ -977,6 +999,41 @@ mod tests {
         g.put_char('x');
         g.erase_in_display(2);
         assert_eq!(g.lines[0][0].c, ' ');
+    }
+
+    #[test]
+    fn ech_fills_with_current_background() {
+        let mut g = Grid::new(2, 5);
+        g.cursor.bg = Color::Indexed(4);
+        g.erase_chars(3);
+        for c in 0..3 {
+            assert_eq!(g.lines[0][c].c, ' ');
+            assert_eq!(g.lines[0][c].bg, Color::Indexed(4));
+        }
+        // past the erased run keeps the default background
+        assert_eq!(g.lines[0][3].bg, Color::DefaultBg);
+    }
+
+    #[test]
+    fn cuu_cud_stop_at_screen_edge_when_outside_region() {
+        let mut g = Grid::new(10, 4);
+        g.set_scroll_region(3, 7);
+        // above the top margin: cuu must reach the top of the screen, not snap
+        // down into the region
+        g.goto(1, 0);
+        g.move_up(5);
+        assert_eq!(g.cursor.row, 0);
+        // below the bottom margin: cud must reach the bottom of the screen
+        g.goto(8, 0);
+        g.move_down(5);
+        assert_eq!(g.cursor.row, 9);
+        // inside the region the margins still bound the motion
+        g.goto(5, 0);
+        g.move_up(10);
+        assert_eq!(g.cursor.row, 3);
+        g.goto(5, 0);
+        g.move_down(10);
+        assert_eq!(g.cursor.row, 7);
     }
 
     #[test]
@@ -1122,5 +1179,46 @@ mod tests {
         g.resize(5, 40);
         assert_eq!(row_text(&g, 0), "AAAA");
         assert_eq!(row_text(&g, 1), "BBBBBBBBBBBBBBBBBBBBBBBBB");
+    }
+
+    #[test]
+    fn reflow_preserves_scrollback_content() {
+        let mut g = Grid::new(4, 10);
+        g.set_scrollback_limit(100);
+        // ten distinct hard-newline lines on a 4-row screen, so six scroll into
+        // scrollback; "line-NN" is 7 chars so nothing wraps at width 10
+        for i in 0..10 {
+            for ch in format!("line-{i:02}").chars() {
+                g.put_char(ch);
+            }
+            g.carriage_return();
+            g.linefeed();
+        }
+        // rejoin soft-wrapped physical rows into logical lines before reading,
+        // so the check holds even at a width where the labels wrap
+        let collect_labels = |g: &Grid| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            for l in g.scrollback.iter().chain(g.lines.iter()) {
+                cur.extend(l.iter().map(|c| c.c));
+                if !l.wrapped {
+                    let t = cur.trim_end().to_string();
+                    if t.starts_with("line-") {
+                        out.push(t);
+                    }
+                    cur.clear();
+                }
+            }
+            out
+        };
+        let expect: Vec<String> = (0..10).map(|i| format!("line-{i:02}")).collect();
+        // widen then narrow: reflow drains + rejoins + redistributes scrollback
+        // each time, and must never lose, duplicate, or reorder a line
+        g.resize(4, 20);
+        assert_eq!(collect_labels(&g), expect, "after widen");
+        g.resize(4, 6);
+        assert_eq!(collect_labels(&g), expect, "after narrow (each line wraps)");
+        g.resize(4, 30);
+        assert_eq!(collect_labels(&g), expect, "after re-widen");
     }
 }
