@@ -146,7 +146,10 @@ impl Pty {
         let mut capture = std::env::var_os("TERMIE_CAPTURE")
             .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            // a larger read means fewer, fatter UserEvent::Pty hops under heavy
+            // streaming, cutting the fixed per-event handler cost (find_pane walk,
+            // cross-thread send); the Vec is sized to bytes actually read
+            let mut buf = [0u8; 32768];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
