@@ -1989,8 +1989,10 @@ impl App {
             for (id, rect) in &rects {
                 let (_, _, cols, rows) = r.pane_metrics(*rect);
                 if let Some(p) = find_pane_mut(root, *id) {
-                    // skip redundant resizes — resizing pwsh mid-startup wedges PSReadLine
-                    if p.term.grid.rows != rows || p.term.grid.cols != cols {
+                    // skip redundant resizes, and never resize a shell that hasn't
+                    // produced output yet — resizing pwsh mid-PSReadLine-startup
+                    // wedges it (same guard the warm pool already uses above)
+                    if p.ready && (p.term.grid.rows != rows || p.term.grid.cols != cols) {
                         p.resize(rows, cols);
                     }
                 }
@@ -3356,10 +3358,17 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut found = false;
                 let mut in_sync = false;
                 let mut rang = false;
+                let mut newly_ready = false;
                 for tab in &mut self.tabs {
                     if let Some(root) = tab.root.as_mut()
                         && let Some(p) = find_pane_mut(root, id) {
                             p.parser.advance(&mut p.term, &bytes);
+                            // first output means the shell has settled past its
+                            // PSReadLine startup, so it's now safe to resize
+                            if !p.ready {
+                                p.ready = true;
+                                newly_ready = true;
+                            }
                             in_sync = p.term.sync_output;
                             if !p.term.responses.is_empty() {
                                 responses = Some(std::mem::take(&mut p.term.responses));
@@ -3394,6 +3403,10 @@ impl ApplicationHandler<UserEvent> for App {
                     sat.pane.term.bell = false;
                     self.paint_satellite(idx);
                     found = true;
+                }
+                // a pane that just became ready may need its deferred resize
+                if newly_ready {
+                    self.relayout_all();
                 }
                 // let plugins react to the bell (host -> plugin event direction)
                 if rang && !self.plugins.is_empty() {
