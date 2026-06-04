@@ -175,7 +175,7 @@ fn srgb(l: f32) -> u8 {
 }
 
 // minimal dependency-free PNG writer: RGBA8, stored (uncompressed) zlib
-fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     let mut png: Vec<u8> = vec![137, 80, 78, 71, 13, 10, 26, 10];
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&w.to_be_bytes());
