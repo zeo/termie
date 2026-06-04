@@ -424,6 +424,8 @@ pub struct Renderer {
     /// persistent CPU instance buffer reused across frames (cleared, not
     /// reallocated, each build) to avoid per-frame heap churn on the hot path
     scratch: Vec<Instance>,
+    /// persistent pane-origin buffer reused across frames, same idea as scratch
+    pane_scratch: Vec<PaneInfo>,
 
     atlas: GlyphAtlas,
     palette: Palette,
@@ -868,6 +870,7 @@ impl Renderer {
             instance_buffer,
             instance_capacity,
             scratch: Vec::new(),
+            pane_scratch: Vec::new(),
             atlas,
             palette: Palette::from_theme(ThemeId::Instrument),
             theme: ThemeId::Instrument,
@@ -1145,8 +1148,15 @@ impl Renderer {
 
     /// re-measure the glyph atlas at a new content point size; returns new (cols, rows)
     pub fn set_content_pt(&mut self, pt: f32) -> (usize, usize) {
-        self.content_pt = pt.clamp(8.0, 32.0);
-        self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font);
+        let pt = pt.clamp(8.0, 32.0);
+        // re-rasterizing the atlas is the expensive part (two cosmic-text shape
+        // passes + clearing ~5MB of atlas buffers); skip it when the size is
+        // unchanged — notably at boot, where the worker already built the atlas
+        // at exactly this size. still recompute the grid (cols/rows start at 0)
+        if pt != self.content_pt {
+            self.content_pt = pt;
+            self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font);
+        }
         self.recompute_grid_size();
         (self.cols, self.rows)
     }
@@ -2149,14 +2159,14 @@ impl Renderer {
         }
         out.extend_from_slice(&self.gradient_cache);
 
-        // pre-resolve pane grid origins (immutable self) before borrowing the atlas
-        let pane_info: Vec<PaneInfo> = panes
-            .iter()
-            .map(|p| {
-                let (ox, oy, _, _) = self.pane_metrics(p.rect);
-                (ox, oy, p.focused, p.rect)
-            })
-            .collect();
+        // pre-resolve pane grid origins (immutable self) before borrowing the
+        // atlas; reuse a persistent buffer like scratch to avoid a per-frame alloc
+        let mut pane_info = std::mem::take(&mut self.pane_scratch);
+        pane_info.clear();
+        pane_info.extend(panes.iter().map(|p| {
+            let (ox, oy, _, _) = self.pane_metrics(p.rect);
+            (ox, oy, p.focused, p.rect)
+        }));
 
         // ---- terminal content (one grid per pane) ----
         let cursor_style = self.cursor_style;
@@ -2210,6 +2220,8 @@ impl Renderer {
                 Self::stroke_rect_a(&mut out, info.3, hair * 2.0, PAPER, pv.flash);
             }
         }
+        // last use of pane_info — hand the buffer back so its capacity persists
+        self.pane_scratch = pane_info;
 
         // a torn-off satellite window renders just its pane (the OS supplies the
         // title bar / close / move), so skip all the chrome and overlays below
@@ -2278,13 +2290,18 @@ impl Renderer {
             // truncate the label to the space before the close icon
             let avail = (close.0 - (tx + 10.0 * self.scale)).max(0.0);
             let maxc = (avail / cw_c).floor().max(0.0) as usize;
-            let mut lab = label.clone();
-            if lab.chars().count() > maxc && maxc > 1 {
-                lab = lab.chars().take(maxc.saturating_sub(1)).collect::<String>() + "\u{2026}";
-            }
+            // borrow the already-owned snapshot label; only allocate when the
+            // label actually needs truncating (the common case fits as-is)
+            let truncated;
+            let lab: &str = if label.chars().count() > maxc && maxc > 1 {
+                truncated = label.chars().take(maxc.saturating_sub(1)).collect::<String>() + "\u{2026}";
+                &truncated
+            } else {
+                label
+            };
             let lc = if *active { TEXT_2 } else { MUTE };
             let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, tx + 10.0 * self.scale, text_top, &lab, lc, 1.0, track,
+                &mut self.atlas, &mut out, FontId::Chrome, tx + 10.0 * self.scale, text_top, lab, lc, 1.0, track,
             );
             // close icon (nerd-font times), easing brighter on hover
             let (cx, cy, ccw, _cch) = *close;
