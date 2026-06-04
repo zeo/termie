@@ -243,6 +243,19 @@ fn resolve_shell(kind: ShellKind) -> String {
     }
 }
 
+#[cfg(test)]
+impl Pty {
+    /// a no-op pty for tests: build a Pane without spawning a real shell
+    pub(crate) fn null() -> Pty {
+        Pty {
+            master: Box::new(null_pty::NullMaster),
+            writer: Box::new(std::io::sink()),
+            child: Box::new(null_pty::NullChild),
+            reader: None,
+        }
+    }
+}
+
 // test-only null pty: lets a Pane be built without spawning a shell, so the
 // pane-tree and layout logic can be exercised headlessly. every operation is a
 // no-op (kill/resize/write do nothing; reads return EOF)
@@ -314,19 +327,6 @@ mod null_pty {
         #[cfg(unix)]
         fn tty_name(&self) -> Option<std::path::PathBuf> {
             None
-        }
-    }
-}
-
-#[cfg(test)]
-impl Pty {
-    /// a no-op pty for tests: build a Pane without spawning a real shell
-    pub(crate) fn null() -> Pty {
-        Pty {
-            master: Box::new(null_pty::NullMaster),
-            writer: Box::new(std::io::sink()),
-            child: Box::new(null_pty::NullChild),
-            reader: None,
         }
     }
 }
