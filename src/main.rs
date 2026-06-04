@@ -1188,14 +1188,15 @@ impl App {
         }
 
         self.active_tab = 0;
-        // paint the chrome immediately (no pane yet) and reveal the window, then
-        // spawn the first shell asynchronously — pwsh startup never blocks the
-        // window appearing. the first pool shell to arrive becomes tab one.
+        // start the first shells now — the pane size is final once settings are
+        // applied, so the async pwsh spawn overlaps the first paint + reveal
+        // below instead of starting after them. the first pool shell becomes
+        // tab one. pwsh startup never blocks the window appearing
+        self.warm_pool();
         self.paint();
         window.set_visible(true);
         timing("window shown");
         self.shown = true;
-        self.warm_pool();
         window.request_redraw();
         Ok(())
     }
