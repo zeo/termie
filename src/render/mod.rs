@@ -397,7 +397,9 @@ pub struct Renderer {
     /// None for a headless (offscreen) renderer used by the dev capture harness
     surface: Option<wgpu::Surface<'static>>,
     /// offscreen render target + readback buffer for the headless harness; None
-    /// for the normal windowed renderer, which draws straight to the surface
+    /// for the normal windowed renderer, which draws straight to the surface.
+    /// only read by the debug-only capture path, so release sees it as unused
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     offscreen: Option<(wgpu::Texture, wgpu::Buffer)>,
     device: wgpu::Device,
     queue: wgpu::Queue,
