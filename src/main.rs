@@ -1547,15 +1547,14 @@ impl App {
 
     fn focused_grid(&self) -> Option<&crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        self.pool.iter().find(|p| p.id == id).map(|p| &p.term.grid)
+        let root = self.tabs.get(self.active_tab)?.root.as_ref()?;
+        find_pane(root, id).map(|p| &p.term.grid)
     }
 
     fn focused_grid_mut(&mut self) -> Option<&mut crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        self.pool
-            .iter_mut()
-            .find(|p| p.id == id)
-            .map(|p| &mut p.term.grid)
+        let root = self.tabs.get_mut(self.active_tab)?.root.as_mut()?;
+        find_pane_mut(root, id).map(|p| &mut p.term.grid)
     }
 
     fn open_find(&mut self) {
@@ -3506,9 +3505,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 (self.active_focused_id(), self.cell_in_focused(cx, cy))
                             {
                                 let grid = self
-                                    .pool
-                                    .iter()
-                                    .find(|p| p.id == pane)
+                                    .tabs
+                                    .get(self.active_tab)
+                                    .and_then(|t| t.root.as_ref())
+                                    .and_then(|r| find_pane(r, pane))
                                     .map(|p| &p.term.grid);
                                 match self.click_seq {
                                     2 => {
