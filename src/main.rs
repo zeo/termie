@@ -2813,12 +2813,19 @@ impl App {
             }
             return true;
         }
+        // pane control mode is a toggle: the same chord (Ctrl+Shift+P) enters
+        // and exits it, so it stays on until you deliberately turn it off
+        if self.mods.control_key()
+            && self.mods.shift_key()
+            && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("p"))
+        {
+            self.set_pane_mode(!self.pane_mode);
+            return true;
+        }
         // pane control mode captures every key until exited
         if self.pane_mode {
             match &event.logical_key {
-                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
-                    self.set_pane_mode(false)
-                }
+                Key::Named(NamedKey::Escape) => self.set_pane_mode(false),
                 Key::Named(NamedKey::ArrowLeft) => self.focus_dir(-1, 0),
                 Key::Named(NamedKey::ArrowRight) => self.focus_dir(1, 0),
                 Key::Named(NamedKey::ArrowUp) => self.focus_dir(0, -1),
@@ -2885,10 +2892,6 @@ impl App {
                     self.sync_tabs();
                     self.redraw();
                 }
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("p") => {
-                self.set_pane_mode(true);
                 true
             }
             // broadcast input: type once, send to every pane in the tab

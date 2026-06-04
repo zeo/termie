@@ -2139,6 +2139,16 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, gx, text_top, glyph, color, 1.0, track,
             );
+            // a small "+" badge on the split buttons so they read as "split —
+            // add a pane" rather than an ambiguous line icon
+            if c == Hot::SplitV || c == Hot::SplitH {
+                let arm = (3.5 * self.scale).max(2.0);
+                let th = hair.max(1.0);
+                let bx = x1 - arm - 3.0 * self.scale;
+                let by = self.title_bar_h - arm - 3.0 * self.scale;
+                Self::push_rect(&mut out, bx - arm, by - th * 0.5, arm * 2.0, th, color, 1.0);
+                Self::push_rect(&mut out, bx - th * 0.5, by - arm, th, arm * 2.0, color, 1.0);
+            }
         }
 
         // ---- status bar (flat) ----
