@@ -592,6 +592,26 @@ fn set_divider_ratio(node: &mut Node, rect: Rect, path: &[usize], x: f32, y: f32
     }
 }
 
+/// grow or shrink the pane with `id` by nudging the ratio of its nearest
+/// ancestor split of orientation `dir`. returns true if a split was adjusted
+fn grow_focused(node: &mut Node, id: usize, dir: Dir, grow: bool, step: f32, done: &mut bool) -> bool {
+    match node {
+        Node::Leaf(p) => p.id == id,
+        Node::Split { dir: d, ratio, a, b } => {
+            let in_a = grow_focused(a, id, dir, grow, step, done);
+            let in_b = !in_a && grow_focused(b, id, dir, grow, step, done);
+            if (in_a || in_b) && !*done && *d == dir {
+                *done = true;
+                // ratio is the A child's fraction: growing a pane on the A side
+                // raises it, on the B side lowers it (and vice-versa for shrink)
+                let delta = if in_a == grow { step } else { -step };
+                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+            }
+            in_a || in_b
+        }
+    }
+}
+
 /// swap the panes of two distinct leaves (by id) in place
 fn swap_panes(node: &mut Node, a: usize, b: usize) {
     if a == b {
@@ -2609,6 +2629,21 @@ impl App {
         }
     }
 
+    /// grow/shrink the focused pane along `dir` (pane-mode keyboard resize)
+    fn resize_focused(&mut self, dir: Dir, grow: bool) {
+        let Some(fid) = self.tabs.get(self.active_tab).map(|t| t.focused) else {
+            return;
+        };
+        let mut done = false;
+        if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+            grow_focused(root, fid, dir, grow, 0.04, &mut done);
+        }
+        if done {
+            self.relayout_all();
+            self.redraw();
+        }
+    }
+
     /// report a mouse event to the pane under the cursor if it has mouse mode on;
     /// returns true if forwarded (caller should skip local selection/scroll)
     fn mouse_report(&mut self, btn: u8, pressed: bool, motion: bool) -> bool {
@@ -2861,6 +2896,11 @@ impl App {
         if self.pane_mode {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => self.set_pane_mode(false),
+                // shift+arrows resize the focused pane; plain arrows move focus
+                Key::Named(NamedKey::ArrowLeft) if self.mods.shift_key() => self.resize_focused(Dir::Vertical, false),
+                Key::Named(NamedKey::ArrowRight) if self.mods.shift_key() => self.resize_focused(Dir::Vertical, true),
+                Key::Named(NamedKey::ArrowUp) if self.mods.shift_key() => self.resize_focused(Dir::Horizontal, false),
+                Key::Named(NamedKey::ArrowDown) if self.mods.shift_key() => self.resize_focused(Dir::Horizontal, true),
                 Key::Named(NamedKey::ArrowLeft) => self.focus_dir(-1, 0),
                 Key::Named(NamedKey::ArrowRight) => self.focus_dir(1, 0),
                 Key::Named(NamedKey::ArrowUp) => self.focus_dir(0, -1),
