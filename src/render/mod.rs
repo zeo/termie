@@ -2416,11 +2416,11 @@ impl Renderer {
             );
         }
 
-        // title-bar buttons: split right|left, split top/bottom, gear, min, max, close
-        // (nerd-font codicons split-horizontal / split-vertical)
+        // title-bar buttons: split right|left, split top/bottom, gear, min, max, close.
+        // the split icons are drawn procedurally below (like pane-mode), not glyphs
         let glyphs = [
-            (Hot::SplitV, "\u{eb56}"),
-            (Hot::SplitH, "\u{eb57}"),
+            (Hot::SplitV, ""),
+            (Hot::SplitH, ""),
             (Hot::PaneMode, ""),
             (Hot::Gear, "\u{f013}"),
             (Hot::Minimize, "\u{f2d1}"),
@@ -2450,15 +2450,28 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, gx, text_top, glyph, color, 1.0, track,
             );
-            // a small "+" badge on the split buttons so they read as "split —
-            // add a pane" rather than an ambiguous line icon
+            // split icon as one cohesive mark: a pane frame, a divider on the
+            // split axis, and a "+" in the cell the split would open — so "split,
+            // add a pane" reads as a single machined icon, not a glyph + sticker
             if c == Hot::SplitV || c == Hot::SplitH {
-                let arm = (3.5 * self.scale).max(2.0);
-                let th = hair.max(1.0);
-                let bx = x1 - arm - 3.0 * self.scale;
-                let by = self.title_bar_h - arm - 3.0 * self.scale;
-                Self::push_rect(&mut out, bx - arm, by - th * 0.5, arm * 2.0, th, color, 1.0);
-                Self::push_rect(&mut out, bx - th * 0.5, by - arm, th, arm * 2.0, color, 1.0);
+                let s = self.scale;
+                let th = hair;
+                let sz = (12.0 * s).round();
+                let bx = ((x0 + x1) / 2.0 - sz / 2.0).round();
+                let by = (self.title_bar_h / 2.0 - sz / 2.0).round();
+                Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
+                let arm = (2.0 * s).max(1.5);
+                let (cx, cy) = if c == Hot::SplitV {
+                    // vertical divider; + in the right cell (new pane opens right)
+                    Self::push_rect(&mut out, (bx + sz / 2.0 - th / 2.0).round(), by, th, sz, color, 1.0);
+                    ((bx + sz * 0.75).round(), (by + sz / 2.0).round())
+                } else {
+                    // horizontal divider; + in the bottom cell (new pane opens below)
+                    Self::push_rect(&mut out, bx, (by + sz / 2.0 - th / 2.0).round(), sz, th, color, 1.0);
+                    ((bx + sz / 2.0).round(), (by + sz * 0.75).round())
+                };
+                Self::push_rect(&mut out, cx - arm, cy - th / 2.0, arm * 2.0, th, color, 1.0);
+                Self::push_rect(&mut out, cx - th / 2.0, cy - arm, th, arm * 2.0, color, 1.0);
             }
             // pane-mode toggle: a 2x2 grid of panes, lit while the mode is active
             if c == Hot::PaneMode {
@@ -2585,11 +2598,11 @@ impl Renderer {
             self.build_settings(&mut out, track);
         }
 
-        // startup reveal: a dim overlay eases up from the background while a
-        // PAPER accent line sweeps left→right under the title bar, like an
-        // instrument powering on. purely visual — input is live underneath the
-        // whole time. skipped while the settings panel is open so these rects
-        // can't land in the scissored panel range (they'd be clipped to it)
+        // startup reveal: a dim scrim eases up from the background and the
+        // title-rule seam firms once — a quiet settle, not a power-on. purely
+        // visual — input is live underneath the whole time. skipped while the
+        // settings panel is open so these rects can't land in the scissored
+        // panel range (they'd be clipped to it)
         if self.panel_clip.is_none() {
             let t = self.startup_t();
             if t < 1.0 {
@@ -2597,36 +2610,23 @@ impl Renderer {
                 if fade > 0.0 {
                     Self::push_rect(&mut out, 0.0, 0.0, w, h, INK_0, fade);
                 }
-                // ease-out sweep across the title-bar rule: a faint trail behind
-                // a bright leading segment, the whole thing fading as it lands
-                let ease = 1.0 - (1.0 - t) * (1.0 - t);
-                let seg = (120.0 * self.scale).min(w * ease);
-                let y = self.title_bar_h - hair * 2.0;
-                let head = w * ease;
-                Self::push_rect(&mut out, 0.0, y, head, hair * 2.0, PAPER, 0.16 * (1.0 - t));
-                Self::push_rect(&mut out, head - seg, y, seg, hair * 2.0, PAPER, 1.0 * (1.0 - t * t));
-                // mirror on the status-bar rule, sweeping the other way, so the
-                // instrument powers on from both rails toward the centre
-                let yb = h - self.status_bar_h;
-                let headx = w * (1.0 - ease);
-                Self::push_rect(&mut out, headx, yb, w - headx, hair * 2.0, PAPER, 0.16 * (1.0 - t));
-                let segb = (120.0 * self.scale).min(w - headx);
-                Self::push_rect(&mut out, headx, yb, segb, hair * 2.0, PAPER, 1.0 * (1.0 - t * t));
-                // a bright horizontal rule scans top→bottom once, trailing a soft
-                // glow, then fades as the instrument settles — the "power-on" tell
-                let scan = h * ease;
-                let band = (2.0 * self.scale).max(1.5);
-                let glow = 56.0 * self.scale;
-                let out_a = (1.0 - t) * (1.0 - t * t);
-                Self::push_rect(&mut out, 0.0, (scan - glow).max(0.0), w, glow.min(scan), PAPER, 0.06 * out_a);
-                Self::push_rect(&mut out, 0.0, scan, w, band, PAPER, 0.45 * out_a);
+                // a single in-place hairline firms the title-rule seam as the
+                // scrim clears, then fades — the chrome's own machined edge
+                // reading a touch crisper for a beat, not a laser sweep
+                let rise = t * (2.0 - t);
+                let settle = 1.0 - (1.0 - rise).powi(3);
+                let a = settle * (1.0 - t);
+                if a > 0.0 {
+                    let ay = self.title_bar_h - hair * 2.0;
+                    Self::push_rect(&mut out, 0.0, ay, w, hair, RULE_2, 0.6 * a);
+                }
             }
         }
 
         out
     }
 
-    const STARTUP_FADE: f32 = 0.34;
+    const STARTUP_FADE: f32 = 0.22;
 
     /// restart the power-on reveal; called the instant the window becomes
     /// visible so the whole animation plays in view rather than during gpu init
@@ -2646,7 +2646,7 @@ impl Renderer {
             return 0.0;
         }
         let e = 1.0 - t;
-        e * e
+        e * e * e
     }
 
     pub fn startup_fading(&self) -> bool {
