@@ -875,7 +875,7 @@ impl Default for Persisted {
             backend: render::BackendChoice::Auto,
             font_size: CONTENT_PT,
             padding: 6.0,
-            cursor: grid::CursorShape::Bar,
+            cursor: grid::CursorShape::Block,
             cursor_blink: true,
             theme: color::ThemeId::Instrument,
             font: None,

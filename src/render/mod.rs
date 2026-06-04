@@ -883,7 +883,7 @@ impl Renderer {
             settings_p: 0.0,
             settings_scroll: 0.0,
             panel_clip: None,
-            cursor_style: CursorShape::Bar,
+            cursor_style: CursorShape::Block,
             cursor_blink: true,
             pane_pad_px: 6.0,
             content_font: None,
