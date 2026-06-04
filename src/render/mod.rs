@@ -2450,28 +2450,26 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, gx, text_top, glyph, color, 1.0, track,
             );
-            // split icon as one cohesive mark: a pane frame, a divider on the
-            // split axis, and a "+" in the cell the split would open — so "split,
-            // add a pane" reads as a single machined icon, not a glyph + sticker
+            // a clean "split view" mark à la Konsole: a landscape window frame
+            // divided into two panes, one pane tinted so it reads as a split
+            // view at a glance. no plus, no clutter (new-tab "+" is its own button)
             if c == Hot::SplitV || c == Hot::SplitH {
                 let s = self.scale;
                 let th = hair;
-                let sz = (12.0 * s).round();
-                let bx = ((x0 + x1) / 2.0 - sz / 2.0).round();
-                let by = (self.title_bar_h / 2.0 - sz / 2.0).round();
-                Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
-                let arm = (2.0 * s).max(1.5);
-                let (cx, cy) = if c == Hot::SplitV {
-                    // vertical divider; + in the right cell (new pane opens right)
-                    Self::push_rect(&mut out, (bx + sz / 2.0 - th / 2.0).round(), by, th, sz, color, 1.0);
-                    ((bx + sz * 0.75).round(), (by + sz / 2.0).round())
+                let iw = (16.0 * s).round();
+                let ih = (12.0 * s).round();
+                let bx = ((x0 + x1) / 2.0 - iw / 2.0).round();
+                let by = (self.title_bar_h / 2.0 - ih / 2.0).round();
+                if c == Hot::SplitV {
+                    let half = (iw / 2.0).round();
+                    Self::push_rect(&mut out, bx, by, half, ih, color, 0.5);
+                    Self::push_rect(&mut out, (bx + half - th / 2.0).round(), by, th, ih, color, 1.0);
                 } else {
-                    // horizontal divider; + in the bottom cell (new pane opens below)
-                    Self::push_rect(&mut out, bx, (by + sz / 2.0 - th / 2.0).round(), sz, th, color, 1.0);
-                    ((bx + sz / 2.0).round(), (by + sz * 0.75).round())
-                };
-                Self::push_rect(&mut out, cx - arm, cy - th / 2.0, arm * 2.0, th, color, 1.0);
-                Self::push_rect(&mut out, cx - th / 2.0, cy - arm, th, arm * 2.0, color, 1.0);
+                    let half = (ih / 2.0).round();
+                    Self::push_rect(&mut out, bx, by, iw, half, color, 0.5);
+                    Self::push_rect(&mut out, bx, (by + half - th / 2.0).round(), iw, th, color, 1.0);
+                }
+                Self::stroke_rect(&mut out, (bx, by, iw, ih), th, color);
             }
             // pane-mode toggle: a 2x2 grid of panes, lit while the mode is active
             if c == Hot::PaneMode {
