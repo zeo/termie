@@ -1364,6 +1364,11 @@ impl App {
         // below instead of starting after them. the first pool shell becomes
         // tab one. pwsh startup never blocks the window appearing
         self.warm_pool();
+        // start the power-on reveal clock now so the whole animation plays once
+        // the window is visible, not during the (invisible) gpu-init wait
+        if let Some(r) = self.renderer.as_mut() {
+            r.begin_reveal();
+        }
         self.paint();
         window.set_visible(true);
         timing("window shown");

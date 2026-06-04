@@ -10,6 +10,13 @@ impl Rgb {
         Rgb { r, g, b }
     }
 
+    /// per-channel blend toward `other` by `t` in [0,1] for ui colour eases
+    pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        Rgb::new(mix(self.r, other.r), mix(self.g, other.g), mix(self.b, other.b))
+    }
+
     pub fn to_linear_f32(self) -> [f32; 4] {
         // srgb -> linear via a precomputed 256-entry table: this runs per cell
         // per color every paint, so the per-channel powf was the hot path's main

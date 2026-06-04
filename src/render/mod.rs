@@ -440,6 +440,10 @@ pub struct Renderer {
     transparent: bool,
     opacity: f32,
     start: Instant,
+    /// independent clock for the power-on reveal, restarted the moment the
+    /// window is shown so the whole animation plays in view (the gpu-init wait
+    /// would otherwise eat most of it before the first visible frame)
+    reveal_start: Instant,
     hovered: Option<Hot>,
     /// when the current hovered target was entered, for the hover fade-in
     hover_since: Option<Instant>,
@@ -881,6 +885,7 @@ impl Renderer {
             transparent,
             opacity: 0.85,
             start: Instant::now(),
+            reveal_start: Instant::now(),
             hovered: None,
             hover_since: None,
             settings_open: false,
@@ -2281,9 +2286,10 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, tx + 10.0 * self.scale, text_top, &lab, lc, 1.0, track,
             );
-            // close icon (nerd-font times), brighter on hover
+            // close icon (nerd-font times), easing brighter on hover
             let (cx, cy, ccw, _cch) = *close;
-            let cc = if *close_hov { PAPER } else if *active { MUTE } else { RULE_2 };
+            let cbase = if *active { MUTE } else { RULE_2 };
+            let cc = if *close_hov { cbase.lerp(PAPER, he) } else { cbase };
             let cgx = (cx + (ccw - cw_c) / 2.0).round();
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, cgx, cy.round(), "\u{f00d}", cc, 1.0, track,
@@ -2452,29 +2458,43 @@ impl Renderer {
                 // ease-out sweep across the title-bar rule: a faint trail behind
                 // a bright leading segment, the whole thing fading as it lands
                 let ease = 1.0 - (1.0 - t) * (1.0 - t);
-                let seg = (96.0 * self.scale).min(w * ease);
+                let seg = (120.0 * self.scale).min(w * ease);
                 let y = self.title_bar_h - hair * 2.0;
                 let head = w * ease;
-                Self::push_rect(&mut out, 0.0, y, head, hair * 2.0, PAPER, 0.12 * (1.0 - t));
-                Self::push_rect(&mut out, head - seg, y, seg, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
+                Self::push_rect(&mut out, 0.0, y, head, hair * 2.0, PAPER, 0.16 * (1.0 - t));
+                Self::push_rect(&mut out, head - seg, y, seg, hair * 2.0, PAPER, 1.0 * (1.0 - t * t));
                 // mirror on the status-bar rule, sweeping the other way, so the
                 // instrument powers on from both rails toward the centre
                 let yb = h - self.status_bar_h;
                 let headx = w * (1.0 - ease);
-                Self::push_rect(&mut out, headx, yb, w - headx, hair * 2.0, PAPER, 0.12 * (1.0 - t));
-                let segb = (96.0 * self.scale).min(w - headx);
-                Self::push_rect(&mut out, headx, yb, segb, hair * 2.0, PAPER, 0.85 * (1.0 - t * t));
+                Self::push_rect(&mut out, headx, yb, w - headx, hair * 2.0, PAPER, 0.16 * (1.0 - t));
+                let segb = (120.0 * self.scale).min(w - headx);
+                Self::push_rect(&mut out, headx, yb, segb, hair * 2.0, PAPER, 1.0 * (1.0 - t * t));
+                // a bright horizontal rule scans top→bottom once, trailing a soft
+                // glow, then fades as the instrument settles — the "power-on" tell
+                let scan = h * ease;
+                let band = (2.0 * self.scale).max(1.5);
+                let glow = 56.0 * self.scale;
+                let out_a = (1.0 - t) * (1.0 - t * t);
+                Self::push_rect(&mut out, 0.0, (scan - glow).max(0.0), w, glow.min(scan), PAPER, 0.06 * out_a);
+                Self::push_rect(&mut out, 0.0, scan, w, band, PAPER, 0.45 * out_a);
             }
         }
 
         out
     }
 
-    const STARTUP_FADE: f32 = 0.22;
+    const STARTUP_FADE: f32 = 0.34;
+
+    /// restart the power-on reveal; called the instant the window becomes
+    /// visible so the whole animation plays in view rather than during gpu init
+    pub fn begin_reveal(&mut self) {
+        self.reveal_start = Instant::now();
+    }
 
     /// normalized startup-reveal progress: 0 → 1 over STARTUP_FADE, then ≥ 1
     fn startup_t(&self) -> f32 {
-        (self.start.elapsed().as_secs_f32() / Self::STARTUP_FADE).min(1.0)
+        (self.reveal_start.elapsed().as_secs_f32() / Self::STARTUP_FADE).min(1.0)
     }
 
     /// dim-overlay alpha for the reveal: 1 → 0 over STARTUP_FADE (ease-out)
@@ -2488,7 +2508,7 @@ impl Renderer {
     }
 
     pub fn startup_fading(&self) -> bool {
-        self.start.elapsed().as_secs_f32() < Self::STARTUP_FADE
+        self.reveal_start.elapsed().as_secs_f32() < Self::STARTUP_FADE
     }
 
     #[allow(non_snake_case)]

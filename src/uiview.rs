@@ -41,6 +41,10 @@ pub fn maybe_run() -> bool {
         "menu" => {
             r.set_pane_menu(Some(PaneMenuView { x: 90.0, y: 150.0, hovered: Some(0) }));
         }
+        "reveal" => {
+            // restart the power-on clock so the capture lands mid-animation
+            r.begin_reveal();
+        }
         _ => {}
     }
 
