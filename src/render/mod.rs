@@ -3,6 +3,7 @@ mod atlas;
 pub mod preview;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -437,6 +438,11 @@ pub struct Renderer {
     /// the dim the gpu atlas textures were created at; when atlas.dim outgrows it
     /// upload_atlas recreates the textures + bind group at the new size
     atlas_gpu_dim: u32,
+    /// set by the device-lost callback; render() recreates the gpu on the next
+    /// frame so a driver reset / TDR doesn't permanently freeze the window
+    device_lost: Arc<AtomicBool>,
+    /// the window, kept so recreate() can rebuild the surface (None headless)
+    window: Option<Arc<Window>>,
 
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
@@ -923,7 +929,113 @@ impl Renderer {
             device, queue, Some(surface), format, config, atlas, scale, content_pt, chrome_pt, transparent,
         );
         r.backend_label = backend_label(adapter.get_info().backend);
+        r.window = Some(window);
         Ok(r)
+    }
+
+    /// rebuild the gpu (instance + surface + adapter + device + queue + all
+    /// device-owned handles) after a device loss, preserving the cpu-side glyph
+    /// atlas and all ui state. a no-op for the headless renderer
+    pub fn recreate(&mut self, window: Arc<Window>) -> Result<()> {
+        if self.surface.is_none() {
+            return Ok(());
+        }
+        // a surface is bound to its instance and a fresh device can't adopt a
+        // stale one, so the whole chain is rebuilt. recovery takes any adapter,
+        // including the software/WARP fallback
+        let backends = if cfg!(windows) {
+            wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL
+        } else {
+            wgpu::Backends::all()
+        };
+        let try_init = |force_fallback: bool| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+            desc.backends = backends;
+            let instance = wgpu::Instance::new(desc);
+            let surface = instance.create_surface(window.clone())?;
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: force_fallback,
+            }))
+            .map_err(|e| anyhow!("no GPU adapter on recreate: {e}"))?;
+            Ok((instance, surface, adapter))
+        };
+        let (_instance, surface, adapter) = match try_init(false) {
+            Ok(t) => t,
+            Err(_) => try_init(true)?,
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("termie-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let transparent = caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
+        let mut config = self.config.clone();
+        config.format = format;
+        config.alpha_mode = if transparent {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Opaque
+        };
+        surface.configure(&device, &config);
+
+        // re-arm the lost callback on the new device, reusing the same flag
+        {
+            let flag = self.device_lost.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    log::error!("gpu device lost: {reason:?}: {msg}");
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+
+        let gpu = build_gpu_resources(&device, &queue, self.atlas.dim, format);
+        // swap in the new device-owned handles; every cpu field (atlas, palette,
+        // tabs, ...) is preserved so the warm glyph cache and ui state survive
+        self.surface = Some(surface);
+        self.device = device;
+        self.queue = queue;
+        self.config = config;
+        // recovery may have landed on a different backend (incl. software/WARP);
+        // keep the settings ABOUT panel honest rather than showing the old one
+        self.backend_label = backend_label(adapter.get_info().backend);
+        self.transparent = transparent;
+        self.bg_alpha = if transparent { self.opacity } else { 1.0 };
+        self.uniform_buffer = gpu.uniform_buffer;
+        self.uniform_bind_group = gpu.uniform_bind_group;
+        self.pipeline = gpu.pipeline;
+        self.instance_buffer = gpu.instance_buffer;
+        self.instance_capacity = gpu.instance_capacity;
+        self.atlas_texture = gpu.atlas_texture;
+        self.color_texture = gpu.color_texture;
+        self.atlas_bind_group = gpu.atlas_bind_group;
+        self._icon_texture = gpu.icon_texture;
+        self.sampler = gpu.sampler;
+        self.icon_view = gpu.icon_view;
+        self.icon_sampler = gpu.icon_sampler;
+        self.color_sampler = gpu.color_sampler;
+        self.atlas_gpu_dim = self.atlas.dim;
+        // re-upload the warm cpu glyph bitmaps onto the fresh textures
+        self.atlas.dirty = true;
+        self.atlas.dirty_y = None;
+        self.atlas.color_dirty = true;
+        self.atlas.color_dirty_y = None;
+        self.device_lost.store(false, Ordering::SeqCst);
+        log::info!("gpu device recreated");
+        Ok(())
     }
 
     /// build the renderer from already-created gpu parts. shared by the windowed
@@ -967,6 +1079,20 @@ impl Renderer {
         let title_bar_h = (chrome_h + (14.0 * scale)).round();
         let status_bar_h = (chrome_h + (8.0 * scale)).round();
 
+        // arm device-lost recovery before `device` moves into the struct; the
+        // callback fires on a driver reset / TDR (not on our own teardown) and
+        // render() rebuilds the gpu on the next frame
+        let device_lost = Arc::new(AtomicBool::new(false));
+        {
+            let flag = device_lost.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    log::error!("gpu device lost: {reason:?}: {msg}");
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+
         let mut r = Renderer {
             surface,
             offscreen: None,
@@ -985,6 +1111,8 @@ impl Renderer {
             icon_sampler,
             color_sampler,
             atlas_gpu_dim: atlas.dim,
+            device_lost,
+            window: None,
             instance_buffer,
             instance_capacity,
             scratch: Vec::new(),
@@ -3466,6 +3594,13 @@ impl Renderer {
     }
 
     pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32, bare: bool) -> Result<()> {
+        // a device-lost callback fired since the last frame: rebuild the gpu now,
+        // before building/uploading anything against the dead device
+        if self.device_lost.swap(false, Ordering::SeqCst)
+            && let Some(w) = self.window.clone()
+        {
+            self.recreate(w)?;
+        }
         let instances = self.build(panes, focused, maximized, focus_ease, bare);
         self.upload_atlas();
 
@@ -3492,19 +3627,38 @@ impl Renderer {
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         use wgpu::CurrentSurfaceTexture as Cst;
-        let Some(surface) = self.surface.as_ref() else {
+        if self.surface.is_none() {
             return Ok(());
-        };
-        let frame = match surface.get_current_texture() {
-            Cst::Success(f) | Cst::Suboptimal(f) => f,
-            Cst::Outdated | Cst::Lost => {
-                surface.configure(&self.device, &self.config);
-                match surface.get_current_texture() {
-                    Cst::Success(f) | Cst::Suboptimal(f) => f,
-                    _ => return Ok(()),
+        }
+        // get_current_texture returns an owned enum, so the surface borrow ends
+        // before each arm runs — letting the Lost arm call the &mut self recreate
+        let frame = match self.surface.as_ref().unwrap().get_current_texture() {
+            Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
+            Cst::Outdated => {
+                // stale swapchain (resize / format change): cheap reconfigure
+                let s = self.surface.as_ref().unwrap();
+                s.configure(&self.device, &self.config);
+                match s.get_current_texture() {
+                    Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
+                    _ => None,
                 }
             }
-            _ => return Ok(()),
+            Cst::Lost => {
+                // swapchain/device lost: rebuild the gpu and SKIP this frame. the
+                // per-frame uploads above already ran against the now-dead device,
+                // so drawing now would use the fresh empty buffers (blank frame —
+                // and an over-capacity instance range could trip a validation
+                // abort). recreate clears device_lost + marks the atlas dirty, so
+                // the next frame repaints correctly against the new device
+                if let Some(w) = self.window.clone() {
+                    self.recreate(w)?;
+                }
+                return Ok(());
+            }
+            _ => None,
+        };
+        let Some(frame) = frame else {
+            return Ok(());
         };
         let view = frame
             .texture
@@ -3546,7 +3700,10 @@ impl Renderer {
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 pass.set_bind_group(1, &self.atlas_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                let total = instances.len() as u32;
+                // clamp the drawn range to the live buffer capacity so a count vs
+                // buffer-size desync can never feed an oversized range to wgpu
+                // (which, with panic=abort, would take the process down)
+                let total = (instances.len() as u32).min(self.instance_capacity as u32);
                 match self.panel_clip {
                     // everything up to `start` is the terminal/chrome + fixed panel
                     // (full surface); the body after it is clipped to the panel
