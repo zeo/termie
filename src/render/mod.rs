@@ -1316,9 +1316,22 @@ impl Renderer {
         true
     }
 
-    /// switch to a content font by family name (no-op if not available)
+    /// switch to a content font by family name. resolves against the known list
+    /// first; if the name isn't a built-in candidate but the family is actually
+    /// installed, inject it so any user-configured font resolves (not just the
+    /// six hardcoded ones). the leak is bounded: font switches are rare and only
+    /// a handful of distinct families are ever set in a session
     pub fn set_font_by_name(&mut self, name: &str) -> (usize, usize) {
-        if let Some(i) = self.fonts.iter().position(|f| f.eq_ignore_ascii_case(name))
+        let idx = match self.fonts.iter().position(|f| f.eq_ignore_ascii_case(name)) {
+            Some(i) => Some(i),
+            None if self.atlas.has_family(name) => {
+                let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+                self.fonts.push(leaked);
+                Some(self.fonts.len() - 1)
+            }
+            None => None,
+        };
+        if let Some(i) = idx
             && i != self.font_idx {
                 self.font_idx = i;
                 self.content_font = if i == 0 { None } else { Some(self.fonts[i]) };
