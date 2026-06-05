@@ -176,16 +176,60 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("quake drop-down", PaletteAction::Quake),
     ("cycle theme", PaletteAction::Theme),
     ("plugins", PaletteAction::Plugins),
+    ("find", PaletteAction::OpenFind),
+    ("copy", PaletteAction::Copy),
+    ("paste", PaletteAction::Paste),
+    ("broadcast input", PaletteAction::ToggleBroadcast),
+    ("close pane", PaletteAction::CloseFocusedPane),
+    ("font increase", PaletteAction::FontInc),
+    ("font decrease", PaletteAction::FontDec),
+    ("font reset", PaletteAction::FontReset),
     ("quit", PaletteAction::Quit),
 ];
 
+/// fuzzy subsequence score of `query` against `label`: every query char must
+/// appear in order; contiguous runs, word-boundary hits, and earlier matches
+/// score higher. None when the query is not a subsequence. case-insensitive
+fn fuzzy_score(query: &str, label: &str) -> Option<i32> {
+    let q: Vec<char> = query.trim().chars().map(|c| c.to_ascii_lowercase()).collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let lab: Vec<char> = label.chars().collect();
+    let mut score = 0i32;
+    let mut qi = 0usize;
+    let mut prev: Option<usize> = None;
+    for (li, &lc) in lab.iter().enumerate() {
+        if qi >= q.len() {
+            break;
+        }
+        if lc.to_ascii_lowercase() == q[qi] {
+            score += 1;
+            if prev == Some(li.wrapping_sub(1)) {
+                score += 5; // contiguous with the previous match
+            }
+            if li == 0 || matches!(lab.get(li - 1), Some(' ' | '-' | '_' | ':')) {
+                score += 8; // at a word boundary
+            }
+            score -= (li as i32) / 4; // earlier matches slightly preferred
+            prev = Some(li);
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then_some(score)
+}
+
+/// palette entries matching `query`, best match first (stable by label on ties)
 fn palette_filter(query: &str) -> Vec<(&'static str, PaletteAction)> {
-    let q = query.to_ascii_lowercase();
-    PALETTE_ACTIONS
+    if query.trim().is_empty() {
+        return PALETTE_ACTIONS.to_vec();
+    }
+    let mut scored: Vec<(i32, &'static str, PaletteAction)> = PALETTE_ACTIONS
         .iter()
-        .filter(|(label, _)| q.is_empty() || label.to_ascii_lowercase().contains(&q))
-        .copied()
-        .collect()
+        .filter_map(|(label, a)| fuzzy_score(query, label).map(|s| (s, *label, *a)))
+        .collect();
+    scored.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(y.1)));
+    scored.into_iter().map(|(_, l, a)| (l, a)).collect()
 }
 
 struct PaletteState {
@@ -4927,6 +4971,22 @@ mod tests {
         assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));
         assert_eq!(action_from_label("select tab 3"), Some(PaletteAction::SelectTab(2)));
         assert_eq!(action_from_label("bogus action"), None);
+    }
+
+    #[test]
+    fn fuzzy_palette_matches_and_ranks() {
+        assert!(fuzzy_score("xyz", "new tab").is_none());
+        assert!(fuzzy_score("nt", "new tab").is_some());
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+        // a word-boundary/contiguous match outranks a scattered subsequence
+        let prefix = fuzzy_score("set", "settings").unwrap();
+        let scattered = fuzzy_score("set", "split vertical").unwrap();
+        assert!(prefix > scattered);
+        // filter returns only subsequence matches, best-first, and a clean prefix wins
+        let r = palette_filter("split");
+        assert!(r.iter().all(|(l, _)| fuzzy_score("split", l).is_some()));
+        assert!(r.first().map(|(l, _)| l.starts_with("split")).unwrap_or(false));
+        assert_eq!(palette_filter("").len(), PALETTE_ACTIONS.len());
     }
 
     #[test]
