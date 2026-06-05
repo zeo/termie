@@ -227,17 +227,27 @@ impl GlyphAtlas {
         };
         self.content = self.measure(self.content);
         self.chrome = self.measure(self.chrome);
-        // discard the old rasterized glyphs and repack from scratch
+        // discard the old rasterized glyphs and repack from scratch (same dim)
+        self.repack_at(self.dim);
+    }
+
+    /// reset the shelf packing + glyph cache and clear the cpu atlas buffers,
+    /// reallocating them when `dim` changes (the grow path); flags a full
+    /// re-upload. shared by reconfigure (same dim) and the 1024 -> 2048 grow
+    fn repack_at(&mut self, dim: u32) {
+        if dim != self.dim || self.data.len() != (dim * dim) as usize {
+            self.data = vec![0u8; (dim * dim) as usize];
+            self.color_data = vec![0u8; (dim * dim * 4) as usize];
+            self.dim = dim;
+        } else {
+            // same dim: zero in place (avoids a ~5MB realloc on a font/size change)
+            self.data.iter_mut().for_each(|b| *b = 0);
+            self.color_data.iter_mut().for_each(|b| *b = 0);
+        }
         self.cache.clear();
         self.cursor_x = PAD;
         self.cursor_y = PAD;
         self.shelf_h = 0;
-        for b in self.data.iter_mut() {
-            *b = 0;
-        }
-        for b in self.color_data.iter_mut() {
-            *b = 0;
-        }
         self.dirty = true;
         self.dirty_y = None;
         self.color_dirty = true;
@@ -265,9 +275,31 @@ impl GlyphAtlas {
         if let Some(g) = self.cache.get(&key) {
             return *g;
         }
-        let g = self.rasterize(key);
-        self.cache.insert(key, g);
-        g
+        match self.rasterize(key) {
+            RasterOutcome::Glyph(g) => {
+                self.cache.insert(key, Some(g));
+                Some(g)
+            }
+            // nothing to draw — caching None is correct here
+            RasterOutcome::Empty => {
+                self.cache.insert(key, None);
+                None
+            }
+            // the shelf filled: grow 1024 -> 2048, or (already at max) clear and
+            // repack for forward progress, then retry once. never cache a NoSpace
+            // as None, or this glyph would render blank for the rest of the session
+            RasterOutcome::NoSpace => {
+                const MAX_DIM: u32 = 2048;
+                self.repack_at(MAX_DIM);
+                match self.rasterize(key) {
+                    RasterOutcome::Glyph(g) => {
+                        self.cache.insert(key, Some(g));
+                        Some(g)
+                    }
+                    _ => None,
+                }
+            }
+        }
     }
 
     /// rasterize printable ASCII for the content font (regular weight) up front
@@ -285,9 +317,9 @@ impl GlyphAtlas {
         }
     }
 
-    fn rasterize(&mut self, key: GlyphKey) -> Option<AtlasGlyph> {
+    fn rasterize(&mut self, key: GlyphKey) -> RasterOutcome {
         if key.c == ' ' || key.c.is_control() {
-            return None;
+            return RasterOutcome::Empty;
         }
 
         let m = self.metrics(key.font);
@@ -306,19 +338,25 @@ impl GlyphAtlas {
         self.buffer.shape_until_scroll(&mut self.font_system, false);
 
         // the glyph's cache key comes from the first run's first glyph
-        let cache_key = self
+        let cache_key = match self
             .buffer
             .layout_runs()
             .next()
-            .and_then(|run| run.glyphs.first().map(|g| g.physical((0.0, 0.0), 1.0).cache_key))?;
+            .and_then(|run| run.glyphs.first().map(|g| g.physical((0.0, 0.0), 1.0).cache_key))
+        {
+            Some(k) => k,
+            None => return RasterOutcome::Empty,
+        };
 
         let (w, h, left, top, is_color, pixels) = {
             let image = self.swash.get_image(&mut self.font_system, cache_key);
-            let image = image.as_ref()?;
+            let Some(image) = image.as_ref() else {
+                return RasterOutcome::Empty;
+            };
             let w = image.placement.width;
             let h = image.placement.height;
             if w == 0 || h == 0 {
-                return None;
+                return RasterOutcome::Empty;
             }
             let is_color = matches!(image.content, SwashContent::Color);
             // color glyphs keep their RGBA; everything else collapses to coverage
@@ -330,7 +368,12 @@ impl GlyphAtlas {
             (w, h, image.placement.left, image.placement.top, is_color, pixels)
         };
 
-        let (x, y) = self.alloc(w, h)?;
+        // a full shelf is not a missing glyph: signal NoSpace so get() can grow
+        // or evict and retry (never cache it, or it renders blank forever)
+        let (x, y) = match self.alloc(w, h) {
+            Some(p) => p,
+            None => return RasterOutcome::NoSpace,
+        };
         if is_color {
             for row in 0..h {
                 let dst = (((y + row) * self.dim + x) * 4) as usize;
@@ -349,7 +392,7 @@ impl GlyphAtlas {
         }
 
         let d = self.dim as f32;
-        Some(AtlasGlyph {
+        RasterOutcome::Glyph(AtlasGlyph {
             uv_min: [x as f32 / d, y as f32 / d],
             uv_max: [(x + w) as f32 / d, (y + h) as f32 / d],
             width: w as f32,
@@ -388,6 +431,15 @@ impl GlyphAtlas {
         self.shelf_h = self.shelf_h.max(h);
         Some(pos)
     }
+}
+
+/// outcome of rasterizing one glyph: a packed glyph; a genuinely-empty glyph
+/// (space / control / zero-size — safe to cache as None); or the shelf ran out
+/// of room, which must NOT be cached so get() can grow/evict and retry
+enum RasterOutcome {
+    Glyph(AtlasGlyph),
+    Empty,
+    NoSpace,
 }
 
 /// load Iosevka (content) + Departure Mono (chrome) from the assets dir.
@@ -522,5 +574,46 @@ mod tests {
         }
         assert!(color_alpha > 0, "color glyph must have non-zero rgba in the color atlas");
         assert_eq!(alpha_cov, 0, "color glyph must not also be stored in the alpha atlas");
+    }
+
+    // growing the atlas must REALLOCATE the cpu buffers, not just zero them:
+    // rasterize copies rows at a dim stride, so a stale 1024-sized buffer would
+    // index out of bounds the moment dim bumps to 2048
+    #[test]
+    fn repack_at_reallocates_on_grow() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None);
+        assert_eq!(atlas.dim, 1024);
+        atlas.repack_at(2048);
+        assert_eq!(atlas.dim, 2048);
+        assert_eq!(atlas.data.len(), 2048 * 2048);
+        assert_eq!(atlas.color_data.len(), 2048 * 2048 * 4);
+        assert_eq!((atlas.cursor_x, atlas.cursor_y), (PAD, PAD));
+        assert!(atlas.dirty && atlas.dirty_y.is_none(), "grow must flag a full re-upload");
+    }
+
+    // exhausting the 1024 shelf must grow to 2048 and keep returning real glyphs
+    // — never a permanently-blank slot from a cached alloc-failure. needs enough
+    // distinct rasterizable glyphs to fill 1024, so it is gated on the host
+    // actually having them (font-poor CI never trips the grow and still passes)
+    #[test]
+    fn atlas_grows_instead_of_blanking() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None);
+        atlas.load_system_fonts();
+        // a wide CJK sweep so distinct glyphs pile up fast on a host with the fonts
+        for cp in 0x4E00u32..0x4E00 + 6000 {
+            if let Some(c) = char::from_u32(cp) {
+                let _ = atlas.get(GlyphKey { font: FontId::Content, c, bold: false, italic: false });
+            }
+            if atlas.dim == 2048 {
+                break;
+            }
+        }
+        if atlas.dim != 2048 {
+            return; // host lacks enough distinct glyphs to exhaust the 1024 atlas
+        }
+        // after the grow a normal glyph must resolve to a real packed slot, not a
+        // cached blank (the no-cache-on-NoSpace invariant, observed end to end)
+        let g = atlas.get(GlyphKey { font: FontId::Content, c: 'A', bold: false, italic: false });
+        assert!(g.is_some(), "a normal glyph must still rasterize after the atlas grows");
     }
 }

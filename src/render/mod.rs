@@ -428,6 +428,15 @@ pub struct Renderer {
     atlas_bind_group: wgpu::BindGroup,
     /// kept alive for the icon badge texture referenced by atlas_bind_group
     _icon_texture: wgpu::Texture,
+    /// samplers + icon view referenced by atlas_bind_group, kept so the bind
+    /// group can be rebuilt when the atlas grows (the 1024 -> 2048 grow path)
+    sampler: wgpu::Sampler,
+    icon_view: wgpu::TextureView,
+    icon_sampler: wgpu::Sampler,
+    color_sampler: wgpu::Sampler,
+    /// the dim the gpu atlas textures were created at; when atlas.dim outgrows it
+    /// upload_atlas recreates the textures + bind group at the new size
+    atlas_gpu_dim: u32,
 
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
@@ -555,6 +564,56 @@ fn build_atlas_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         label: Some("atlas-bgl"),
         entries: &[tex(0), samp(1), tex(2), samp(3), tex(4), samp(5)],
     })
+}
+
+/// create the R8 coverage atlas + RGBA color atlas at `dim` and the 6-entry
+/// atlas bind group over them (reusing the fixed icon view + the three
+/// samplers). shared by from_parts and the 1024 -> 2048 grow so the layout can
+/// never drift between the two
+fn make_atlas_bind_group(
+    device: &wgpu::Device,
+    dim: u32,
+    sampler: &wgpu::Sampler,
+    icon_view: &wgpu::TextureView,
+    icon_sampler: &wgpu::Sampler,
+    color_sampler: &wgpu::Sampler,
+) -> (wgpu::Texture, wgpu::Texture, wgpu::BindGroup) {
+    let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glyph-atlas"),
+        size: wgpu::Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color-glyph-atlas"),
+        size: wgpu::Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bgl = build_atlas_bgl(device);
+    let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("atlas-bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(icon_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(icon_sampler) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&color_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(color_sampler) },
+        ],
+    });
+    (atlas_texture, color_texture, atlas_bind_group)
 }
 
 /// the cell render pipeline (shader + layout + premultiplied-alpha blend),
@@ -912,6 +971,11 @@ impl Renderer {
             color_texture,
             atlas_bind_group,
             _icon_texture: icon_texture,
+            sampler,
+            icon_view,
+            icon_sampler,
+            color_sampler,
+            atlas_gpu_dim: atlas.dim,
             instance_buffer,
             instance_capacity,
             scratch: Vec::new(),
@@ -1808,6 +1872,23 @@ impl Renderer {
     }
 
     fn upload_atlas(&mut self) {
+        // the atlas grew (1024 -> 2048): recreate the gpu textures + bind group
+        // at the new dim before uploading. repack_at already flagged a full
+        // re-upload, so the bands below repopulate the fresh textures this call
+        if self.atlas.dim != self.atlas_gpu_dim {
+            let (at, ct, bg) = make_atlas_bind_group(
+                &self.device,
+                self.atlas.dim,
+                &self.sampler,
+                &self.icon_view,
+                &self.icon_sampler,
+                &self.color_sampler,
+            );
+            self.atlas_texture = at;
+            self.color_texture = ct;
+            self.atlas_bind_group = bg;
+            self.atlas_gpu_dim = self.atlas.dim;
+        }
         let dim = self.atlas.dim;
         // upload only the row band that changed; a freshly repacked atlas has no
         // band and uploads in full. width is the full atlas width (R8, so
