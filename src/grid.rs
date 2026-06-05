@@ -51,6 +51,16 @@ impl Default for Cell {
     }
 }
 
+/// a placed kitty image: anchored to an absolute line (col, abs_line) so it
+/// scrolls with the text. image_id indexes the owning Terminal's ImageStore;
+/// the image draws at its native pixel size from that cell
+#[derive(Clone, Copy)]
+pub struct Placement {
+    pub image_id: u32,
+    pub abs_line: u64,
+    pub col: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CursorShape {
     Block,
@@ -144,6 +154,8 @@ pub struct Grid {
     /// grapheme clusters; a cell's cluster id indexes here, 0 = none and
     /// clusters[0] is the empty sentinel
     clusters: Vec<String>,
+    /// kitty graphics placements anchored to absolute lines (scroll with text)
+    placements: Vec<Placement>,
 }
 
 fn blank_line(cols: usize) -> Line {
@@ -195,6 +207,7 @@ impl Grid {
             scrollback_limit: 10_000,
             links: vec![String::new()],
             clusters: vec![String::new()],
+            placements: Vec::new(),
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
             region_top: 0,
@@ -881,6 +894,8 @@ impl Grid {
                         self.lines[r][c] = blank;
                     }
                 }
+                // a full screen clear also removes any image placements
+                self.placements.clear();
             }
             _ => {}
         }
@@ -1053,6 +1068,35 @@ impl Grid {
             end += 1;
         }
         (start, end + 1)
+    }
+
+    /// place a kitty image at the cursor, anchored to the current absolute line
+    /// so it scrolls with the surrounding text
+    pub fn place_image(&mut self, image_id: u32) {
+        let abs_line = self.total_scrolled + self.cursor.row as u64;
+        self.placements.push(Placement {
+            image_id,
+            abs_line,
+            col: self.cursor.col,
+        });
+        if self.placements.len() > 1024 {
+            self.placements.remove(0);
+        }
+    }
+
+    pub fn clear_placements(&mut self) {
+        self.placements.clear();
+    }
+
+    pub fn placements(&self) -> &[Placement] {
+        &self.placements
+    }
+
+    /// the on-screen row (0..rows) for an absolute line if currently visible,
+    /// accounting for the scrollback view offset
+    pub fn screen_row(&self, abs_line: u64) -> Option<usize> {
+        let r = abs_line as i64 - self.total_scrolled as i64 + self.view_offset as i64;
+        (r >= 0 && (r as usize) < self.rows).then_some(r as usize)
     }
 }
 

@@ -73,6 +73,8 @@ pub struct GlyphAtlas {
 
     cache: HashMap<GlyphKey, Option<AtlasGlyph>>,
     cluster_cache: HashMap<(String, bool, bool), Option<AtlasGlyph>>,
+    /// kitty images packed into the color atlas, keyed by global image key
+    image_cache: HashMap<u64, Option<AtlasGlyph>>,
 }
 
 const PAD: u32 = 1;
@@ -137,6 +139,7 @@ impl GlyphAtlas {
             system_loaded: false,
             cache: HashMap::new(),
             cluster_cache: HashMap::new(),
+            image_cache: HashMap::new(),
         };
         atlas.data = vec![0u8; (atlas.dim * atlas.dim) as usize];
         atlas.color_data = vec![0u8; (atlas.dim * atlas.dim * 4) as usize];
@@ -248,6 +251,7 @@ impl GlyphAtlas {
         }
         self.cache.clear();
         self.cluster_cache.clear();
+        self.image_cache.clear();
         self.cursor_x = PAD;
         self.cursor_y = PAD;
         self.shelf_h = 0;
@@ -538,6 +542,59 @@ impl GlyphAtlas {
         })
     }
 
+    /// pack a decoded RGBA image into the color atlas, cached by its global key.
+    /// returns the uv rect, or None if it doesn't fit (too large, or the atlas is
+    /// full this frame — we never repack mid-draw, which would corrupt already-
+    /// emitted glyph instances)
+    pub fn get_image(&mut self, key: u64, rgba: &[u8], w: u32, h: u32) -> Option<AtlasGlyph> {
+        if let Some(g) = self.image_cache.get(&key) {
+            return *g;
+        }
+        match self.pack_image(rgba, w, h) {
+            ImagePack::Ok(g) => {
+                self.image_cache.insert(key, Some(g));
+                Some(g)
+            }
+            ImagePack::TooBig => {
+                self.image_cache.insert(key, None);
+                None
+            }
+            // atlas full: don't cache, retry next frame once space frees
+            ImagePack::NoSpace => None,
+        }
+    }
+
+    fn pack_image(&mut self, rgba: &[u8], w: u32, h: u32) -> ImagePack {
+        if w == 0 || h == 0 {
+            return ImagePack::TooBig;
+        }
+        let needed = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if rgba.len() < needed || w + PAD * 2 > 2048 || h + PAD * 2 > 2048 {
+            return ImagePack::TooBig;
+        }
+        let (x, y) = match self.alloc(w, h) {
+            Some(p) => p,
+            None => return ImagePack::NoSpace,
+        };
+        for row in 0..h {
+            let dst = (((y + row) * self.dim + x) * 4) as usize;
+            let src = (row * w * 4) as usize;
+            self.color_data[dst..dst + (w * 4) as usize]
+                .copy_from_slice(&rgba[src..src + (w * 4) as usize]);
+        }
+        self.mark_color_dirty(y, y + h);
+        let d = self.dim as f32;
+        ImagePack::Ok(AtlasGlyph {
+            uv_min: [x as f32 / d, y as f32 / d],
+            uv_max: [(x + w) as f32 / d, (y + h) as f32 / d],
+            width: w as f32,
+            height: h as f32,
+            left: 0.0,
+            top: 0.0,
+            color: true,
+        })
+    }
+
     /// extend the color atlas's pending-upload band, mirroring mark_dirty_rows
     fn mark_color_dirty(&mut self, y0: u32, y1: u32) {
         if !(self.color_dirty && self.color_dirty_y.is_none()) {
@@ -574,6 +631,14 @@ impl GlyphAtlas {
 enum RasterOutcome {
     Glyph(AtlasGlyph),
     Empty,
+    NoSpace,
+}
+
+enum ImagePack {
+    Ok(AtlasGlyph),
+    /// permanently can't fit (larger than the max atlas) — cache as a miss
+    TooBig,
+    /// the atlas is full this frame — skip without caching, retry next frame
     NoSpace,
 }
 

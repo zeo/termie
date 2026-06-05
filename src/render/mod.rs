@@ -2491,6 +2491,30 @@ impl Renderer {
             }
         }
 
+        // kitty image placements: each visible image drawn as a color-atlas quad
+        // on top of the cells it overlaps, anchored to its absolute line so it
+        // scrolls with the text
+        for p in grid.placements() {
+            let Some(srow) = grid.screen_row(p.abs_line) else {
+                continue;
+            };
+            let Some(img) = term.images.get(p.image_id) else {
+                continue;
+            };
+            let Some(g) = atlas.get_image(img.key, &img.rgba, img.width, img.height) else {
+                continue;
+            };
+            out.push(Instance {
+                pos: [ox + p.col as f32 * cell_w, oy + srow as f32 * cell_h],
+                size: [g.width, g.height],
+                uv_min: g.uv_min,
+                uv_max: g.uv_max,
+                color: [0.0, 0.0, 0.0, 1.0],
+                kind: 3,
+                _pad: [0; 3],
+            });
+        }
+
         // scroll position indicator: a thin thumb on the pane's right edge,
         // shown only while scrolled into history, sized + positioned to the
         // viewport's slice of total (scrollback + screen) lines

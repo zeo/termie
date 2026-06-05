@@ -95,6 +95,8 @@ pub struct Terminal {
     gl: u8,
     /// last printed char, for REP (CSI Ps b)
     last_print: Option<char>,
+    /// decoded kitty graphics images for this pane
+    pub images: crate::image::ImageStore,
 }
 
 impl Terminal {
@@ -123,6 +125,7 @@ impl Terminal {
             g1: Charset::Ascii,
             gl: 0,
             last_print: None,
+            images: crate::image::ImageStore::default(),
         }
     }
 

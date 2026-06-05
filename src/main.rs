@@ -4,6 +4,7 @@
 mod a11y;
 mod apc;
 mod color;
+mod image;
 mod grid;
 mod input;
 mod plugin;
@@ -1030,21 +1031,55 @@ fn node_to_snap(node: &Node, leaf_ids: &mut Vec<usize>) -> session::NodeSnap {
 fn pump_bytes(pane: &mut Pane, bytes: &[u8]) {
     let (pass, imgs) = pane.apc.feed(bytes);
     pane.parser.advance(&mut pane.term, &pass);
-    for img in &imgs {
-        if let Some(cmd) = apc::KittyCmd::parse(img) {
-            log::debug!(
-                "kitty graphics: a={} f={} {}x{} id={} more={} q={} {}B",
-                cmd.action as char,
-                cmd.format,
-                cmd.width,
-                cmd.height,
-                cmd.id,
-                cmd.more,
-                cmd.quiet,
-                cmd.payload.len()
-            );
+    for raw in &imgs {
+        if let Some(cmd) = apc::KittyCmd::parse(raw) {
+            handle_kitty(&mut pane.term, &cmd);
         }
     }
+}
+
+/// apply a kitty graphics command to a pane's terminal: store/decode images,
+/// anchor placements at the cursor, delete, and queue the APC ack
+fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
+    match cmd.action {
+        b't' | b'T' => {
+            if let Some(id) =
+                term.images.transmit(cmd.id, cmd.format, cmd.width, cmd.height, cmd.more, &cmd.payload)
+            {
+                if cmd.action == b'T' {
+                    term.grid.place_image(id);
+                }
+                if cmd.quiet == 0 {
+                    kitty_ok(term, cmd.id);
+                }
+            }
+        }
+        b'p' => {
+            if term.images.get(cmd.id).is_some() {
+                term.grid.place_image(cmd.id);
+                if cmd.quiet == 0 {
+                    kitty_ok(term, cmd.id);
+                }
+            }
+        }
+        b'd' => {
+            term.images.delete(cmd.id);
+            term.grid.clear_placements();
+        }
+        b'q' => {
+            if cmd.quiet == 0 {
+                kitty_ok(term, cmd.id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// queue a kitty "OK" APC response for the program (drained to the pty with the
+/// other terminal responses)
+fn kitty_ok(term: &mut Terminal, id: u32) {
+    term.responses
+        .extend_from_slice(format!("\x1b_Gi={id};OK\x1b\\").as_bytes());
 }
 
 fn build_pane(
