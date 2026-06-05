@@ -18,6 +18,8 @@ pub struct TabSnap {
     /// be re-keyed after restore renumbers pane ids
     pub focused_leaf: usize,
     pub root: NodeSnap,
+    /// user-given tab name overriding the cwd label (None = use the cwd)
+    pub title: Option<String>,
 }
 
 pub enum NodeSnap {
@@ -63,16 +65,21 @@ impl SessionFile {
 
 impl TabSnap {
     fn to_json(&self) -> Json {
-        Json::obj([
-            ("focused_leaf", Json::Num(self.focused_leaf as f64)),
-            ("root", self.root.to_json()),
-        ])
+        let mut pairs = vec![
+            ("focused_leaf".to_string(), Json::Num(self.focused_leaf as f64)),
+            ("root".to_string(), self.root.to_json()),
+        ];
+        if let Some(t) = &self.title {
+            pairs.push(("title".to_string(), Json::Str(t.clone())));
+        }
+        Json::Obj(pairs.into_iter().collect())
     }
 
     fn from_json(v: &Json) -> Option<TabSnap> {
         let focused_leaf = v.get("focused_leaf").and_then(Json::as_f64).unwrap_or(0.0) as usize;
         let root = NodeSnap::from_json(v.get("root")?)?;
-        Some(TabSnap { focused_leaf, root })
+        let title = v.get("title").and_then(Json::as_str).map(str::to_string);
+        Some(TabSnap { focused_leaf, root, title })
     }
 }
 
@@ -129,6 +136,7 @@ mod tests {
                 TabSnap {
                     focused_leaf: 0,
                     root: NodeSnap::Leaf { cwd: Some("C:/a".into()), shell: "pwsh".into() },
+                    title: None,
                 },
                 TabSnap {
                     focused_leaf: 1,
@@ -138,6 +146,7 @@ mod tests {
                         a: Box::new(NodeSnap::Leaf { cwd: None, shell: "cmd".into() }),
                         b: Box::new(NodeSnap::Leaf { cwd: Some("C:/b".into()), shell: "wsl".into() }),
                     },
+                    title: Some("build".into()),
                 },
             ],
         };
@@ -152,6 +161,8 @@ mod tests {
             _ => panic!("expected leaf"),
         }
         assert_eq!(back.tabs[1].focused_leaf, 1);
+        assert_eq!(back.tabs[0].title, None);
+        assert_eq!(back.tabs[1].title.as_deref(), Some("build"));
         match &back.tabs[1].root {
             NodeSnap::Split { vertical, ratio, a, b } => {
                 assert!(*vertical);

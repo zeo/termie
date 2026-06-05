@@ -162,6 +162,11 @@ pub struct ConfirmView {
     pub hint: String,
 }
 
+/// the tab-rename text field overlay
+pub struct RenameView {
+    pub buf: String,
+}
+
 /// one row in the plugins marketplace overlay
 pub struct MarketRowView {
     /// left text: plugin name + version
@@ -519,6 +524,7 @@ pub struct Renderer {
     find_view: Option<FindView>,
     market_view: Option<MarketView>,
     confirm_view: Option<ConfirmView>,
+    rename_view: Option<RenameView>,
     /// plugin-declared Tier-1 widgets shown in the right-side dock; when
     /// non-empty the dock carves width off content_rect so panes reflow
     dock: Vec<DockWidget>,
@@ -1166,6 +1172,7 @@ impl Renderer {
             find_view: None,
             market_view: None,
             confirm_view: None,
+            rename_view: None,
             dock: Vec::new(),
             dock_hitboxes: Vec::new(),
             cols: 0,
@@ -1660,6 +1667,10 @@ impl Renderer {
 
     pub fn set_confirm(&mut self, c: Option<ConfirmView>) {
         self.confirm_view = c;
+    }
+
+    pub fn set_rename(&mut self, r: Option<RenameView>) {
+        self.rename_view = r;
     }
 
     fn chrome_track(&self) -> f32 {
@@ -2846,7 +2857,8 @@ impl Renderer {
             || self.palette_view.is_some()
             || self.market_view.is_some()
             || self.find_view.is_some()
-            || self.confirm_view.is_some();
+            || self.confirm_view.is_some()
+            || self.rename_view.is_some();
         if overlay_now && !self.overlay_shown {
             self.overlay_since = Some(Instant::now());
         }
@@ -2866,6 +2878,9 @@ impl Renderer {
         }
         if self.confirm_view.is_some() {
             self.build_confirm(&mut out, track);
+        }
+        if self.rename_view.is_some() {
+            self.build_rename(&mut out, track);
         }
         if overlay_now {
             let p = self
@@ -3321,6 +3336,39 @@ impl Renderer {
         let tx = bx + pad;
         let ty = (by + pad).round();
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty, &prompt, paper, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty + row_h, &hint, mute, 1.0, track);
+    }
+
+    /// the tab-rename field: a centered box with the editable name + a caret,
+    /// modeled on build_confirm
+    fn build_rename(&mut self, out: &mut Vec<Instance>, track: f32) {
+        let Some(rv) = self.rename_view.as_ref() else {
+            return;
+        };
+        let label = format!("rename tab: {}\u{2588}", rv.buf);
+        let hint = "enter: rename \u{b7} esc: cancel".to_string();
+        let ink0 = self.palette.ink0;
+        let ink1 = self.palette.ink1;
+        let rule2 = self.palette.rule2;
+        let paper = self.palette.paper;
+        let mute = self.palette.mute;
+        let s = self.scale;
+        let hair = s.max(1.0);
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let row_h = chrome_h + 10.0 * s;
+        let pad = 18.0 * s;
+        let bw = (520.0 * s).min(w - 80.0 * s);
+        let bh = (row_h * 2.0 + pad * 2.0).round();
+        let bx = ((w - bw) / 2.0).round();
+        let by = ((h - bh) / 2.0).round().max(self.title_bar_h + 12.0 * s);
+        Self::push_rect(out, bx - 2.0 * s, by + 6.0 * s, bw + 4.0 * s, bh, ink0, 0.5);
+        Self::push_rect(out, bx, by, bw, bh, ink1, 1.0);
+        Self::stroke_rect(out, (bx, by, bw, bh), hair, rule2);
+        let tx = bx + pad;
+        let ty = (by + pad).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty, &label, paper, 1.0, track);
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty + row_h, &hint, mute, 1.0, track);
     }
 

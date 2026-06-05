@@ -105,6 +105,8 @@ struct Tab {
     /// when set, that leaf pane fills the whole content area (tmux-style zoom),
     /// hiding its siblings until toggled off. transient — not persisted
     zoom: Option<usize>,
+    /// user-given name overriding the cwd-derived label (persisted)
+    title: Option<String>,
 }
 
 /// a torn-off pane living in its own OS-decorated window. its pty reader still
@@ -152,6 +154,7 @@ enum PaletteAction {
     Paste,
     CloseFocusedPane,
     ToggleZoom,
+    RenameTab,
     /// prompt-jump passes through to the program when there are no OSC-133 marks
     JumpPromptPrev,
     JumpPromptNext,
@@ -173,6 +176,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("settings", PaletteAction::Settings),
     ("pane mode", PaletteAction::PaneMode),
     ("zoom pane", PaletteAction::ToggleZoom),
+    ("rename tab", PaletteAction::RenameTab),
     ("quake drop-down", PaletteAction::Quake),
     ("cycle theme", PaletteAction::Theme),
     ("plugins", PaletteAction::Plugins),
@@ -258,6 +262,12 @@ enum ConfirmAction {
     PasteBytes { pane: usize, bytes: Vec<u8> },
     /// close a tab that holds more than one pane
     CloseTab { tab: usize },
+}
+
+/// tab-rename text field overlay: which tab is being renamed + the current input
+struct RenameState {
+    tab: usize,
+    buf: String,
 }
 
 /// modal yes/no overlay state; captures keys until resolved
@@ -1417,6 +1427,8 @@ struct App {
     find: Option<FindState>,
     /// a modal confirm prompt (e.g. a risky paste), when open
     confirm: Option<ConfirmState>,
+    /// the tab-rename text field, when open
+    rename: Option<RenameState>,
     /// the plugins marketplace overlay, when open
     market: Option<MarketState>,
     cursor: PhysicalPosition<f64>,
@@ -1532,6 +1544,7 @@ impl App {
             palette: None,
             find: None,
             confirm: None,
+            rename: None,
             market: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
             pressed: None,
@@ -1725,6 +1738,7 @@ impl App {
             focused: fid,
             root: Some(Node::Leaf(pane)),
             zoom: None,
+            title: None,
         });
         self.active_tab = 0;
         self.relayout_all();
@@ -2260,6 +2274,7 @@ impl App {
                 prompt: c.prompt.clone(),
                 hint: c.hint.clone(),
             }));
+            r.set_rename(self.rename.as_ref().map(|rs| render::RenameView { buf: rs.buf.clone() }));
             r.set_settings(render::SettingsView {
                 scrollback: config.scrollback,
                 copy_on_select: config.copy_on_select,
@@ -2396,6 +2411,10 @@ impl App {
             .tabs
             .iter()
             .map(|t| {
+                // a user-given title wins; otherwise label by the focused cwd
+                if let Some(title) = t.title.as_deref().filter(|s| !s.is_empty()) {
+                    return title.to_string();
+                }
                 let cwd = t
                     .root
                     .as_ref()
@@ -2472,6 +2491,7 @@ impl App {
                 focused: fid,
                 root: Some(Node::Leaf(pane)),
                 zoom: None,
+                title: None,
             });
             self.active_tab = self.tabs.len() - 1;
             self.relayout_all();
@@ -2658,6 +2678,13 @@ impl App {
             PaletteAction::Paste => self.paste(),
             PaletteAction::CloseFocusedPane => self.close_focused_pane(event_loop),
             PaletteAction::ToggleZoom => self.toggle_zoom(),
+            PaletteAction::RenameTab => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let buf = tab.title.clone().unwrap_or_default();
+                    self.rename = Some(RenameState { tab: self.active_tab, buf });
+                    self.redraw();
+                }
+            }
             PaletteAction::SelectTab(n) => {
                 let n = n as usize;
                 if n < self.tabs.len() && n != self.active_tab {
@@ -3249,7 +3276,7 @@ impl App {
             let mut leaf_ids = Vec::new();
             let root = node_to_snap(root, &mut leaf_ids);
             let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
-            tabs.push(session::TabSnap { focused_leaf, root });
+            tabs.push(session::TabSnap { focused_leaf, root, title: tab.title.clone() });
         }
         session::SessionFile { active_tab: self.active_tab, tabs }
     }
@@ -3334,7 +3361,7 @@ impl App {
                 .copied()
                 .or_else(|| leaf_ids.first().copied())
                 .unwrap_or(0);
-            self.tabs.push(Tab { focused, root: Some(root), zoom: None });
+            self.tabs.push(Tab { focused, root: Some(root), zoom: None, title: tab.title.clone() });
         }
         if self.tabs.is_empty() {
             return;
@@ -3441,7 +3468,7 @@ impl App {
     /// re-attach a loose pane as a new tab (used if a satellite window won't open)
     fn dock_loose_pane(&mut self, pane: Pane) {
         let fid = pane.id;
-        self.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)), zoom: None });
+        self.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)), zoom: None, title: None });
         self.active_tab = self.tabs.len() - 1;
         self.relayout_all();
         self.sync_tabs();
@@ -3673,6 +3700,41 @@ impl App {
                 }
                 Key::Named(NamedKey::Escape) => self.confirm = None,
                 _ => {}
+            }
+            self.redraw();
+            return true;
+        }
+        // tab rename text field: enter commits (an empty name clears back to the
+        // cwd label), esc cancels, the rest edits the buffer
+        if self.rename.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(rs) = self.rename.take() {
+                        let name = rs.buf.trim().to_string();
+                        if let Some(tab) = self.tabs.get_mut(rs.tab) {
+                            tab.title = (!name.is_empty()).then_some(name);
+                        }
+                        self.sync_tabs();
+                    }
+                }
+                Key::Named(NamedKey::Escape) => self.rename = None,
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(rs) = self.rename.as_mut() {
+                        rs.buf.pop();
+                    }
+                }
+                _ => {
+                    if !self.mods.control_key()
+                        && let Some(t) = event.text.as_ref()
+                        && !t.is_empty()
+                        && !t.chars().any(|c| c.is_control())
+                    {
+                        let t = t.to_string();
+                        if let Some(rs) = self.rename.as_mut() {
+                            rs.buf.push_str(&t);
+                        }
+                    }
+                }
             }
             self.redraw();
             return true;
