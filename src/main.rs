@@ -1,6 +1,7 @@
 // no extra console window in release; keep one in debug for logs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod color;
 mod grid;
 mod input;
@@ -53,6 +54,14 @@ enum UserEvent {
     Market(Vec<plugin::market::Entry>),
     /// the global quake hotkey fired (from the hotkey thread)
     ToggleQuake,
+    /// an accesskit adapter event (screen-reader tree request / action)
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(e: accesskit_winit::Event) -> Self {
+        UserEvent::Accessibility(e)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1439,6 +1448,8 @@ struct App {
     confirm: Option<ConfirmState>,
     /// the tab-rename text field, when open
     rename: Option<RenameState>,
+    /// accesskit adapter for the main window (screen-reader tree); None until boot
+    a11y: Option<accesskit_winit::Adapter>,
     /// true while the user is composing via the IME; raw keystrokes are then
     /// ignored and the OS candidate window is parked at the cursor
     ime_composing: bool,
@@ -1558,6 +1569,7 @@ impl App {
             find: None,
             confirm: None,
             rename: None,
+            a11y: None,
             ime_composing: false,
             market: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
@@ -1631,6 +1643,11 @@ impl App {
         let renderer = Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend)?;
         timing("renderer ready (gpu init)");
         window.set_ime_allowed(true);
+        self.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
+        ));
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
 
@@ -2461,6 +2478,33 @@ impl App {
 
     fn active_focused_id(&self) -> Option<usize> {
         self.tabs.get(self.active_tab).map(|t| t.focused)
+    }
+
+    /// push the current accessibility tree to the adapter — a cheap no-op when no
+    /// assistive tech is attached (the flatten only runs while active)
+    fn update_a11y(&mut self) {
+        if let Some(mut adapter) = self.a11y.take() {
+            adapter.update_if_active(|| self.build_a11y_update());
+            self.a11y = Some(adapter);
+        }
+    }
+
+    fn build_a11y_update(&self) -> accesskit::TreeUpdate {
+        let bounds = self.window.as_ref().map(|w| {
+            let s = w.inner_size();
+            accesskit::Rect::new(0.0, 0.0, s.width as f64, s.height as f64)
+        });
+        let text = self
+            .active_focused_id()
+            .and_then(|id| {
+                self.tabs
+                    .get(self.active_tab)
+                    .and_then(|t| t.root.as_ref())
+                    .and_then(|r| find_pane(r, id))
+            })
+            .map(|p| a11y::flatten(&p.term))
+            .unwrap_or_default();
+        a11y::build_tree(&text, "termie", bounds)
     }
 
     /// write bytes to the focused pane, or every pane in broadcast mode — the
@@ -4221,6 +4265,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ToggleQuake => self.toggle_quake(),
+            UserEvent::Accessibility(e) => match e.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => self.update_a11y(),
+                // read-only v1: the screen reader can't drive actions
+                accesskit_winit::WindowEvent::ActionRequested(_) => {}
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+            },
         }
     }
 
@@ -4229,6 +4279,10 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(idx) = self.satellites.iter().position(|s| s.window.id() == id) {
             self.satellite_event(idx, &event);
             return;
+        }
+        // feed the main window's events to the accesskit adapter (focus/bounds)
+        if let (Some(a), Some(w)) = (self.a11y.as_mut(), self.window.as_ref()) {
+            a.process_event(w, &event);
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -4771,6 +4825,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // refresh the screen-reader tree (no-op unless an assistive tech is on)
+        self.update_a11y();
         // top up the warm pool once the window is up (one per tick, no spawn burst)
         if self.shown {
             self.warm_pool();
