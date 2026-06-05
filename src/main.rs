@@ -1478,18 +1478,26 @@ fn load_persisted() -> Persisted {
     p
 }
 
+/// per-window state. step 1 of the multi-window refactor extracts the main
+/// window's state here (App.pw); torn-off panes still live in App.satellites
+/// until step 2 graduates them to first-class PaneWindows
+struct PaneWindow {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    layout_cache: Vec<(usize, Rect)>,
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     /// this process's parsed command line (always-new-window: one per process)
     cli: CliArgs,
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
-    tabs: Vec<Tab>,
+    /// the main window's state (window/renderer/tabs/active_tab/layout)
+    pw: PaneWindow,
     /// torn-off panes, each in its own window (keyed by window id at routing)
     satellites: Vec<Satellite>,
-    active_tab: usize,
     next_id: usize,
-    layout_cache: Vec<(usize, Rect)>,
     mods: ModifiersState,
     focused: bool,
     maximized: bool,
@@ -1607,13 +1615,15 @@ impl App {
         App {
             proxy,
             cli: parse_args(std::env::args().skip(1)),
-            window: None,
-            renderer: None,
-            tabs: Vec::new(),
+            pw: PaneWindow {
+                window: None,
+                renderer: None,
+                tabs: Vec::new(),
+                active_tab: 0,
+                layout_cache: Vec::new(),
+            },
             satellites: Vec::new(),
-            active_tab: 0,
             next_id: 0,
-            layout_cache: Vec::new(),
             mods: ModifiersState::empty(),
             keybindings: load_keybindings(),
             focused: true,
@@ -1710,13 +1720,13 @@ impl App {
             &window,
             self.proxy.clone(),
         ));
-        self.window = Some(window.clone());
-        self.renderer = Some(renderer);
+        self.pw.window = Some(window.clone());
+        self.pw.renderer = Some(renderer);
 
         // apply persisted renderer-owned settings before sizing the first pane
         {
             let p = &self.persisted;
-            if let Some(r) = self.renderer.as_mut() {
+            if let Some(r) = self.pw.renderer.as_mut() {
                 r.set_theme(p.theme);
                 r.set_color_overrides(load_color_overrides());
                 r.set_cursor_style(p.cursor);
@@ -1732,7 +1742,7 @@ impl App {
             }
         }
 
-        self.active_tab = 0;
+        self.pw.active_tab = 0;
         // register the global quake hotkey once (opt-in via the quake_key setting)
         if !self.quake_hotkey_spawned
             && let Some((mods, vk)) = self.config.quake_key
@@ -1779,7 +1789,7 @@ impl App {
         self.warm_pool();
         // start the power-on reveal clock now so the whole animation plays once
         // the window is visible, not during the (invisible) gpu-init wait
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             r.begin_reveal();
         }
         self.paint();
@@ -1830,20 +1840,20 @@ impl App {
     /// synchronous cli-launched command so the two can't diverge
     fn install_first_tab(&mut self, pane: Pane) {
         let fid = pane.id;
-        self.tabs.push(Tab {
+        self.pw.tabs.push(Tab {
             focused: fid,
             root: Some(Node::Leaf(pane)),
             zoom: None,
             title: None,
         });
-        self.active_tab = 0;
+        self.pw.active_tab = 0;
         self.relayout_all();
         self.sync_tabs();
         self.redraw();
     }
 
     fn redraw(&self) {
-        if let Some(w) = &self.window {
+        if let Some(w) = &self.pw.window {
             w.request_redraw();
         }
     }
@@ -1851,14 +1861,14 @@ impl App {
     /// is there a visible, blinking cursor on the focused pane that needs the
     /// periodic blink tick? (false when blink is off, cursor hidden, or scrolled)
     fn blinking_cursor_on_screen(&self) -> bool {
-        let Some(r) = self.renderer.as_ref() else {
+        let Some(r) = self.pw.renderer.as_ref() else {
             return false;
         };
         if !r.cursor_blink() {
             return false;
         }
-        self.tabs
-            .get(self.active_tab)
+        self.pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref().and_then(|root| find_pane(root, t.focused)))
             .map(|p| p.term.grid.cursor.visible && p.term.grid.view_offset == 0)
             .unwrap_or(false)
@@ -1866,7 +1876,7 @@ impl App {
 
     /// any visible pane mid bell-flash (keeps the tick alive so it fades out)
     fn any_flash(&self) -> bool {
-        let Some(root) = self.tabs.get(self.active_tab).and_then(|t| t.root.as_ref()) else {
+        let Some(root) = self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()) else {
             return false;
         };
         let mut any = false;
@@ -1881,7 +1891,7 @@ impl App {
 
     /// cols/rows for a single pane filling the whole content area
     fn content_pane_size(&self) -> (usize, usize) {
-        if let Some(r) = self.renderer.as_ref() {
+        if let Some(r) = self.pw.renderer.as_ref() {
             let (_, _, cols, rows) = r.pane_metrics(r.content_rect());
             (cols, rows)
         } else {
@@ -1891,7 +1901,7 @@ impl App {
 
     /// keep one fully-started shell ready so opening a tab feels instant
     fn warm_pool(&mut self) {
-        if self.shutting_down || self.renderer.is_none() {
+        if self.shutting_down || self.pw.renderer.is_none() {
             return;
         }
         // gave up after repeated spawn failures: stop trying (no CPU burn)
@@ -2059,7 +2069,7 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.active_focused_id()
-                    && let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut())
+                    && let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut())
                         && let Some(p) = find_pane_mut(root, id) {
                             p.pty.write(data.as_bytes());
                         }
@@ -2074,7 +2084,7 @@ impl App {
         let widgets: Vec<render::DockWidget> =
             self.plugin_widgets.iter().map(|(_, _, w)| w.clone()).collect();
         let toggled = self
-            .renderer
+            .pw.renderer
             .as_mut()
             .map(|r| r.set_dock(widgets))
             .unwrap_or(false);
@@ -2087,7 +2097,7 @@ impl App {
     /// push the current scrollback limit onto every live pane + the warm pool
     fn apply_scrollback(&mut self) {
         let n = self.config.scrollback;
-        for tab in &mut self.tabs {
+        for tab in &mut self.pw.tabs {
             if let Some(root) = tab.root.as_mut() {
                 each_pane_mut(root, &mut |p| p.term.grid.set_scrollback_limit(n));
             }
@@ -2099,7 +2109,7 @@ impl App {
 
     fn focused_pane_rect(&self) -> Option<Rect> {
         let id = self.active_focused_id()?;
-        self.layout_cache
+        self.pw.layout_cache
             .iter()
             .find(|(i, _)| *i == id)
             .map(|(_, r)| *r)
@@ -2108,7 +2118,7 @@ impl App {
     /// (row, col) under a pixel position within the focused pane
     fn cell_in_focused(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         let rect = self.focused_pane_rect()?;
-        let r = self.renderer.as_ref()?;
+        let r = self.pw.renderer.as_ref()?;
         let (col, row) = r.cell_at(rect, x, y);
         Some((row, col))
     }
@@ -2121,9 +2131,9 @@ impl App {
         if x < rx || y < ry || x >= rx + rw || y >= ry + rh {
             return None;
         }
-        let (col, row) = self.renderer.as_ref()?.cell_at((rx, ry, rw, rh), x, y);
+        let (col, row) = self.pw.renderer.as_ref()?.cell_at((rx, ry, rw, rh), x, y);
         let id = self.active_focused_id()?;
-        let root = self.tabs.get(self.active_tab)?.root.as_ref()?;
+        let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
         let p = find_pane(root, id)?;
         let g = &p.term.grid;
         // an explicit OSC 8 hyperlink on the cell wins over url autodetection
@@ -2138,7 +2148,7 @@ impl App {
 
     /// which pane (id) sits under a pixel position
     fn pane_at(&self, x: f32, y: f32) -> Option<usize> {
-        self.layout_cache
+        self.pw.layout_cache
             .iter()
             .find(|(_, (rx, ry, rw, rh))| x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh)
             .map(|(id, _)| *id)
@@ -2146,13 +2156,13 @@ impl App {
 
     fn focused_grid(&self) -> Option<&crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        let root = self.tabs.get(self.active_tab)?.root.as_ref()?;
+        let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
         find_pane(root, id).map(|p| &p.term.grid)
     }
 
     fn focused_grid_mut(&mut self) -> Option<&mut crate::grid::Grid> {
         let id = self.active_focused_id()?;
-        let root = self.tabs.get_mut(self.active_tab)?.root.as_mut()?;
+        let root = self.pw.tabs.get_mut(self.pw.active_tab)?.root.as_mut()?;
         find_pane_mut(root, id).map(|p| &mut p.term.grid)
     }
 
@@ -2239,8 +2249,8 @@ impl App {
             return;
         };
         let text = self
-            .tabs
-            .get(self.active_tab)
+            .pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref())
             .and_then(|r| find_pane(r, sel.pane))
             .map(|p| p.term.grid.selected_text(sel.start, sel.end))
@@ -2260,8 +2270,8 @@ impl App {
             return;
         };
         let bracketed = self
-            .tabs
-            .get(self.active_tab)
+            .pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref())
             .and_then(|r| find_pane(r, id))
             .map(|p| p.term.bracketed_paste)
@@ -2294,7 +2304,7 @@ impl App {
 
     /// write already-encoded paste bytes to a pane by id
     fn send_paste_bytes(&mut self, pane: usize, bytes: &[u8]) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+        if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
             && let Some(p) = find_pane_mut(root, pane)
         {
@@ -2315,7 +2325,7 @@ impl App {
         let clock = win::local_hm();
         let focus_ease = self.focus_ease();
         let git = self.git.clone();
-        let sessions = self.tabs.len();
+        let sessions = self.pw.tabs.len();
         let palette_view = self.palette.as_ref().map(|p| render::PaletteView {
             query: p.query.clone(),
             items: palette_filter(&p.query)
@@ -2360,7 +2370,7 @@ impl App {
             y: m.y,
             hovered: m.hovered,
         });
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             r.set_status(git, clock, sessions);
             r.set_palette(palette_view);
             r.set_pane_menu(pane_menu_view);
@@ -2382,29 +2392,33 @@ impl App {
             r.set_settings_panel(settings_open, settings_p);
         }
         let title = self
-            .tabs
-            .get(self.active_tab)
+            .pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, t.focused)))
             .and_then(|p| p.term.cwd.as_deref())
             .map(|c| format!("{} — termie", cwd_label(Some(c))))
             .unwrap_or_else(|| "termie".to_string());
         if self.last_title != title {
-            if let Some(w) = &self.window {
+            if let Some(w) = &self.pw.window {
                 w.set_title(&title);
             }
             self.last_title = title;
         }
         let App {
-            renderer,
-            tabs,
-            active_tab,
-            layout_cache,
+            pw,
             focused,
             maximized,
             selection,
             link,
             ..
         } = self;
+        let PaneWindow {
+            renderer,
+            tabs,
+            active_tab,
+            layout_cache,
+            ..
+        } = pw;
         if let Some(r) = renderer.as_mut() {
             // render even before the first pane exists (async startup) so the
             // window/chrome can appear immediately; views is just empty then
@@ -2445,11 +2459,11 @@ impl App {
 
     /// recompute every tab's pane rects and resize each pane's term + pty
     fn relayout_all(&mut self) {
-        let Some(r) = self.renderer.as_ref() else {
+        let Some(r) = self.pw.renderer.as_ref() else {
             return;
         };
         // a settings tab has no panes; clear so stale rects don't linger
-        self.layout_cache.clear();
+        self.pw.layout_cache.clear();
         let content = r.content_rect();
         let (_, _, pool_cols, pool_rows) = r.pane_metrics(content);
         // keep ready pool shells sized to a full content pane; resizing a shell
@@ -2459,7 +2473,7 @@ impl App {
                 sp.resize(pool_rows, pool_cols);
             }
         }
-        for (ti, tab) in self.tabs.iter_mut().enumerate() {
+        for (ti, tab) in self.pw.tabs.iter_mut().enumerate() {
             // a zoomed leaf fills the whole content area; drop a stale zoom whose
             // pane no longer exists (validated before the mutable root borrow)
             let zoom = tab
@@ -2486,8 +2500,8 @@ impl App {
                     }
                 }
             }
-            if ti == self.active_tab {
-                self.layout_cache = rects;
+            if ti == self.pw.active_tab {
+                self.pw.layout_cache = rects;
             }
         }
     }
@@ -2495,7 +2509,7 @@ impl App {
     /// toggle tmux-style zoom on the focused pane: it fills the whole content
     /// area, hiding its siblings, until toggled off (no-op with a single pane)
     fn toggle_zoom(&mut self) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) {
             tab.zoom = if tab.zoom.is_some() { None } else { Some(tab.focused) };
         }
         self.relayout_all();
@@ -2504,7 +2518,7 @@ impl App {
 
     fn sync_tabs(&mut self) {
         let labels: Vec<String> = self
-            .tabs
+            .pw.tabs
             .iter()
             .map(|t| {
                 // a user-given title wins; otherwise label by the focused cwd
@@ -2519,9 +2533,9 @@ impl App {
                 cwd_label(cwd)
             })
             .collect();
-        let active = self.active_tab;
+        let active = self.pw.active_tab;
         let cwd: Option<String> = self
-            .tabs
+            .pw.tabs
             .get(active)
             .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, t.focused)))
             .and_then(|p| p.term.cwd.clone());
@@ -2530,7 +2544,7 @@ impl App {
             self.git = git_branch(cwd.as_deref());
             self.last_git_cwd = cwd;
         }
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             r.set_tabs(labels, active);
         }
         // sync_tabs runs after every structural / focus / cwd change (never per
@@ -2539,7 +2553,7 @@ impl App {
     }
 
     fn active_focused_id(&self) -> Option<usize> {
-        self.tabs.get(self.active_tab).map(|t| t.focused)
+        self.pw.tabs.get(self.pw.active_tab).map(|t| t.focused)
     }
 
     /// push the current accessibility tree to the adapter — a cheap no-op when no
@@ -2552,15 +2566,15 @@ impl App {
     }
 
     fn build_a11y_update(&self) -> accesskit::TreeUpdate {
-        let bounds = self.window.as_ref().map(|w| {
+        let bounds = self.pw.window.as_ref().map(|w| {
             let s = w.inner_size();
             accesskit::Rect::new(0.0, 0.0, s.width as f64, s.height as f64)
         });
         let text = self
             .active_focused_id()
             .and_then(|id| {
-                self.tabs
-                    .get(self.active_tab)
+                self.pw.tabs
+                    .get(self.pw.active_tab)
                     .and_then(|t| t.root.as_ref())
                     .and_then(|r| find_pane(r, id))
             })
@@ -2575,7 +2589,7 @@ impl App {
         let Some(id) = self.active_focused_id() else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+        if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
         {
             if self.broadcast {
@@ -2591,18 +2605,18 @@ impl App {
         let Some(id) = self.active_focused_id() else {
             return;
         };
-        let rect = self.layout_cache.iter().find(|(pid, _)| *pid == id).map(|(_, r)| *r);
+        let rect = self.pw.layout_cache.iter().find(|(pid, _)| *pid == id).map(|(_, r)| *r);
         let cursor = self
-            .tabs
-            .get(self.active_tab)
+            .pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref())
             .and_then(|r| find_pane(r, id))
             .map(|p| (p.term.grid.cursor.row, p.term.grid.cursor.col));
-        let area = match (rect, cursor, self.renderer.as_ref()) {
+        let area = match (rect, cursor, self.pw.renderer.as_ref()) {
             (Some(rect), Some((row, col)), Some(r)) => Some(r.cell_screen_rect(rect, row, col)),
             _ => None,
         };
-        if let (Some((x, y, cw, ch)), Some(w)) = (area, self.window.as_ref()) {
+        if let (Some((x, y, cw, ch)), Some(w)) = (area, self.pw.window.as_ref()) {
             w.set_ime_cursor_area(
                 winit::dpi::PhysicalPosition::new(x, y),
                 winit::dpi::PhysicalSize::new(cw, ch),
@@ -2613,7 +2627,7 @@ impl App {
     /// the focused pane's working directory (from OSC 7), as a filesystem path
     fn focused_cwd(&self) -> Option<String> {
         let id = self.active_focused_id()?;
-        let root = self.tabs.get(self.active_tab)?.root.as_ref()?;
+        let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
         let p = find_pane(root, id)?;
         cwd_path(p.term.cwd.as_deref())
     }
@@ -2625,7 +2639,7 @@ impl App {
     /// open a new tab; a Some(cwd) or Some(shell) spawns a fresh shell, while
     /// None/None grabs a warm pool shell for an instant default-shell home tab
     fn new_tab_cwd(&mut self, cwd: Option<String>, shell: Option<ShellKind>) {
-        if self.renderer.is_none() {
+        if self.pw.renderer.is_none() {
             return;
         }
         let t0 = Instant::now();
@@ -2651,13 +2665,13 @@ impl App {
         };
         if let Ok(pane) = pane {
             let fid = pane.id;
-            self.tabs.push(Tab {
+            self.pw.tabs.push(Tab {
                 focused: fid,
                 root: Some(Node::Leaf(pane)),
                 zoom: None,
                 title: None,
             });
-            self.active_tab = self.tabs.len() - 1;
+            self.pw.active_tab = self.pw.tabs.len() - 1;
             self.relayout_all();
             self.sync_tabs();
             self.redraw();
@@ -2677,7 +2691,7 @@ impl App {
             self.settings_open = true;
             self.settings_anim = Some(Instant::now());
             self.refresh_settings_plugins();
-            if let Some(r) = self.renderer.as_mut() {
+            if let Some(r) = self.pw.renderer.as_mut() {
                 r.reset_settings_scroll();
             }
             self.redraw();
@@ -2691,7 +2705,7 @@ impl App {
             .into_iter()
             .map(|d| (d.manifest.name, d.enabled))
             .collect();
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             r.set_plugins(list);
         }
     }
@@ -2780,25 +2794,25 @@ impl App {
             PaletteAction::SplitV => self.split_focused(Dir::Vertical),
             PaletteAction::SplitH => self.split_focused(Dir::Horizontal),
             PaletteAction::NextTab => {
-                let n = self.tabs.len();
+                let n = self.pw.tabs.len();
                 if n > 1 {
-                    self.active_tab = (self.active_tab + 1) % n;
+                    self.pw.active_tab = (self.pw.active_tab + 1) % n;
                     self.relayout_all();
                     self.sync_tabs();
                     self.redraw();
                 }
             }
             PaletteAction::PrevTab => {
-                let n = self.tabs.len();
+                let n = self.pw.tabs.len();
                 if n > 1 {
-                    self.active_tab = (self.active_tab + n - 1) % n;
+                    self.pw.active_tab = (self.pw.active_tab + n - 1) % n;
                     self.relayout_all();
                     self.sync_tabs();
                     self.redraw();
                 }
             }
             PaletteAction::CloseTab => {
-                let i = self.active_tab;
+                let i = self.pw.active_tab;
                 self.close_tab(i, event_loop);
             }
             PaletteAction::Settings => self.open_settings(),
@@ -2806,14 +2820,14 @@ impl App {
             PaletteAction::PaneMode => self.set_pane_mode(true),
             PaletteAction::Quake => self.toggle_quake(),
             PaletteAction::Theme => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.cycle_theme();
                 }
                 self.redraw();
                 self.save_config();
             }
             PaletteAction::Quit => {
-                for tab in &mut self.tabs {
+                for tab in &mut self.pw.tabs {
                     if let Some(root) = tab.root.as_mut() {
                         kill_all(root);
                     }
@@ -2828,7 +2842,7 @@ impl App {
             PaletteAction::FontReset => self.nudge_font(0.0),
             PaletteAction::ToggleBroadcast => {
                 self.broadcast = !self.broadcast;
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.set_broadcast(self.broadcast);
                 }
                 self.redraw();
@@ -2843,16 +2857,16 @@ impl App {
             PaletteAction::CloseFocusedPane => self.close_focused_pane(event_loop),
             PaletteAction::ToggleZoom => self.toggle_zoom(),
             PaletteAction::RenameTab => {
-                if let Some(tab) = self.tabs.get(self.active_tab) {
+                if let Some(tab) = self.pw.tabs.get(self.pw.active_tab) {
                     let buf = tab.title.clone().unwrap_or_default();
-                    self.rename = Some(RenameState { tab: self.active_tab, buf });
+                    self.rename = Some(RenameState { tab: self.pw.active_tab, buf });
                     self.redraw();
                 }
             }
             PaletteAction::SelectTab(n) => {
                 let n = n as usize;
-                if n < self.tabs.len() && n != self.active_tab {
-                    self.active_tab = n;
+                if n < self.pw.tabs.len() && n != self.pw.active_tab {
+                    self.pw.active_tab = n;
                     self.relayout_all();
                     self.sync_tabs();
                     self.redraw();
@@ -3089,7 +3103,7 @@ impl App {
     /// restore can't undo it — the closed tab leaves the saved layout)
     fn close_tab(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
         let panes = self
-            .tabs
+            .pw.tabs
             .get(idx)
             .and_then(|t| t.root.as_ref())
             .map(pane_count)
@@ -3107,29 +3121,29 @@ impl App {
     }
 
     fn do_close_tab(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
-        if idx >= self.tabs.len() {
+        if idx >= self.pw.tabs.len() {
             return;
         }
-        let mut tab = self.tabs.remove(idx);
+        let mut tab = self.pw.tabs.remove(idx);
         if let Some(root) = tab.root.as_mut() {
             kill_all(root);
         }
-        if self.tabs.is_empty() {
+        if self.pw.tabs.is_empty() {
             event_loop.exit();
             return;
         }
-        if self.active_tab > idx {
-            self.active_tab -= 1;
+        if self.pw.active_tab > idx {
+            self.pw.active_tab -= 1;
         }
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.pw.active_tab = self.pw.active_tab.min(self.pw.tabs.len() - 1);
         self.relayout_all();
         self.sync_tabs();
         self.redraw();
     }
 
     fn switch_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.active_tab = idx;
+        if idx < self.pw.tabs.len() {
+            self.pw.active_tab = idx;
             self.relayout_all();
             self.sync_tabs();
             self.redraw();
@@ -3151,11 +3165,11 @@ impl App {
             self.pool.remove(i)
         } else {
             let foc_rect = self
-                .layout_cache
+                .pw.layout_cache
                 .iter()
                 .find(|(i, _)| *i == focused)
                 .map(|(_, r)| *r);
-            let (cols, rows) = match (self.renderer.as_ref(), foc_rect) {
+            let (cols, rows) = match (self.pw.renderer.as_ref(), foc_rect) {
                 (Some(r), Some((x, y, w, h))) => {
                     let b = match dir {
                         Dir::Vertical => {
@@ -3178,7 +3192,7 @@ impl App {
             p
         };
         let new_id = pane.id;
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
         let Some(root) = tab.root.take() else {
@@ -3203,7 +3217,7 @@ impl App {
     }
 
     fn close_focused_pane(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
         let target = tab.focused;
@@ -3221,7 +3235,7 @@ impl App {
             }
             None => {
                 // last pane in the tab closed → close the tab
-                let idx = self.active_tab;
+                let idx = self.pw.active_tab;
                 self.close_tab(idx, event_loop);
             }
         }
@@ -3229,11 +3243,11 @@ impl App {
 
     fn focus_pane_at(&mut self, x: f32, y: f32) {
         let hit = self
-            .layout_cache
+            .pw.layout_cache
             .iter()
             .find(|(_, (rx, ry, rw, rh))| x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh)
             .map(|(id, _)| *id);
-        let changed = if let (Some(id), Some(tab)) = (hit, self.tabs.get_mut(self.active_tab)) {
+        let changed = if let (Some(id), Some(tab)) = (hit, self.pw.tabs.get_mut(self.pw.active_tab)) {
             if tab.focused != id {
                 tab.focused = id;
                 true
@@ -3257,23 +3271,23 @@ impl App {
     fn button_action(&mut self, event_loop: &ActiveEventLoop, hot: Hot) {
         match hot {
             Hot::Minimize => {
-                if let Some(w) = &self.window {
+                if let Some(w) = &self.pw.window {
                     w.set_minimized(true);
                 }
             }
             Hot::Maximize => {
                 self.maximized = !self.maximized;
-                if let Some(w) = &self.window {
+                if let Some(w) = &self.pw.window {
                     w.set_maximized(self.maximized);
                 }
             }
             Hot::Close => {
                 if self.config.close_action == CloseAction::Minimize {
-                    if let Some(w) = &self.window {
+                    if let Some(w) = &self.pw.window {
                         w.set_minimized(true);
                     }
                 } else {
-                    for tab in &mut self.tabs {
+                    for tab in &mut self.pw.tabs {
                         if let Some(root) = tab.root.as_mut() {
                             kill_all(root);
                         }
@@ -3286,7 +3300,7 @@ impl App {
             Hot::Gear => self.toggle_settings(),
             Hot::PanelClose => self.close_settings(),
             Hot::ThemeSet(id) => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.set_theme(id);
                 }
                 self.redraw();
@@ -3299,14 +3313,14 @@ impl App {
             Hot::TabClose(i) => self.close_tab(i, event_loop),
             Hot::FontDec | Hot::FontInc => {
                 let d = if hot == Hot::FontInc { 1.0 } else { -1.0 };
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.set_content_pt(r.content_pt() + d);
                 }
                 self.relayout_all();
                 self.redraw();
             }
             Hot::FontCycle => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.cycle_font();
                 }
                 self.relayout_all();
@@ -3315,7 +3329,7 @@ impl App {
             Hot::PadDec | Hot::PadInc => {
                 let d = if hot == Hot::PadInc { 2.0 } else { -2.0 };
                 let changed = self
-                    .renderer
+                    .pw.renderer
                     .as_mut()
                     .map(|r| r.set_pane_pad(d))
                     .unwrap_or(false);
@@ -3326,19 +3340,19 @@ impl App {
             }
             Hot::OpacityDec | Hot::OpacityInc => {
                 let d = if hot == Hot::OpacityInc { 5 } else { -5 };
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.nudge_opacity(d);
                 }
                 self.redraw();
             }
             Hot::CursorCycle => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.cycle_cursor();
                 }
                 self.redraw();
             }
             Hot::CursorBlink => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.toggle_cursor_blink();
                 }
                 self.redraw();
@@ -3400,7 +3414,7 @@ impl App {
         use std::fmt::Write as _;
         // never persist a partial file: renderer-owned keys would be dropped and
         // fall back to defaults on the next load
-        let Some(r) = self.renderer.as_ref() else {
+        let Some(r) = self.pw.renderer.as_ref() else {
             return;
         };
         let Some(path) = config_path() else {
@@ -3435,7 +3449,7 @@ impl App {
     /// build a snapshot of the current window's tabs + split tree for persistence
     fn session_snapshot(&self) -> session::SessionFile {
         let mut tabs = Vec::new();
-        for tab in &self.tabs {
+        for tab in &self.pw.tabs {
             let Some(root) = tab.root.as_ref() else {
                 continue;
             };
@@ -3444,7 +3458,7 @@ impl App {
             let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
             tabs.push(session::TabSnap { focused_leaf, root, title: tab.title.clone() });
         }
-        session::SessionFile { active_tab: self.active_tab, tabs }
+        session::SessionFile { active_tab: self.pw.active_tab, tabs }
     }
 
     /// mark the layout changed and (re)arm the debounced session write so a burst
@@ -3513,7 +3527,7 @@ impl App {
     }
 
     /// restore tabs from a saved session by spawning fresh shells in the saved
-    /// directories. leaves self.tabs empty on total failure so the caller falls
+    /// directories. leaves self.pw.tabs empty on total failure so the caller falls
     /// back to a single shell
     fn restore_session(&mut self, sf: session::SessionFile) {
         let (cols, rows) = self.content_pane_size();
@@ -3527,19 +3541,19 @@ impl App {
                 .copied()
                 .or_else(|| leaf_ids.first().copied())
                 .unwrap_or(0);
-            self.tabs.push(Tab { focused, root: Some(root), zoom: None, title: tab.title.clone() });
+            self.pw.tabs.push(Tab { focused, root: Some(root), zoom: None, title: tab.title.clone() });
         }
-        if self.tabs.is_empty() {
+        if self.pw.tabs.is_empty() {
             return;
         }
-        self.active_tab = sf.active_tab.min(self.tabs.len() - 1);
+        self.pw.active_tab = sf.active_tab.min(self.pw.tabs.len() - 1);
         self.relayout_all();
         self.sync_tabs();
     }
 
     fn set_pane_mode(&mut self, on: bool) {
         self.pane_mode = on;
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             r.set_pane_mode(on);
         }
         self.redraw();
@@ -3560,11 +3574,11 @@ impl App {
 
     /// grow/shrink the focused pane along `dir` (pane-mode keyboard resize)
     fn resize_focused(&mut self, dir: Dir, grow: bool) {
-        let Some(fid) = self.tabs.get(self.active_tab).map(|t| t.focused) else {
+        let Some(fid) = self.pw.tabs.get(self.pw.active_tab).map(|t| t.focused) else {
             return;
         };
         let mut done = false;
-        if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+        if let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) {
             grow_focused(root, fid, dir, grow, 0.04, &mut done);
         }
         if done {
@@ -3575,12 +3589,12 @@ impl App {
 
     /// tear the focused pane off into its own OS window (multi-window)
     fn pop_out_focused(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(fid) = self.tabs.get(self.active_tab).map(|t| t.focused) else {
+        let Some(fid) = self.pw.tabs.get(self.pw.active_tab).map(|t| t.focused) else {
             return;
         };
         let count = self
-            .tabs
-            .get(self.active_tab)
+            .pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref())
             .map(|r| {
                 let mut n = 0;
@@ -3592,7 +3606,7 @@ impl App {
             return; // don't strip a tab's only pane
         }
         let mut popped: Option<Pane> = None;
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+        if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.take()
         {
             tab.root = extract_pane(root, fid, &mut popped);
@@ -3634,8 +3648,8 @@ impl App {
     /// re-attach a loose pane as a new tab (used if a satellite window won't open)
     fn dock_loose_pane(&mut self, pane: Pane) {
         let fid = pane.id;
-        self.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)), zoom: None, title: None });
-        self.active_tab = self.tabs.len() - 1;
+        self.pw.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)), zoom: None, title: None });
+        self.pw.active_tab = self.pw.tabs.len() - 1;
         self.relayout_all();
         self.sync_tabs();
         self.redraw();
@@ -3709,7 +3723,7 @@ impl App {
     /// monitor (full width, ~45% height, always-on-top, focused), or hide it.
     /// only ever reached via the global hotkey or the palette action
     fn toggle_quake(&mut self) {
-        let Some(win) = self.window.clone() else {
+        let Some(win) = self.pw.window.clone() else {
             return;
         };
         if self.quake_shown {
@@ -3750,17 +3764,17 @@ impl App {
     /// used to keep a drag locked to the pane that received the press
     fn report_to_pane(&mut self, id: usize, btn: u8, pressed: bool, motion: bool) -> bool {
         let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
-        let Some(rect) = self.layout_cache.iter().find(|(i, _)| *i == id).map(|(_, r)| *r) else {
+        let Some(rect) = self.pw.layout_cache.iter().find(|(i, _)| *i == id).map(|(_, r)| *r) else {
             return false;
         };
-        let Some((col, row)) = self.renderer.as_ref().map(|r| r.cell_at(rect, cx, cy)) else {
+        let Some((col, row)) = self.pw.renderer.as_ref().map(|r| r.cell_at(rect, cx, cy)) else {
             return false;
         };
         // xterm modifier bitfield (shift 4, alt 8, ctrl 16) for the mouse report
         let mmods = (if self.mods.shift_key() { 4u8 } else { 0 })
             | (if self.mods.alt_key() { 8 } else { 0 })
             | (if self.mods.control_key() { 16 } else { 0 });
-        let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) else {
+        let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) else {
             return false;
         };
         let Some(p) = find_pane_mut(root, id) else {
@@ -3780,8 +3794,8 @@ impl App {
         let Some(id) = self.pane_at(cx, cy) else {
             return false;
         };
-        self.tabs
-            .get(self.active_tab)
+        self.pw.tabs
+            .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, id)))
             .map(|p| p.term.wants_motion(self.mouse_down.is_some()))
             .unwrap_or(false)
@@ -3791,7 +3805,7 @@ impl App {
     fn set_pointer(&mut self, icon: CursorIcon) {
         if self.cursor_icon != icon {
             self.cursor_icon = icon;
-            if let Some(w) = &self.window {
+            if let Some(w) = &self.pw.window {
                 w.set_cursor(icon);
             }
         }
@@ -3799,7 +3813,7 @@ impl App {
 
     /// change the content font size: d>0 bigger, d<0 smaller, d==0 reset to default
     fn nudge_font(&mut self, d: f32) {
-        if let Some(r) = self.renderer.as_mut() {
+        if let Some(r) = self.pw.renderer.as_mut() {
             let pt = if d == 0.0 { CONTENT_PT } else { r.content_pt() + d };
             r.set_content_pt(pt);
         }
@@ -3813,13 +3827,13 @@ impl App {
         let Some(cur) = self.active_focused_id() else {
             return;
         };
-        let Some((_, (cx0, cy0, cw, ch))) = self.layout_cache.iter().find(|(id, _)| *id == cur)
+        let Some((_, (cx0, cy0, cw, ch))) = self.pw.layout_cache.iter().find(|(id, _)| *id == cur)
         else {
             return;
         };
         let (cx, cy) = (cx0 + cw / 2.0, cy0 + ch / 2.0);
         let mut best: Option<(usize, f32)> = None;
-        for (id, (x, y, w, h)) in &self.layout_cache {
+        for (id, (x, y, w, h)) in &self.pw.layout_cache {
             if *id == cur {
                 continue;
             }
@@ -3837,7 +3851,7 @@ impl App {
             }
         }
         if let Some((id, _)) = best {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) {
                 tab.focused = id;
             }
             // ease the accent border in on the newly focused pane
@@ -3881,7 +3895,7 @@ impl App {
                 Key::Named(NamedKey::Enter) => {
                     if let Some(rs) = self.rename.take() {
                         let name = rs.buf.trim().to_string();
-                        if let Some(tab) = self.tabs.get_mut(rs.tab) {
+                        if let Some(tab) = self.pw.tabs.get_mut(rs.tab) {
                             tab.title = (!name.is_empty()).then_some(name);
                         }
                         self.sync_tabs();
@@ -4091,7 +4105,7 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.pw.window.is_some() {
             return;
         }
         if let Err(e) = self.boot(event_loop) {
@@ -4114,7 +4128,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut rang = false;
                 let mut newly_ready = false;
                 let mut cwd_changed = false;
-                for tab in &mut self.tabs {
+                for tab in &mut self.pw.tabs {
                     if let Some(root) = tab.root.as_mut()
                         && let Some(p) = find_pane_mut(root, id) {
                             pump_bytes(p, &bytes);
@@ -4197,7 +4211,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // answer OSC 4/10/11/12 color queries from the active palette
                 if !color_reqs.is_empty()
-                    && let Some(rend) = self.renderer.as_ref()
+                    && let Some(rend) = self.pw.renderer.as_ref()
                 {
                     let pal = rend.palette();
                     let mut buf = responses.take().unwrap_or_default();
@@ -4208,7 +4222,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(r) = responses {
                     let mut wrote = false;
-                    for tab in &mut self.tabs {
+                    for tab in &mut self.pw.tabs {
                         if let Some(root) = tab.root.as_mut()
                             && let Some(p) = find_pane_mut(root, id) {
                                 p.pty.write(&r);
@@ -4225,7 +4239,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if cwd_changed {
                     self.sync_tabs();
                 }
-                if self.layout_cache.iter().any(|(pid, _)| *pid == id) {
+                if self.pw.layout_cache.iter().any(|(pid, _)| *pid == id) {
                     if in_sync {
                         // mid synchronized-output frame: defer the paint so the
                         // screen isn't shown torn (cursor stranded mid-redraw)
@@ -4250,15 +4264,15 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 // find which tab holds this pane, close that pane
-                let owner = self.tabs.iter().position(|t| {
+                let owner = self.pw.tabs.iter().position(|t| {
                     t.root.as_ref().map(|r| find_pane(r, id).is_some()).unwrap_or(false)
                 });
                 if let Some(ti) = owner {
-                    let prev_active = self.active_tab;
-                    self.active_tab = ti;
+                    let prev_active = self.pw.active_tab;
+                    self.pw.active_tab = ti;
                     self.close_focused_pane_by_id(id, event_loop);
-                    if ti != prev_active && prev_active < self.tabs.len() {
-                        self.active_tab = prev_active.min(self.tabs.len().saturating_sub(1));
+                    if ti != prev_active && prev_active < self.pw.tabs.len() {
+                        self.pw.active_tab = prev_active.min(self.pw.tabs.len().saturating_sub(1));
                         self.relayout_all();
                     }
                     self.sync_tabs();
@@ -4275,7 +4289,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // it changed while the shell was spawning
                     self.start_reader(&mut pane);
                     pane.term.grid.set_scrollback_limit(self.config.scrollback);
-                    if self.tabs.is_empty() {
+                    if self.pw.tabs.is_empty() {
                         // first shell of an async startup -> becomes tab one
                         self.install_first_tab(*pane);
                         timing("first shell on screen");
@@ -4343,12 +4357,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // feed the main window's events to the accesskit adapter (focus/bounds)
-        if let (Some(a), Some(w)) = (self.a11y.as_mut(), self.window.as_ref()) {
+        if let (Some(a), Some(w)) = (self.a11y.as_mut(), self.pw.window.as_ref()) {
             a.process_event(w, &event);
         }
         match event {
             WindowEvent::CloseRequested => {
-                for tab in &mut self.tabs {
+                for tab in &mut self.pw.tabs {
                     if let Some(root) = tab.root.as_mut() {
                         kill_all(root);
                     }
@@ -4367,7 +4381,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 // report focus in/out to a pane that enabled mode 1004
                 if let Some(id) = self.active_focused_id()
-                    && let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut())
+                    && let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut())
                         && let Some(p) = find_pane_mut(root, id)
                             && p.term.focus_events {
                                 p.pty.write(if f { b"\x1b[I" } else { b"\x1b[O" });
@@ -4388,7 +4402,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let (px, py) = (position.x as f32, position.y as f32);
                 // while the pane menu is open, only track which item is hovered
                 if self.pane_menu.is_some() {
-                    let h = self.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
+                    let h = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
                     if let Some(m) = self.pane_menu.as_mut()
                         && m.hovered != h
                     {
@@ -4403,8 +4417,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // a forwarded press is held: lock motion to the press-pane
                         // (even off its rect) and don't fall through to selection
                         let wants = self
-                            .tabs
-                            .get(self.active_tab)
+                            .pw.tabs
+                            .get(self.pw.active_tab)
                             .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, id)))
                             .map(|p| p.term.wants_motion(true))
                             .unwrap_or(false);
@@ -4420,8 +4434,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(path) = self.drag_divider.clone() {
                     // pane-mode: drag a divider to resize the split
-                    if let Some(content) = self.renderer.as_ref().map(|r| r.content_rect()) {
-                        if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+                    if let Some(content) = self.pw.renderer.as_ref().map(|r| r.content_rect()) {
+                        if let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) {
                             set_divider_ratio(root, content, &path, px, py);
                         }
                         self.relayout_all();
@@ -4436,7 +4450,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.redraw();
                     }
                 } else {
-                    if let Some(r) = self.renderer.as_mut() {
+                    if let Some(r) = self.pw.renderer.as_mut() {
                         let hovered = match r.hit_test(px, py) {
                             Hit::Button(c) => Some(c),
                             _ => None,
@@ -4462,8 +4476,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let dir = if self.settings_open || self.mods.shift_key() {
                             None
                         } else if let (Some(content), Some(root)) = (
-                            self.renderer.as_ref().map(|r| r.content_rect()),
-                            self.tabs.get(self.active_tab).and_then(|t| t.root.as_ref()),
+                            self.pw.renderer.as_ref().map(|r| r.content_rect()),
+                            self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()),
                         ) {
                             divider_dir(root, content, px, py, 6.0)
                         } else {
@@ -4483,13 +4497,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
                 // the open settings panel grabs the wheel when hovered
                 if self.settings_open {
-                    let over = self.renderer.as_ref().map(|r| r.in_settings_panel(cx, cy)).unwrap_or(false);
+                    let over = self.pw.renderer.as_ref().map(|r| r.in_settings_panel(cx, cy)).unwrap_or(false);
                     if over {
                         let amt = match delta {
                             MouseScrollDelta::LineDelta(_, y) => -y * 40.0,
                             MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
                         };
-                        if let Some(r) = self.renderer.as_mut() {
+                        if let Some(r) = self.pw.renderer.as_mut() {
                             r.scroll_settings(amt);
                         }
                         self.redraw();
@@ -4509,7 +4523,7 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as f32,
                 };
                 if let Some(id) = self.pane_at(cx, cy)
-                    && let Some(tab) = self.tabs.get_mut(self.active_tab)
+                    && let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
                         && let Some(root) = tab.root.as_mut()
                             && let Some(p) = find_pane_mut(root, id) {
                                 // alt screen has no scrollback — don't local-scroll it
@@ -4529,7 +4543,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // actions target it
                 let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
                 let on_content =
-                    matches!(self.renderer.as_ref().map(|r| r.hit_test(cx, cy)), Some(Hit::Content));
+                    matches!(self.pw.renderer.as_ref().map(|r| r.hit_test(cx, cy)), Some(Hit::Content));
                 if on_content {
                     self.focus_pane_at(cx, cy);
                     self.pane_menu = Some(PaneMenu { x: cx, y: cy, hovered: None });
@@ -4543,7 +4557,7 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
                 if let Some(Hit::Button(Hot::Tab(i) | Hot::TabClose(i))) =
-                    self.renderer.as_ref().map(|r| r.hit_test(cx, cy))
+                    self.pw.renderer.as_ref().map(|r| r.hit_test(cx, cy))
                 {
                     self.close_tab(i, event_loop);
                 }
@@ -4554,11 +4568,11 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
-                let hit = self.renderer.as_ref().map(|r| r.hit_test(cx, cy));
+                let hit = self.pw.renderer.as_ref().map(|r| r.hit_test(cx, cy));
                 // a left-press while the pane menu is open runs the clicked item
                 // (or dismisses it when the click lands elsewhere)
                 if self.pane_menu.is_some() && state == ElementState::Pressed {
-                    let item = self.renderer.as_ref().and_then(|r| r.pane_menu_item_at(cx, cy));
+                    let item = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(cx, cy));
                     self.pane_menu = None;
                     if let Some(i) = item {
                         self.pane_menu_action(i, event_loop);
@@ -4577,7 +4591,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // (and is consumed); presses inside fall through to its controls
                 if self.settings_open && state == ElementState::Pressed {
                     let in_panel = self
-                        .renderer
+                        .pw.renderer
                         .as_ref()
                         .map(|r| r.in_settings_panel(cx, cy))
                         .unwrap_or(false);
@@ -4596,8 +4610,8 @@ impl ApplicationHandler<UserEvent> for App {
                     match state {
                         ElementState::Pressed => {
                             let found = if let (Some(content), Some(root)) = (
-                                self.renderer.as_ref().map(|r| r.content_rect()),
-                                self.tabs.get(self.active_tab).and_then(|t| t.root.as_ref()),
+                                self.pw.renderer.as_ref().map(|r| r.content_rect()),
+                                self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()),
                             ) {
                                 let mut path = Vec::new();
                                 find_divider(root, content, cx, cy, 8.0, &mut path)
@@ -4616,7 +4630,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 && let Some(src) = self.drag_pane.take()
                                     && let Some(dst) = self.pane_at(cx, cy)
                                         && dst != src {
-                                            if let Some(root) = self.tabs.get_mut(self.active_tab).and_then(|t| t.root.as_mut()) {
+                                            if let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) {
                                                 swap_panes(root, src, dst);
                                             }
                                             self.relayout_all();
@@ -4636,7 +4650,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 // a click on a plugin dock widget notifies the owning plugin
                 if state == ElementState::Pressed {
-                    let di = self.renderer.as_ref().and_then(|r| r.widget_at(cx, cy));
+                    let di = self.pw.renderer.as_ref().and_then(|r| r.widget_at(cx, cy));
                     if let Some(di) = di
                         && let Some((pidx, wid, _)) = self.plugin_widgets.get(di)
                     {
@@ -4663,8 +4677,8 @@ impl ApplicationHandler<UserEvent> for App {
                     match state {
                         ElementState::Pressed => {
                             let found = if let (Some(content), Some(root)) = (
-                                self.renderer.as_ref().map(|r| r.content_rect()),
-                                self.tabs.get(self.active_tab).and_then(|t| t.root.as_ref()),
+                                self.pw.renderer.as_ref().map(|r| r.content_rect()),
+                                self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()),
                             ) {
                                 let mut path = Vec::new();
                                 find_divider(root, content, cx, cy, 6.0, &mut path)
@@ -4704,8 +4718,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 (self.active_focused_id(), self.cell_in_focused(cx, cy))
                             {
                                 let grid = self
-                                    .tabs
-                                    .get(self.active_tab)
+                                    .pw.tabs
+                                    .get(self.pw.active_tab)
                                     .and_then(|t| t.root.as_ref())
                                     .and_then(|r| find_pane(r, pane))
                                     .map(|p| &p.term.grid);
@@ -4759,13 +4773,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.new_tab();
                             } else {
                                 self.last_click = Some((now, cx as f64, cy as f64));
-                                if let Some(w) = &self.window {
+                                if let Some(w) = &self.pw.window {
                                     let _ = w.drag_window();
                                 }
                             }
                         }
                         Some(Hit::Resize(dir)) => {
-                            if let Some(w) = &self.window {
+                            if let Some(w) = &self.pw.window {
                                 let _ = w.drag_resize_window(dir);
                             }
                         }
@@ -4794,7 +4808,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // reflow on a width change moves cell coordinates, so a stale
                 // selection would highlight the wrong cells
                 self.selection = None;
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.resize(size.width, size.height);
                 }
                 // keep the surface crisp now, but defer the grid/pty reflow until
@@ -4807,7 +4821,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // monitor/dpi change: re-raster the atlas at the new scale so text
                 // stays crisp. winit applies the os-suggested size and a Resized
                 // follows (which arms the resize-settle reflow at the new size)
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.set_scale(scale_factor as f32);
                 }
                 self.relayout_all();
@@ -4844,8 +4858,8 @@ impl ApplicationHandler<UserEvent> for App {
                     None => return,
                 };
                 let (app_cursor, kbd_flags) = self
-                    .tabs
-                    .get(self.active_tab)
+                    .pw.tabs
+                    .get(self.pw.active_tab)
                     .and_then(|t| t.root.as_ref())
                     .and_then(|r| find_pane(r, id))
                     .map(|p| (p.term.app_cursor_keys, p.term.kbd_flags()))
@@ -4873,7 +4887,7 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         format!("{s} ")
                     };
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab)
+                    if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
                         && let Some(root) = tab.root.as_mut()
                         && let Some(p) = find_pane_mut(root, id)
                     {
@@ -4898,17 +4912,17 @@ impl ApplicationHandler<UserEvent> for App {
             // already loaded, so this needs no system-font scan
             if !self.ascii_warmed {
                 self.ascii_warmed = true;
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.pw.renderer.as_mut() {
                     r.prewarm_glyphs();
                 }
             }
             // scan system fonts once, deferred until the first shell is on screen
             // so the prompt appears before this (event-loop-blocking) scan rather
             // than after it; enables the font picker + non-Latin fallbacks
-            if self.system_fonts_pending && !self.tabs.is_empty() {
+            if self.system_fonts_pending && !self.pw.tabs.is_empty() {
                 self.system_fonts_pending = false;
                 let want = self.persisted.font.clone();
-                let scanned = if let Some(r) = self.renderer.as_mut() {
+                let scanned = if let Some(r) = self.pw.renderer.as_mut() {
                     let s = r.ensure_system_fonts();
                     // a persisted system font couldn't resolve before the scan;
                     // apply it now that the db has it
@@ -4940,7 +4954,7 @@ impl ApplicationHandler<UserEvent> for App {
         // debug-only: drive TERMIE_BENCH auto-opens once the first shell + pool
         // are up, so warm-pool tab-open latency lands in the TERMIE_TIMING log
         #[cfg(debug_assertions)]
-        if self.bench_left > 0 && !self.tabs.is_empty() {
+        if self.bench_left > 0 && !self.pw.tabs.is_empty() {
             match self.bench_next {
                 None => self.bench_next = Some(Instant::now() + Duration::from_millis(600)),
                 Some(t) if Instant::now() >= t => {
@@ -4955,7 +4969,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // first shell hasn't spawned yet after a failure: wake at the backoff
         // deadline to retry, rather than hot-looping or sleeping indefinitely
-        if self.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS
+        if self.pw.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS
             && let Some(t) = self.warm_backoff_until {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(t));
                 return;
@@ -5002,7 +5016,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // startup reveal fade: drive it at ~60fps until it settles
-        if self.renderer.as_ref().map(|r| r.startup_fading()).unwrap_or(false) {
+        if self.pw.renderer.as_ref().map(|r| r.startup_fading()).unwrap_or(false) {
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -5035,7 +5049,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // chrome-button hover fade-in: drive ~60fps only while it's in flight
-        if self.renderer.as_ref().is_some_and(|r| r.hover_animating()) {
+        if self.pw.renderer.as_ref().is_some_and(|r| r.hover_animating()) {
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -5043,7 +5057,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // active-tab accent rail slide: drive ~60fps only while it's in flight
-        if self.renderer.as_ref().is_some_and(|r| r.tab_animating()) {
+        if self.pw.renderer.as_ref().is_some_and(|r| r.tab_animating()) {
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -5051,7 +5065,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // overlay (palette/find/market/menu) bloom-in: drive while in flight
-        if self.renderer.as_ref().is_some_and(|r| r.overlay_animating()) {
+        if self.pw.renderer.as_ref().is_some_and(|r| r.overlay_animating()) {
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -5077,7 +5091,7 @@ impl ApplicationHandler<UserEvent> for App {
             // coarsely and only repaint when the displayed minute actually rolls
             let now_hm = win::local_hm();
             let stale = self
-                .renderer
+                .pw.renderer
                 .as_ref()
                 .map(|r| r.status_clock() != now_hm)
                 .unwrap_or(false);
@@ -5095,7 +5109,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 impl App {
     fn close_focused_pane_by_id(&mut self, id: usize, event_loop: &ActiveEventLoop) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
         let Some(root) = tab.root.take() else {
@@ -5110,7 +5124,7 @@ impl App {
                 self.relayout_all();
             }
             None => {
-                let idx = self.active_tab;
+                let idx = self.pw.active_tab;
                 self.close_tab(idx, event_loop);
             }
         }
