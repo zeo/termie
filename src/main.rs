@@ -120,7 +120,7 @@ struct Sel {
     end: (usize, usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PaletteAction {
     NewTab,
     NewTabHere,
@@ -136,6 +136,23 @@ enum PaletteAction {
     Theme,
     Plugins,
     Quit,
+    // bindable built-ins (also reachable from keybindings.conf); some are not
+    // shown in the palette, only the keybinding table
+    ToggleSettings,
+    FontInc,
+    FontDec,
+    FontReset,
+    ToggleBroadcast,
+    OpenFind,
+    OpenPalette,
+    Copy,
+    Paste,
+    CloseFocusedPane,
+    /// prompt-jump passes through to the program when there are no OSC-133 marks
+    JumpPromptPrev,
+    JumpPromptNext,
+    /// 0-based tab index (Ctrl+1..9)
+    SelectTab(u8),
 }
 
 const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
@@ -423,10 +440,82 @@ fn parse_combo(s: &str) -> Option<(ModifiersState, Key)> {
     key.map(|k| (mods, k))
 }
 
-/// load user keybindings from %APPDATA%\termie\keybindings.conf (combo=action,
-/// where action matches a command-palette entry, e.g. `ctrl+alt+t=new tab here`)
+/// the built-in keybindings, seeded before any user overrides. matching at the
+/// gate is exact-modifier (Ctrl+Alt+X is a different chord than Ctrl+X), so the
+/// shift-produced symbols '+' and '_' are seeded with Ctrl+Shift, the modifiers
+/// that physically accompany them. Ctrl+Shift+P (pane mode toggle) and
+/// Esc/Ctrl+, settings-close are intentionally absent — they stay as dedicated
+/// state-aware handlers in handle_shortcut (and are not rebindable)
+fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
+    use PaletteAction as A;
+    let ctrl = ModifiersState::CONTROL;
+    let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+    let chr = |s: &str| Key::Character(s.into());
+    let mut v = vec![
+        (ctrl, chr(","), A::ToggleSettings),
+        (ctrl, chr("="), A::FontInc),
+        (cs, chr("+"), A::FontInc),
+        (ctrl, chr("-"), A::FontDec),
+        (cs, chr("_"), A::FontDec),
+        (ctrl, chr("0"), A::FontReset),
+        (ctrl, Key::Named(NamedKey::Tab), A::NextTab),
+        (cs, Key::Named(NamedKey::Tab), A::PrevTab),
+        (cs, chr("b"), A::ToggleBroadcast),
+        (cs, chr("f"), A::OpenFind),
+        (ctrl, Key::Named(NamedKey::ArrowUp), A::JumpPromptPrev),
+        (ctrl, Key::Named(NamedKey::ArrowDown), A::JumpPromptNext),
+        (ctrl, chr("p"), A::OpenPalette),
+        (ctrl, chr("t"), A::NewTab),
+        (cs, chr("t"), A::NewTab),
+        (cs, chr("c"), A::Copy),
+        (cs, chr("v"), A::Paste),
+        (cs, chr("w"), A::CloseFocusedPane),
+        (cs, chr("e"), A::SplitV),
+        (cs, chr("o"), A::SplitH),
+    ];
+    for n in 1u8..=9 {
+        v.push((ctrl, chr(&n.to_string()), A::SelectTab(n - 1)));
+    }
+    v
+}
+
+/// resolve a keybindings.conf action label to an action — the palette entries
+/// plus the keybinding-only actions (copy/paste/find/font/select-tab/etc.)
+fn action_from_label(name: &str) -> Option<PaletteAction> {
+    let n = name.trim();
+    if let Some((_, a)) = PALETTE_ACTIONS.iter().find(|(l, _)| l.eq_ignore_ascii_case(n)) {
+        return Some(*a);
+    }
+    let lower = n.to_ascii_lowercase();
+    if let Some(d) = lower.strip_prefix("select tab ")
+        && let Ok(num) = d.trim().parse::<u8>()
+        && (1..=9).contains(&num)
+    {
+        return Some(PaletteAction::SelectTab(num - 1));
+    }
+    Some(match lower.as_str() {
+        "copy" => PaletteAction::Copy,
+        "paste" => PaletteAction::Paste,
+        "find" => PaletteAction::OpenFind,
+        "broadcast" | "toggle broadcast" => PaletteAction::ToggleBroadcast,
+        "command palette" | "palette" => PaletteAction::OpenPalette,
+        "toggle settings" => PaletteAction::ToggleSettings,
+        "font increase" | "font bigger" => PaletteAction::FontInc,
+        "font decrease" | "font smaller" => PaletteAction::FontDec,
+        "font reset" => PaletteAction::FontReset,
+        "close pane" => PaletteAction::CloseFocusedPane,
+        "prompt prev" | "previous prompt" => PaletteAction::JumpPromptPrev,
+        "prompt next" | "next prompt" => PaletteAction::JumpPromptNext,
+        _ => return None,
+    })
+}
+
+/// load keybindings: built-in defaults first, then user overrides from
+/// %APPDATA%\termie\keybindings.conf. `combo=none` (or `unbind`) frees a chord
+/// so it falls through to the program; any other line overrides; unknown actions
+/// and unparseable combos warn instead of silently dropping
 fn load_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
-    let mut out = Vec::new();
+    let mut out = default_keybindings();
     let Some(dir) = std::env::var_os("APPDATA") else {
         return out;
     };
@@ -439,14 +528,23 @@ fn load_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((combo, action)) = line.split_once('=')
-            && let Some((mods, key)) = parse_combo(combo.trim())
-            && let Some(a) = PALETTE_ACTIONS
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(action.trim()))
-                .map(|(_, a)| *a)
-        {
-            out.push((mods, key, a));
+        let Some((combo, action)) = line.split_once('=') else {
+            log::warn!("keybindings.conf: no '=' in line: {line}");
+            continue;
+        };
+        let Some((mods, key)) = parse_combo(combo.trim()) else {
+            log::warn!("keybindings.conf: unparseable combo: {}", combo.trim());
+            continue;
+        };
+        let action = action.trim();
+        // a user line replaces any default (or earlier line) for the same combo
+        out.retain(|(m, k, _)| !(*m == mods && key_matches(&key, k)));
+        if action.eq_ignore_ascii_case("none") || action.eq_ignore_ascii_case("unbind") {
+            continue;
+        }
+        match action_from_label(action) {
+            Some(a) => out.push((mods, key, a)),
+            None => log::warn!("keybindings.conf: unknown action '{action}' (combo {})", combo.trim()),
         }
     }
     out
@@ -2370,8 +2468,25 @@ impl App {
         }
     }
 
-    fn run_palette_action(&mut self, a: PaletteAction, event_loop: &ActiveEventLoop) {
+    /// run an action; returns whether the key was consumed. all actions consume
+    /// except prompt-jump, which passes through to the program when there are no
+    /// OSC-133 marks to jump between
+    fn run_action(&mut self, a: PaletteAction, event_loop: &ActiveEventLoop) -> bool {
         match a {
+            PaletteAction::JumpPromptPrev => {
+                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(false)).unwrap_or(false);
+                if moved {
+                    self.redraw();
+                }
+                return moved;
+            }
+            PaletteAction::JumpPromptNext => {
+                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(true)).unwrap_or(false);
+                if moved {
+                    self.redraw();
+                }
+                return moved;
+            }
             PaletteAction::NewTab => self.new_tab(),
             PaletteAction::NewTabHere => {
                 let cwd = self.focused_cwd();
@@ -2426,7 +2541,36 @@ impl App {
                 self.kill_pool();
                 event_loop.exit();
             }
+            PaletteAction::ToggleSettings => self.toggle_settings(),
+            PaletteAction::FontInc => self.nudge_font(1.0),
+            PaletteAction::FontDec => self.nudge_font(-1.0),
+            PaletteAction::FontReset => self.nudge_font(0.0),
+            PaletteAction::ToggleBroadcast => {
+                self.broadcast = !self.broadcast;
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_broadcast(self.broadcast);
+                }
+                self.redraw();
+            }
+            PaletteAction::OpenFind => self.open_find(),
+            PaletteAction::OpenPalette => {
+                self.palette = Some(PaletteState { query: String::new(), selected: 0 });
+                self.redraw();
+            }
+            PaletteAction::Copy => self.copy_selection(),
+            PaletteAction::Paste => self.paste(),
+            PaletteAction::CloseFocusedPane => self.close_focused_pane(event_loop),
+            PaletteAction::SelectTab(n) => {
+                let n = n as usize;
+                if n < self.tabs.len() && n != self.active_tab {
+                    self.active_tab = n;
+                    self.relayout_all();
+                    self.sync_tabs();
+                    self.redraw();
+                }
+            }
         }
+        true
     }
 
     /// merge the installed plugins (from disk) with the remote catalog into the
@@ -3426,8 +3570,9 @@ impl App {
                 .find(|(m, k, _)| *m == mods && key_matches(&event.logical_key, k))
                 .map(|(_, _, a)| *a);
             if let Some(a) = act {
-                self.run_palette_action(a, event_loop);
-                return true;
+                // run_action returns false only for prompt-jump with no marks, so
+                // that key falls through to the program unchanged
+                return self.run_action(a, event_loop);
             }
         }
         // the plugins marketplace overlay captures keys while open
@@ -3481,7 +3626,7 @@ impl App {
                         .unwrap_or_default();
                     self.palette = None;
                     if let Some(&(_, a)) = palette_filter(&q).get(sel) {
-                        self.run_palette_action(a, event_loop);
+                        self.run_action(a, event_loop);
                     }
                     self.redraw();
                 }
@@ -3581,113 +3726,10 @@ impl App {
             }
             return true;
         }
-        let ctrl = self.mods.control_key();
-        let shift = self.mods.shift_key();
-        if !ctrl {
-            return false;
-        }
-        match &event.logical_key {
-            Key::Character(c) if c.as_str() == "," => {
-                self.toggle_settings();
-                true
-            }
-            // font zoom: Ctrl+= / Ctrl++ bigger, Ctrl+- smaller, Ctrl+0 reset
-            Key::Character(c) if c.as_str() == "=" || c.as_str() == "+" => {
-                self.nudge_font(1.0);
-                true
-            }
-            Key::Character(c) if c.as_str() == "-" || c.as_str() == "_" => {
-                self.nudge_font(-1.0);
-                true
-            }
-            Key::Character(c) if c.as_str() == "0" => {
-                self.nudge_font(0.0);
-                true
-            }
-            Key::Named(NamedKey::Tab) => {
-                let n = self.tabs.len();
-                if n > 1 {
-                    self.active_tab = if shift {
-                        (self.active_tab + n - 1) % n
-                    } else {
-                        (self.active_tab + 1) % n
-                    };
-                    self.relayout_all();
-                    self.sync_tabs();
-                    self.redraw();
-                }
-                true
-            }
-            // broadcast input: type once, send to every pane in the tab
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("b") => {
-                self.broadcast = !self.broadcast;
-                if let Some(r) = self.renderer.as_mut() {
-                    r.set_broadcast(self.broadcast);
-                }
-                self.redraw();
-                true
-            }
-            // find in scrollback
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("f") => {
-                self.open_find();
-                true
-            }
-            // jump between shell prompts (OSC 133 marks): Ctrl+Up prev, Ctrl+Down
-            // next. when there are no marks (no shell hook) the key passes
-            // through to the app unchanged
-            Key::Named(NamedKey::ArrowUp) => {
-                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(false)).unwrap_or(false);
-                if moved {
-                    self.redraw();
-                }
-                moved
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                let moved = self.focused_grid_mut().map(|g| g.jump_prompt(true)).unwrap_or(false);
-                if moved {
-                    self.redraw();
-                }
-                moved
-            }
-            Key::Character(c) if !shift && c.eq_ignore_ascii_case("p") => {
-                self.palette = Some(PaletteState {
-                    query: String::new(),
-                    selected: 0,
-                });
-                self.redraw();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("t") => {
-                self.new_tab();
-                true
-            }
-            // ctrl+t (no shift) is a quick new-tab too
-            Key::Character(c) if !shift && c.eq_ignore_ascii_case("t") => {
-                self.new_tab();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("c") => {
-                self.copy_selection();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("v") => {
-                self.paste();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("w") => {
-                self.close_focused_pane(event_loop);
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("e") => {
-                self.split_focused(Dir::Vertical);
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("o") => {
-                self.split_focused(Dir::Horizontal);
-                true
-            }
-            _ => false,
-        }
+        // every built-in chord now lives in the keybindings table (seeded by
+        // default_keybindings and dispatched by the gate above), so anything
+        // reaching here is unbound and falls through to the focused program
+        false
     }
 }
 
@@ -4780,6 +4822,31 @@ mod tests {
         assert_eq!(m2, ModifiersState::ALT);
         assert_eq!(k2, Key::Named(NamedKey::Enter));
         assert!(parse_combo("ctrl+").is_none());
+    }
+
+    #[test]
+    fn keybinding_defaults_and_labels() {
+        let d = default_keybindings();
+        let ctrl = ModifiersState::CONTROL;
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let has = |m: ModifiersState, key: &str, a: PaletteAction| {
+            d.iter().any(|(mm, k, aa)| *mm == m && key_matches(&Key::Character(key.into()), k) && *aa == a)
+        };
+        assert!(has(ctrl, "t", PaletteAction::NewTab));
+        assert!(has(cs, "e", PaletteAction::SplitV));
+        assert!(has(ctrl, "1", PaletteAction::SelectTab(0)));
+        assert!(has(ctrl, "9", PaletteAction::SelectTab(8)));
+        // '+' and '_' are typed with shift, so they must be bound Ctrl+Shift to
+        // match the modifiers that actually arrive (regression guard)
+        assert!(has(cs, "+", PaletteAction::FontInc));
+        assert!(has(cs, "_", PaletteAction::FontDec));
+        // Ctrl+Shift+P is deliberately NOT a default (dedicated pane-mode handler)
+        assert!(!d.iter().any(|(m, k, _)| *m == cs && key_matches(&Key::Character("p".into()), k)));
+        // label resolution covers palette + keybinding-only + select-tab
+        assert_eq!(action_from_label("new tab"), Some(PaletteAction::NewTab));
+        assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));
+        assert_eq!(action_from_label("select tab 3"), Some(PaletteAction::SelectTab(2)));
+        assert_eq!(action_from_label("bogus action"), None);
     }
 
     #[test]
