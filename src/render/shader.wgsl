@@ -49,8 +49,8 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
     return out;
 }
 
-// premultiplied-alpha output so the surface composes correctly over the
-// DWM acrylic backdrop (and reduces to opaque when alpha == 1)
+// premultiplied-alpha output so the surface composes correctly when the window
+// is translucent (flat per-pixel opacity), and reduces to opaque when alpha == 1
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == 0u) {

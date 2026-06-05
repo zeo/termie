@@ -1,4 +1,5 @@
-//! windows-specific window effects: acrylic backdrop + rounded corners
+//! windows-specific window effects: rounded corners (DWM) + flat per-pixel
+//! window opacity (premultiplied alpha — not acrylic/mica)
 
 /// suppress the OS "application was unable to start correctly" / crash dialogs
 /// for this process and the children it spawns. without this, a pre-warmed pool
