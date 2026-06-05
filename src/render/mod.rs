@@ -2430,22 +2430,38 @@ impl Renderer {
                     // tile seamlessly (font glyphs leave gaps at cell edges)
                     if Self::draw_box(out, x, y, cell_w, cell_h, cell.c, fg) {
                         // handled
-                    } else if let Some(g) = atlas.get(GlyphKey {
-                        font: FontId::Content,
-                        c: cell.c,
-                        bold: cell.attrs.bold,
-                        italic: cell.attrs.italic,
-                    }) {
-                        let lin = fg.to_linear_f32();
-                        out.push(Instance {
-                            pos: [x + g.left, y + ascent - g.top],
-                            size: [g.width, g.height],
-                            uv_min: g.uv_min,
-                            uv_max: g.uv_max,
-                            color: [lin[0], lin[1], lin[2], 1.0],
-                            kind: if g.color { 3 } else { 1 },
-                            _pad: [0; 3],
-                        });
+                    } else {
+                        let gk = GlyphKey {
+                            font: FontId::Content,
+                            c: cell.c,
+                            bold: cell.attrs.bold,
+                            italic: cell.attrs.italic,
+                        };
+                        // a cell carrying combining marks composites its whole
+                        // grapheme cluster; fall back to the base char if that
+                        // yields nothing (e.g. an emoji ZWJ cluster)
+                        let glyph = if cell.cluster != 0 {
+                            let cg = atlas.get_cluster(
+                                grid.cluster_str(cell.cluster),
+                                cell.attrs.bold,
+                                cell.attrs.italic,
+                            );
+                            if cg.is_some() { cg } else { atlas.get(gk) }
+                        } else {
+                            atlas.get(gk)
+                        };
+                        if let Some(g) = glyph {
+                            let lin = fg.to_linear_f32();
+                            out.push(Instance {
+                                pos: [x + g.left, y + ascent - g.top],
+                                size: [g.width, g.height],
+                                uv_min: g.uv_min,
+                                uv_max: g.uv_max,
+                                color: [lin[0], lin[1], lin[2], 1.0],
+                                kind: if g.color { 3 } else { 1 },
+                                _pad: [0; 3],
+                            });
+                        }
                     }
                 }
                 // underline / strikethrough decorations, drawn in the cell's fg

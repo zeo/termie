@@ -72,6 +72,7 @@ pub struct GlyphAtlas {
     system_loaded: bool,
 
     cache: HashMap<GlyphKey, Option<AtlasGlyph>>,
+    cluster_cache: HashMap<(String, bool, bool), Option<AtlasGlyph>>,
 }
 
 const PAD: u32 = 1;
@@ -135,6 +136,7 @@ impl GlyphAtlas {
             shelf_h: 0,
             system_loaded: false,
             cache: HashMap::new(),
+            cluster_cache: HashMap::new(),
         };
         atlas.data = vec![0u8; (atlas.dim * atlas.dim) as usize];
         atlas.color_data = vec![0u8; (atlas.dim * atlas.dim * 4) as usize];
@@ -245,6 +247,7 @@ impl GlyphAtlas {
             self.color_data.iter_mut().for_each(|b| *b = 0);
         }
         self.cache.clear();
+        self.cluster_cache.clear();
         self.cursor_x = PAD;
         self.cursor_y = PAD;
         self.shelf_h = 0;
@@ -400,6 +403,138 @@ impl GlyphAtlas {
             left: left as f32,
             top: top as f32,
             color: is_color,
+        })
+    }
+
+    /// fetch (and cache) a composited glyph for a grapheme cluster (base char +
+    /// combining marks). returns None for color/emoji clusters so the caller
+    /// falls back to drawing the base char from the per-char path
+    pub fn get_cluster(&mut self, text: &str, bold: bool, italic: bool) -> Option<AtlasGlyph> {
+        if let Some(g) = self.cluster_cache.get(&(text.to_string(), bold, italic)) {
+            return *g;
+        }
+        let key = (text.to_string(), bold, italic);
+        match self.rasterize_cluster(text, bold, italic) {
+            RasterOutcome::Glyph(g) => {
+                self.cluster_cache.insert(key, Some(g));
+                Some(g)
+            }
+            RasterOutcome::Empty => {
+                self.cluster_cache.insert(key, None);
+                None
+            }
+            RasterOutcome::NoSpace => {
+                const MAX_DIM: u32 = 2048;
+                self.repack_at(MAX_DIM);
+                match self.rasterize_cluster(text, bold, italic) {
+                    RasterOutcome::Glyph(g) => {
+                        self.cluster_cache.insert(key, Some(g));
+                        Some(g)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// composite a grapheme cluster into one cell-sized coverage slot, baseline-
+    /// aligned. emoji/color clusters return Empty (per-char fallback). the cell-
+    /// aligned slot makes left=0, top=ascent so the caller's normal placement math
+    /// drops the composited cell exactly where the base char would have gone
+    fn rasterize_cluster(&mut self, text: &str, bold: bool, italic: bool) -> RasterOutcome {
+        let m = self.metrics(FontId::Content);
+        let cw = m.cell_w.ceil() as u32;
+        let ch = m.line_height.ceil() as u32;
+        if cw == 0 || ch == 0 {
+            return RasterOutcome::Empty;
+        }
+        let baseline = m.ascent.round() as i32;
+
+        let mut attrs = Attrs::new().family(Family::Name(m.family));
+        if bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        if italic {
+            attrs = attrs.style(Style::Italic);
+        }
+        self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
+        self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let mut keys: Vec<(i32, _)> = Vec::new();
+        if let Some(run) = self.buffer.layout_runs().next() {
+            for g in run.glyphs.iter() {
+                let p = g.physical((0.0, 0.0), 1.0);
+                keys.push((p.x, p.cache_key));
+            }
+        }
+        if keys.is_empty() {
+            return RasterOutcome::Empty;
+        }
+
+        let mut canvas = vec![0u8; (cw * ch) as usize];
+        let mut any = false;
+        for (pen_x, ck) in keys {
+            let extracted = {
+                let img = self.swash.get_image(&mut self.font_system, ck);
+                let Some(img) = img.as_ref() else {
+                    continue;
+                };
+                if matches!(img.content, SwashContent::Color) {
+                    return RasterOutcome::Empty; // let the per-char path handle emoji
+                }
+                let (gw, gh) = (img.placement.width, img.placement.height);
+                if gw == 0 || gh == 0 {
+                    continue;
+                }
+                let cov = to_alpha(&img.data, gw as usize, gh as usize, img.content);
+                (gw, gh, img.placement.left, img.placement.top, cov)
+            };
+            let (gw, gh, gleft, gtop, cov) = extracted;
+            let ox = pen_x + gleft;
+            let oy = baseline - gtop;
+            for gy in 0..gh as i32 {
+                let cy = oy + gy;
+                if cy < 0 || cy >= ch as i32 {
+                    continue;
+                }
+                for gx in 0..gw as i32 {
+                    let cx = ox + gx;
+                    if cx < 0 || cx >= cw as i32 {
+                        continue;
+                    }
+                    let s = cov[(gy as u32 * gw + gx as u32) as usize];
+                    let di = (cy as u32 * cw + cx as u32) as usize;
+                    if s > canvas[di] {
+                        canvas[di] = s;
+                        any = true;
+                    }
+                }
+            }
+        }
+        if !any {
+            return RasterOutcome::Empty;
+        }
+
+        let (x, y) = match self.alloc(cw, ch) {
+            Some(p) => p,
+            None => return RasterOutcome::NoSpace,
+        };
+        for row in 0..ch {
+            let dst = ((y + row) * self.dim + x) as usize;
+            let src = (row * cw) as usize;
+            self.data[dst..dst + cw as usize].copy_from_slice(&canvas[src..src + cw as usize]);
+        }
+        self.mark_dirty_rows(y, y + ch);
+        let d = self.dim as f32;
+        RasterOutcome::Glyph(AtlasGlyph {
+            uv_min: [x as f32 / d, y as f32 / d],
+            uv_max: [(x + cw) as f32 / d, (y + ch) as f32 / d],
+            width: cw as f32,
+            height: ch as f32,
+            left: 0.0,
+            top: m.ascent,
+            color: false,
         })
     }
 
