@@ -91,6 +91,31 @@ pub fn open_url(url: &str) {
 #[cfg(not(windows))]
 pub fn open_url(_url: &str) {}
 
+/// show a blocking error dialog. used only on the fatal boot path (gpu init
+/// failed and we are about to exit) so the user sees why rather than a window
+/// that silently never appears. never call this per-frame
+#[cfg(windows)]
+pub fn show_fatal_error(msg: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+    // both buffers must outlive the modal call and be nul-terminated
+    let body: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = "termie \u{2014} GPU initialization failed\0".encode_utf16().collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn show_fatal_error(_msg: &str) {}
+
 /// set the clipboard to `text` as CF_UNICODETEXT via Win32 directly (avoids a
 /// clipboard crate that drags in image-decoder dependencies for text-only use)
 #[cfg(windows)]

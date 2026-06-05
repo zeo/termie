@@ -702,7 +702,7 @@ impl Renderer {
 
         // build instance+surface+adapter for a backend set; DX12 is the Windows
         // default (Vulkan is slow under injected overlay layers — OBS/Overwolf)
-        let try_init = |backends: wgpu::Backends| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+        let try_init = |backends: wgpu::Backends, force_fallback: bool| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
             let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
             desc.backends = backends;
             let instance = wgpu::Instance::new(desc);
@@ -712,7 +712,7 @@ impl Renderer {
                 // integrated adapter, which inits faster and saves battery
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+                force_fallback_adapter: force_fallback,
             }))
             .map_err(|e| anyhow!("no suitable GPU adapter: {e}"))?;
             Ok((instance, surface, adapter))
@@ -726,11 +726,20 @@ impl Renderer {
         } else {
             wgpu::Backends::all()
         };
-        let (_instance, surface, adapter) = match try_init(chosen) {
+        let (_instance, surface, adapter) = match try_init(chosen, false) {
             Ok(t) => t,
             Err(e) => {
                 log::warn!("backend {chosen:?} unavailable ({e:#}); falling back");
-                try_init(fallback)?
+                match try_init(fallback, false) {
+                    Ok(t) => t,
+                    Err(e2) => {
+                        // last resort: a software/WARP adapter so termie still
+                        // launches on a broken/updating driver, an RDP session, or
+                        // a locked-down VM — degraded but running beats not at all
+                        log::warn!("no hardware GPU adapter ({e2:#}); using software fallback");
+                        try_init(fallback, true)?
+                    }
+                }
             }
         };
         crate::timing("  gpu: adapter+surface");

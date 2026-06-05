@@ -3534,6 +3534,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Err(e) = self.boot(event_loop) {
             log::error!("failed to start termie: {e:#}");
+            // show why instead of vanishing — boot failure is almost always gpu
+            // init, and a window that silently never appears looks like a hang
+            win::show_fatal_error(&format!("{e:#}"));
             event_loop.exit();
         }
     }
