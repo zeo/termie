@@ -40,8 +40,12 @@ pub fn maybe_run() -> bool {
     true
 }
 
-/// time `f` over `iters` calls (after a warmup) and print ns/op; `bytes` (if set)
-/// is the input size per op, reported as MB/s
+/// number of timed trials per bench; we report the FASTEST (min) to filter out
+/// scheduling/thermal noise, which is the standard signal for a micro-benchmark
+const TRIALS: u32 = 5;
+
+/// time `f` over `iters` calls (after a warmup), best-of-TRIALS, and print ns/op;
+/// `bytes` (if set) is the input size per op, reported as MB/s
 fn bench(name: &str, filter: &Option<String>, bytes: Option<usize>, iters: u64, mut f: impl FnMut()) {
     if let Some(fl) = filter
         && !name.contains(fl.as_str())
@@ -51,11 +55,15 @@ fn bench(name: &str, filter: &Option<String>, bytes: Option<usize>, iters: u64, 
     for _ in 0..(iters / 8).max(1) {
         f();
     }
-    let t0 = Instant::now();
-    for _ in 0..iters {
-        f();
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..TRIALS {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        best = best.min(t0.elapsed());
     }
-    let el = t0.elapsed();
+    let el = best;
     let ns = el.as_nanos() as f64 / iters as f64;
     let tput = match bytes {
         Some(b) => {
@@ -201,20 +209,32 @@ fn render_benches(filter: &Option<String>) {
     let plain = plain_chunk(50 * 200 * 2);
     let mut t_plain = Terminal::new(50, 200);
     vte::Parser::new().advance(&mut t_plain, &plain);
-    let (d, n) = crate::render::Renderer::bench_draw_grid(&mut atlas, &t_plain, 4000);
+    let (d, n) = best_render(&mut atlas, &t_plain, 4000);
     report_render("draw_grid_plain_fullscreen", filter, d, 4000, n);
 
     let csi = csi_chunk(50 * 200 * 2);
     let mut t_csi = Terminal::new(50, 200);
     vte::Parser::new().advance(&mut t_csi, &csi);
-    let (d, n) = crate::render::Renderer::bench_draw_grid(&mut atlas, &t_csi, 4000);
+    let (d, n) = best_render(&mut atlas, &t_csi, 4000);
     report_render("draw_grid_colored_fullscreen", filter, d, 4000, n);
 
     let comb = combining_chunk(50 * 200 * 4);
     let mut t_comb = Terminal::new(50, 200);
     vte::Parser::new().advance(&mut t_comb, &comb);
-    let (d, n) = crate::render::Renderer::bench_draw_grid(&mut atlas, &t_comb, 4000);
+    let (d, n) = best_render(&mut atlas, &t_comb, 4000);
     report_render("draw_grid_combining_fullscreen", filter, d, 4000, n);
+}
+
+/// best-of-TRIALS draw_grid timing (filters noise like bench() does)
+fn best_render(atlas: &mut GlyphAtlas, term: &Terminal, iters: u64) -> (std::time::Duration, usize) {
+    let mut best = std::time::Duration::MAX;
+    let mut n = 0;
+    for _ in 0..TRIALS {
+        let (d, c) = crate::render::Renderer::bench_draw_grid(atlas, term, iters);
+        best = best.min(d);
+        n = c;
+    }
+    (best, n)
 }
 
 fn report_render(name: &str, filter: &Option<String>, d: std::time::Duration, iters: u64, instances: usize) {

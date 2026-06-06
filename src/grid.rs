@@ -158,6 +158,9 @@ pub struct Grid {
     /// linear scan of `clusters` — matters for varied non-Latin text where the
     /// table grows toward its cap
     cluster_index: HashMap<String, u32>,
+    /// reused scratch for building a cluster's text in append_combining, so the
+    /// common (already-interned) combining char costs no per-mark allocation
+    cluster_scratch: String,
     /// kitty graphics placements anchored to absolute lines (scroll with text)
     placements: Vec<Placement>,
 }
@@ -212,6 +215,7 @@ impl Grid {
             links: vec![String::new()],
             clusters: vec![String::new()],
             cluster_index: HashMap::new(),
+            cluster_scratch: String::new(),
             placements: Vec::new(),
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
@@ -1050,9 +1054,16 @@ impl Grid {
         let Some(cell) = self.lines.get(row).and_then(|l| l.get(col)).copied() else {
             return;
         };
-        let mut s = self.cluster_str(cell.cluster).to_string();
-        if s.is_empty() {
+        // build the new cluster text in a reused buffer (take it out so it doesn't
+        // borrow self while interning) — an already-interned cluster then costs no
+        // allocation, only the buffer's reused capacity + an index probe
+        let mut s = std::mem::take(&mut self.cluster_scratch);
+        s.clear();
+        let existing = self.cluster_str(cell.cluster);
+        if existing.is_empty() {
             s.push(cell.c);
+        } else {
+            s.push_str(existing);
         }
         // cap so a flood of combiners can't grow one cluster unbounded
         if s.chars().count() < 16 {
@@ -1060,6 +1071,7 @@ impl Grid {
             let id = self.intern_cluster(&s);
             self.lines[row][col].cluster = id;
         }
+        self.cluster_scratch = s; // hand the buffer back for the next mark
     }
 
     /// the URI a cell's link id points at, if any
