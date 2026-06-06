@@ -581,6 +581,9 @@ impl Grid {
         }
         // prompt marks reference pre-reflow line indices; reset rather than mis-jump
         self.prompts.clear();
+        // image placements anchor on absolute line indices too; reset them with
+        // the prompts so they don't point at stale lines after the reindex
+        self.placements.clear();
         self.total_scrolled = self.scrollback.len() as u64;
         self.view_offset = 0;
     }
@@ -999,7 +1002,10 @@ impl Grid {
         if let Some(i) = self.clusters.iter().position(|c| c == s) {
             return i as u32;
         }
-        if self.clusters.len() >= (u32::MAX as usize) {
+        // cap the table so a long session of distinct combining/ZWJ sequences
+        // can't grow it without bound; past the cap a cell falls back to its base
+        // char (cluster 0)
+        if self.clusters.len() >= 16384 {
             return 0;
         }
         self.clusters.push(s.to_string());
@@ -1019,19 +1025,21 @@ impl Grid {
     /// copy and (Part B) composition. a leading combiner with no base is dropped
     fn append_combining(&mut self, c: char) {
         let row = self.cursor.row;
-        let col = if self.cursor.wrap_pending {
+        // the base cell is where the last glyph landed: the cursor column when a
+        // wrap is pending (e.g. a wide glyph at end-of-line), else the cell just
+        // before the cursor
+        let mut col = if self.cursor.wrap_pending {
             self.cursor.col
         } else if self.cursor.col == 0 {
-            return;
+            return; // leading combiner with no base
         } else {
-            let prev = self.cursor.col - 1;
-            // step back onto the lead cell of a wide pair
-            if prev > 0 && self.lines[row].get(prev).map(|x| x.c) == Some('\0') {
-                prev - 1
-            } else {
-                prev
-            }
+            self.cursor.col - 1
         };
+        // never attach to the '\0' continuation of a wide glyph: step to its lead,
+        // or the mark renders blank and leaks a NUL into copy / accessibility
+        if col > 0 && self.lines.get(row).and_then(|l| l.get(col)).map(|x| x.c) == Some('\0') {
+            col -= 1;
+        }
         let Some(cell) = self.lines.get(row).and_then(|l| l.get(col)).copied() else {
             return;
         };
@@ -1084,8 +1092,9 @@ impl Grid {
         }
     }
 
-    pub fn clear_placements(&mut self) {
-        self.placements.clear();
+    /// drop only the placements of a given image (kitty a=d for one image id)
+    pub fn remove_placements(&mut self, image_id: u32) {
+        self.placements.retain(|p| p.image_id != image_id);
     }
 
     pub fn placements(&self) -> &[Placement] {

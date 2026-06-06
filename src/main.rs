@@ -1043,8 +1043,9 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
                 if cmd.action == b'T' {
                     term.grid.place_image(id);
                 }
+                // ack with the resolved id (an i=0 transmit gets an auto id)
                 if cmd.quiet == 0 {
-                    kitty_ok(term, cmd.id);
+                    kitty_ok(term, id);
                 }
             }
         }
@@ -1058,7 +1059,7 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
         }
         b'd' => {
             term.images.delete(cmd.id);
-            term.grid.clear_placements();
+            term.grid.remove_placements(cmd.id);
         }
         b'q' => {
             if cmd.quiet == 0 {

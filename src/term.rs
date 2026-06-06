@@ -150,6 +150,8 @@ impl Terminal {
         self.grid.set_scroll_region(0, self.grid.rows - 1);
         self.grid.origin_mode = false;
         self.grid.cursor.shape_set = false;
+        // DECSTR turns the text cursor back on (DECTCEM)
+        self.grid.cursor.visible = true;
     }
 
     /// DECRQM mode-state reply value: 1 = set, 2 = reset, 0 = not recognized
@@ -513,7 +515,8 @@ impl Perform for Terminal {
     fn print(&mut self, c: char) {
         let mapped = self.map_charset(c);
         self.grid.put_char(mapped);
-        self.last_print = Some(c);
+        // REP repeats the glyph as presented, so store the post-charset glyph
+        self.last_print = Some(mapped);
         self.dirty = true;
     }
 
@@ -569,9 +572,8 @@ impl Perform for Terminal {
             'P' => self.grid.delete_chars(param_at(params, 0, 1) as usize),
             'X' => self.grid.erase_chars(param_at(params, 0, 1) as usize),
             'b' => {
-                // REP: repeat the last printed glyph N times
-                if let Some(c) = self.last_print {
-                    let mapped = self.map_charset(c);
+                // REP: repeat the last presented glyph N times (already charset-mapped)
+                if let Some(mapped) = self.last_print {
                     let n = (param_at(params, 0, 1) as usize).min(self.grid.cols * self.grid.rows);
                     for _ in 0..n {
                         self.grid.put_char(mapped);

@@ -37,6 +37,9 @@ pub struct ImageStore {
     /// in-progress chunked (m=1) transmissions keyed by image id
     pending: HashMap<u32, Pending>,
     next_auto: u32,
+    /// the auto-id of an in-flight anonymous (i=0) chunked transfer, so its
+    /// later chunks continue the same image instead of minting a fresh id each
+    anon: Option<u32>,
 }
 
 impl ImageStore {
@@ -51,9 +54,15 @@ impl ImageStore {
         more: bool,
         chunk: &[u8],
     ) -> Option<u32> {
-        let id = if id == 0 {
-            self.next_auto = self.next_auto.wrapping_add(1).max(1);
-            self.next_auto
+        let anonymous = id == 0;
+        let id = if anonymous {
+            match self.anon {
+                Some(a) => a,
+                None => {
+                    self.next_auto = self.next_auto.wrapping_add(1).max(1);
+                    self.next_auto
+                }
+            }
         } else {
             id
         };
@@ -75,10 +84,18 @@ impl ImageStore {
         p.data.extend_from_slice(chunk);
         if p.data.len() > MAX_IMAGE_BYTES {
             self.pending.remove(&id);
+            self.anon = None;
             return None;
         }
         if more {
+            // remember an anonymous transfer so its next chunk continues it
+            if anonymous {
+                self.anon = Some(id);
+            }
             return None;
+        }
+        if anonymous {
+            self.anon = None;
         }
         let p = self.pending.remove(&id)?;
         let mut img = decode(p.format, p.width, p.height, &p.data)?;
