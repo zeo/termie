@@ -2506,19 +2506,15 @@ impl Renderer {
             // remaining space doesn't bleed into a sibling pane or the status bar,
             // and a placement scrolled partly above the top shows its lower rows
             let top_y = grid.screen_row_signed(p.abs_line) as f32 * cell_h;
-            let vis_top = top_y.max(0.0);
-            let vis_bot = (top_y + g.height).min(content_h);
-            if vis_bot <= vis_top {
+            let Some((vis_top, vis_h, uf0, uf1)) = clip_image_v(top_y, g.height, content_h) else {
                 continue;
-            }
+            };
             let uspan = g.uv_max[1] - g.uv_min[1];
-            let umin = g.uv_min[1] + uspan * (vis_top - top_y) / g.height;
-            let umax = g.uv_min[1] + uspan * (vis_bot - top_y) / g.height;
             out.push(Instance {
                 pos: [ox + p.col as f32 * cell_w, oy + vis_top],
-                size: [g.width, vis_bot - vis_top],
-                uv_min: [g.uv_min[0], umin],
-                uv_max: [g.uv_max[0], umax],
+                size: [g.width, vis_h],
+                uv_min: [g.uv_min[0], g.uv_min[1] + uspan * uf0],
+                uv_max: [g.uv_max[0], g.uv_min[1] + uspan * uf1],
                 color: [0.0, 0.0, 0.0, 1.0],
                 kind: 3,
                 _pad: [0; 3],
@@ -4045,6 +4041,58 @@ impl Renderer {
         readback.unmap();
         self.scratch = instances;
         crate::render::preview::write_png(path, width, height, &rgba)
+    }
+}
+
+/// vertical crop of an image quad to a pane's visible height [0, content_h].
+/// `top_y` is the quad's top in pane-local pixels (negative when scrolled above
+/// the viewport), `height` its native pixel height. returns (visible_top,
+/// visible_height, uv_top_frac, uv_bot_frac) — the uv fracs are 0..1 into the
+/// image height — or None when the quad is fully off-screen or degenerate
+fn clip_image_v(top_y: f32, height: f32, content_h: f32) -> Option<(f32, f32, f32, f32)> {
+    if height <= 0.0 {
+        return None;
+    }
+    let vis_top = top_y.max(0.0);
+    let vis_bot = (top_y + height).min(content_h);
+    if vis_bot <= vis_top {
+        return None;
+    }
+    Some((vis_top, vis_bot - vis_top, (vis_top - top_y) / height, (vis_bot - top_y) / height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_image_v;
+
+    #[test]
+    fn image_clip_fully_visible() {
+        assert_eq!(clip_image_v(10.0, 50.0, 200.0), Some((10.0, 50.0, 0.0, 1.0)));
+    }
+
+    #[test]
+    fn image_clip_bottom_overrun() {
+        // top at 180 in a 200px pane, 50px tall: the bottom 30px is cropped off
+        let (vt, vh, u0, u1) = clip_image_v(180.0, 50.0, 200.0).unwrap();
+        assert_eq!((vt, vh), (180.0, 20.0));
+        assert_eq!(u0, 0.0);
+        assert!((u1 - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn image_clip_scrolled_above_top() {
+        // top 30px above the viewport: show the lower 20px, uv starts mid-image
+        let (vt, vh, u0, u1) = clip_image_v(-30.0, 50.0, 200.0).unwrap();
+        assert_eq!((vt, vh), (0.0, 20.0));
+        assert!((u0 - 0.6).abs() < 1e-6);
+        assert_eq!(u1, 1.0);
+    }
+
+    #[test]
+    fn image_clip_fully_offscreen() {
+        assert!(clip_image_v(-60.0, 50.0, 200.0).is_none()); // wholly above
+        assert!(clip_image_v(250.0, 50.0, 200.0).is_none()); // wholly below
+        assert!(clip_image_v(10.0, 0.0, 200.0).is_none()); // degenerate height
     }
 }
 
