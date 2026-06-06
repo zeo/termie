@@ -1726,6 +1726,17 @@ impl App {
                 win::apply_window_effects(h.hwnd.get());
             }
 
+        // overlap the slow first pwsh spawn with the ~300ms gpu init below: kick it
+        // off now so it is already producing its prompt by the time the window
+        // appears. it arrives via PaneReady and becomes tab one. spawned at the
+        // canonical size since the renderer (final content size) isn't built yet —
+        // the first-output relayout resizes it before any content is painted (the
+        // pty reader only starts at PaneReady, so no 80x24 content is ever shown).
+        // only for a bare launch; cli/restore launches install tab one synchronously
+        if self.cli.is_bare() {
+            self.spawn_pool_shell(80, 24);
+        }
+
         let renderer = Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend)?;
         timing("renderer ready (gpu init)");
         window.set_ime_allowed(true);
@@ -1949,18 +1960,25 @@ impl App {
         // event loop; dispatch all that are needed at once so they spawn in
         // parallel and the pool fills fast. each arrives via UserEvent::PaneReady
         let (cols, rows) = self.content_pane_size();
-        let (shell, profile, sb) = (self.config.shell, self.config.load_profile, self.config.scrollback);
         while self.pool.len() + self.pending_warm < POOL_TARGET {
-            let id = self.next_id;
-            self.next_id += 1;
-            let proxy = self.proxy.clone();
-            let wsl = self.persisted.wsl_distro.clone();
-            self.pending_warm += 1;
-            std::thread::spawn(move || {
-                let pane = build_pane(id, cols, rows, shell, profile, sb, None, None, wsl.as_deref()).ok().map(Box::new);
-                let _ = proxy.send_event(UserEvent::PaneReady(pane));
-            });
+            self.spawn_pool_shell(cols, rows);
         }
+    }
+
+    /// dispatch one pool-shell spawn on a worker thread (the async warm-pool
+    /// unit). it arrives via UserEvent::PaneReady, where it becomes tab one (bare
+    /// launch) or joins the pool
+    fn spawn_pool_shell(&mut self, cols: usize, rows: usize) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (shell, profile, sb) = (self.config.shell, self.config.load_profile, self.config.scrollback);
+        let proxy = self.proxy.clone();
+        let wsl = self.persisted.wsl_distro.clone();
+        self.pending_warm += 1;
+        std::thread::spawn(move || {
+            let pane = build_pane(id, cols, rows, shell, profile, sb, None, None, wsl.as_deref()).ok().map(Box::new);
+            let _ = proxy.send_event(UserEvent::PaneReady(pane));
+        });
     }
 
     /// kill every pre-warmed shell (called on shutdown); also latches the
