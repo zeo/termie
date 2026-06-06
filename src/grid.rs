@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use crate::fxhash::FxHashMap;
+use std::collections::VecDeque;
 
 use crate::color::Color;
 
@@ -157,7 +158,7 @@ pub struct Grid {
     /// reverse index (cluster text -> id) so interning is O(1) instead of a
     /// linear scan of `clusters` — matters for varied non-Latin text where the
     /// table grows toward its cap
-    cluster_index: HashMap<String, u32>,
+    cluster_index: FxHashMap<String, u32>,
     /// reused scratch for building a cluster's text in append_combining, so the
     /// common (already-interned) combining char costs no per-mark allocation
     cluster_scratch: String,
@@ -219,7 +220,7 @@ impl Grid {
             scrollback_limit: 10_000,
             links: vec![String::new()],
             clusters: vec![String::new()],
-            cluster_index: HashMap::new(),
+            cluster_index: FxHashMap::default(),
             cluster_scratch: String::new(),
             placements: Vec::new(),
             cursor: Cursor::default(),

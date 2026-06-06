@@ -4,6 +4,7 @@
 mod a11y;
 mod apc;
 mod color;
+mod fxhash;
 mod image;
 mod grid;
 mod input;

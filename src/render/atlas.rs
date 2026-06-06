@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 use std::path::PathBuf;
 
 use cosmic_text::{
@@ -71,14 +71,14 @@ pub struct GlyphAtlas {
     /// whether system fonts have been scanned into the db yet (lazy)
     system_loaded: bool,
 
-    cache: HashMap<GlyphKey, Option<AtlasGlyph>>,
+    cache: FxHashMap<GlyphKey, Option<AtlasGlyph>>,
     /// composited grapheme-cluster glyphs, keyed by a string whose first char
     /// encodes bold/italic so the lookup borrows `&str` (no per-hit allocation)
-    cluster_cache: HashMap<String, Option<AtlasGlyph>>,
+    cluster_cache: FxHashMap<String, Option<AtlasGlyph>>,
     /// reused scratch for the cluster lookup key (style prefix + cluster text)
     cluster_key: String,
     /// kitty images packed into the color atlas, keyed by global image key
-    image_cache: HashMap<u64, Option<AtlasGlyph>>,
+    image_cache: FxHashMap<u64, Option<AtlasGlyph>>,
 }
 
 const PAD: u32 = 1;
@@ -141,10 +141,10 @@ impl GlyphAtlas {
             cursor_y: PAD,
             shelf_h: 0,
             system_loaded: false,
-            cache: HashMap::new(),
-            cluster_cache: HashMap::new(),
+            cache: FxHashMap::default(),
+            cluster_cache: FxHashMap::default(),
             cluster_key: String::new(),
-            image_cache: HashMap::new(),
+            image_cache: FxHashMap::default(),
         };
         atlas.data = vec![0u8; (atlas.dim * atlas.dim) as usize];
         atlas.color_data = vec![0u8; (atlas.dim * atlas.dim * 4) as usize];
