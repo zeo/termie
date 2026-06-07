@@ -22,8 +22,10 @@ pub fn maybe_run() -> bool {
     };
     let scene = val("--scene").unwrap_or_else(|| "split".to_string());
     let out = val("--png").unwrap_or_else(|| "uiview.png".to_string());
-    let (w, h) = (1100u32, 680u32);
-    let scale = 2.0f32;
+    // overridable so responsive layouts (narrow / wide / hidpi) can be captured
+    let w = val("--w").and_then(|v| v.parse().ok()).unwrap_or(1100u32).clamp(320, 4000);
+    let h = val("--h").and_then(|v| v.parse().ok()).unwrap_or(680u32).clamp(240, 3000);
+    let scale = val("--scale").and_then(|v| v.parse().ok()).unwrap_or(2.0f32).clamp(1.0, 3.0);
 
     let mut r = render::Renderer::new_headless(w, h, 14.0, 12.5, scale);
     r.set_tabs(vec!["backend".into(), "web-ui".into(), "infra".into()], 0);

@@ -1720,7 +1720,11 @@ impl App {
             .with_window_icon(icon)
             .with_decorations(false)
             .with_visible(false)
-            .with_inner_size(LogicalSize::new(1000.0, 640.0));
+            .with_inner_size(LogicalSize::new(1000.0, 640.0))
+            // below this the title-bar controls + tabs and the status-bar clusters
+            // would overlap (no room for all the chrome); clamp so the window is
+            // always usable
+            .with_min_inner_size(LogicalSize::new(560.0, 380.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
         timing("window created");
 
@@ -3704,7 +3708,8 @@ impl App {
         };
         let attrs = Window::default_attributes()
             .with_title("termie — pane")
-            .with_inner_size(LogicalSize::new(760.0, 480.0));
+            .with_inner_size(LogicalSize::new(760.0, 480.0))
+            .with_min_inner_size(LogicalSize::new(560.0, 380.0));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(_) => {
