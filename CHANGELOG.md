@@ -1,11 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 — 2026-06-08
 
 ### Plugins
-- Rebuilt the in-app plugin store as a card layout — each plugin shows its name, version, description, permission badges, and an **Install** / **Enabled** / **Disabled** action, with live installed/available counts in the header and distinct loading, empty, and unreachable-catalog states.
-- The store now tells a failed catalog fetch apart from an empty catalog and shows an accurate message instead of always blaming "offline".
+- Rebuilt the in-app plugin store as a **full-page view** — each plugin is a card with its name, version, description, permission badges, and an **Install** / **Enabled** / **Disabled** action, with live installed/available counts in the header and distinct loading, empty, and unreachable-catalog states.
 - Catalog and plugin downloads authenticate through the GitHub CLI (`gh`) when the file lives in the catalog repo, so a private catalog works with your existing login; anonymous `curl` stays the fallback for a public host.
+- The store tells a failed catalog fetch apart from an empty catalog and shows an accurate message instead of always blaming "offline".
+
+### Fixes
+- Settings: the PLUGINS section rule no longer draws through the "browse" button.
 
 ## v0.1.1 — 2026-06-08
 
