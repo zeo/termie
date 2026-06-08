@@ -361,3 +361,108 @@ mod null_pty {
         }
     }
 }
+
+// live integration tests: spawn a real shell through the pty and exercise the
+// full spawn -> read -> parse -> reply -> render path end-to-end. pty output is
+// fed through a real Terminal so DSR/DA queries (ConPTY's startup `ESC[6n`,
+// which gates the child's output until it's answered) are replied to, exactly
+// as the app does. spawning real processes is timing-sensitive, so these are
+// #[ignore]d to keep them out of CI (the release plan flagged them as flaky);
+// run locally with `cargo test -- --ignored`
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+    use crate::term::Terminal;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use vte::Parser;
+
+    fn grid_text(term: &Terminal) -> String {
+        term.grid
+            .lines
+            .iter()
+            .map(|line| line.iter().map(|c| c.c).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // feed pty output into a Terminal until `needle` renders into the grid or the
+    // timeout passes, writing the terminal's query replies (DSR/DA) back to the
+    // pty so ConPTY proceeds. returns the final grid text.
+    fn pump_until(
+        pty: &mut Pty,
+        rx: &mpsc::Receiver<PtyMsg>,
+        rows: usize,
+        cols: usize,
+        needle: &str,
+        timeout: Duration,
+    ) -> String {
+        let mut term = Terminal::new(rows, cols);
+        let mut parser = Parser::new();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(PtyMsg::Output(b)) => {
+                    parser.advance(&mut term, &b);
+                    if !term.responses.is_empty() {
+                        let reply = std::mem::take(&mut term.responses);
+                        pty.write(&reply);
+                    }
+                    if grid_text(&term).contains(needle) {
+                        break;
+                    }
+                }
+                Ok(PtyMsg::Exited) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        grid_text(&term)
+    }
+
+    fn reader_channel(pty: &mut Pty) -> mpsc::Receiver<PtyMsg> {
+        let (tx, rx) = mpsc::channel();
+        pty.start_reader(move |m| {
+            let _ = tx.send(m);
+        });
+        rx
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn pty_runs_a_command_and_renders_output() {
+        let argv = ["cmd.exe", "/c", "echo termie-itest-OK"].map(String::from);
+        let mut pty =
+            Pty::spawn(24, 80, ShellKind::Cmd, false, None, Some(&argv[..]), None).expect("spawn pty");
+        let rx = reader_channel(&mut pty);
+        let grid = pump_until(&mut pty, &rx, 24, 80, "termie-itest-OK", Duration::from_secs(15));
+        pty.kill();
+        assert!(grid.contains("termie-itest-OK"), "command output not rendered; grid: {grid:?}");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn pty_echoes_typed_input() {
+        let mut pty = Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None).expect("spawn pty");
+        let rx = reader_channel(&mut pty);
+        // let the shell come up (answering its startup queries), then type a command
+        std::thread::sleep(Duration::from_millis(700));
+        pty.write(b"echo termie-input-OK\r\n");
+        let grid = pump_until(&mut pty, &rx, 24, 80, "termie-input-OK", Duration::from_secs(15));
+        pty.kill();
+        assert!(grid.contains("termie-input-OK"), "typed input not rendered; grid: {grid:?}");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn pty_keeps_working_after_resize() {
+        let mut pty = Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None).expect("spawn pty");
+        let rx = reader_channel(&mut pty);
+        std::thread::sleep(Duration::from_millis(500));
+        pty.resize(40, 120);
+        pty.write(b"echo termie-resize-OK\r\n");
+        let grid = pump_until(&mut pty, &rx, 40, 120, "termie-resize-OK", Duration::from_secs(15));
+        pty.kill();
+        assert!(grid.contains("termie-resize-OK"), "no output rendered after resize; grid: {grid:?}");
+    }
+}
