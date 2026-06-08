@@ -1,5 +1,6 @@
 //! decoded kitty graphics images + chunked-transmission reassembly. raw RGB
-//! (f=24) and RGBA (f=32) only; PNG (f=100) is a deferred fast-follow
+//! (f=24), RGBA (f=32), and PNG (f=100); PNG self-describes its size, so the
+//! width/height from the kitty command are ignored for it
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,8 +132,13 @@ impl ImageStore {
     }
 }
 
-/// decode raw RGB/RGBA into RGBA8; None on an unsupported format or short data
+/// decode a transmitted image into RGBA8; None on an unsupported format or short
+/// data. PNG (f=100) self-describes its size, so it's handled before the w/h
+/// guard the raw formats need
 fn decode(format: u32, w: u32, h: u32, data: &[u8]) -> Option<Image> {
+    if format == 100 {
+        return decode_png(data);
+    }
     if w == 0 || h == 0 {
         return None;
     }
@@ -157,8 +163,63 @@ fn decode(format: u32, w: u32, h: u32, data: &[u8]) -> Option<Image> {
             }
             v
         }
-        _ => return None, // PNG (100) deferred
+        _ => return None,
     };
+    Some(Image { key: 0, width: w, height: h, rgba })
+}
+
+/// decode a PNG into RGBA8 using the `png` crate; width/height come from the PNG
+/// header. EXPAND|STRIP_16 normalizes paletted / low-bit / 16-bit down to 8-bit,
+/// leaving grayscale / grayscale-alpha / rgb / rgba, which we widen to RGBA8. the
+/// decoded-size guard rejects a decompression bomb before allocating
+fn decode_png(data: &[u8]) -> Option<Image> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let sz = reader.output_buffer_size()?;
+    if sz == 0 || sz > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; sz];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    let px = (w as usize).checked_mul(h as usize)?;
+    let n4 = px.checked_mul(4)?;
+    let src = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => {
+            if src.len() < n4 {
+                return None;
+            }
+            src[..n4].to_vec()
+        }
+        png::ColorType::Rgb => {
+            let mut v = Vec::with_capacity(n4);
+            for c in src.chunks_exact(3) {
+                v.extend_from_slice(c);
+                v.push(255);
+            }
+            v
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut v = Vec::with_capacity(n4);
+            for c in src.chunks_exact(2) {
+                v.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
+            }
+            v
+        }
+        png::ColorType::Grayscale => {
+            let mut v = Vec::with_capacity(n4);
+            for &g in src {
+                v.extend_from_slice(&[g, g, g, 255]);
+            }
+            v
+        }
+        _ => return None,
+    };
+    if rgba.len() != n4 {
+        return None;
+    }
     Some(Image { key: 0, width: w, height: h, rgba })
 }
 
@@ -174,6 +235,25 @@ mod tests {
         let id = s.transmit(7, 24, 2, 1, false, &data).expect("decoded");
         assert_eq!(id, 7);
         let img = s.get(7).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn decodes_png_via_format_100() {
+        // encode a 2x1 RGBA image (red, green) to PNG, then decode it back through
+        // transmit(f=100) — kitty sends no width/height for PNG; the header carries it
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 2, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        }
+        let mut s = ImageStore::default();
+        let id = s.transmit(9, 100, 0, 0, false, &bytes).expect("png decoded");
+        let img = s.get(id).unwrap();
         assert_eq!((img.width, img.height), (2, 1));
         assert_eq!(img.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
     }
