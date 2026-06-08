@@ -29,6 +29,12 @@ termie is a from-scratch terminal emulator + multiplexer written in Rust. It ren
 
 ## Install
 
+### Download (no toolchain needed)
+
+Grab the `termie-<version>-windows-x64.zip` from the [latest release](https://github.com/lintowe/termie/releases/latest), extract it anywhere, and run `termie.exe`. Keep the `assets` folder next to the executable — that's where the bundled font lives. The build is unsigned, so Windows SmartScreen may warn on first launch; choose **More info → Run anyway**.
+
+### Build from source
+
 Requires the [Rust toolchain](https://rustup.rs/) (stable). From a clone:
 
 ```powershell
