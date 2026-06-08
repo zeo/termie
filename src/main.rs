@@ -1238,6 +1238,11 @@ struct Persisted {
     /// run plugins inside a windows appcontainer for privilege isolation
     /// (`plugin_sandbox=appcontainer`); off by default
     plugin_sandbox: bool,
+    /// experimental: paint inline instead of via request_redraw for pty output
+    /// (`inline_paint=true`); off by default — wants on-device tear-checking
+    inline_paint: bool,
+    /// draw the input-to-photon latency hud (`latency_hud=true`); off by default
+    latency_hud: bool,
 }
 
 impl Default for Persisted {
@@ -1262,8 +1267,61 @@ impl Default for Persisted {
             quake_key: None,
             wsl_distro: None,
             plugin_sandbox: false,
+            inline_paint: false,
+            latency_hud: false,
         }
     }
+}
+
+/// a small rolling meter of input-to-photon latency and frame intervals (ms),
+/// feeding the optional latency hud. fixed-capacity so it never grows
+#[derive(Default)]
+struct LatencyMeter {
+    input_ms: std::collections::VecDeque<f32>,
+    frame_ms: std::collections::VecDeque<f32>,
+}
+
+impl LatencyMeter {
+    fn record_input(&mut self, ms: f32) {
+        push_capped(&mut self.input_ms, ms);
+    }
+
+    fn record_frame(&mut self, ms: f32) {
+        push_capped(&mut self.frame_ms, ms);
+    }
+
+    /// a compact one-line summary, or None until there is data
+    fn hud(&self) -> Option<String> {
+        let lat = percentiles(&self.input_ms);
+        let frame = percentiles(&self.frame_ms);
+        match (lat, frame) {
+            (Some((p50, p95)), Some((f50, _))) => {
+                Some(format!("in->photon p50 {p50:.1}ms p95 {p95:.1}ms  frame {f50:.1}ms"))
+            }
+            (Some((p50, p95)), None) => Some(format!("in->photon p50 {p50:.1}ms p95 {p95:.1}ms")),
+            (None, Some((f50, _))) => Some(format!("frame {f50:.1}ms")),
+            (None, None) => None,
+        }
+    }
+}
+
+fn push_capped(q: &mut std::collections::VecDeque<f32>, v: f32) {
+    const CAP: usize = 120;
+    if q.len() == CAP {
+        q.pop_front();
+    }
+    q.push_back(v);
+}
+
+/// (p50, p95) of a sample set, or None if empty
+fn percentiles(q: &std::collections::VecDeque<f32>) -> Option<(f32, f32)> {
+    if q.is_empty() {
+        return None;
+    }
+    let mut v: Vec<f32> = q.iter().copied().collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |p: f32| v[((v.len() as f32 * p) as usize).min(v.len() - 1)];
+    Some((pick(0.50), pick(0.95)))
 }
 
 fn cursor_from_name(s: &str) -> grid::CursorShape {
@@ -1525,6 +1583,8 @@ fn load_persisted() -> Persisted {
                 }
             }
             "plugin_sandbox" => p.plugin_sandbox = v == "appcontainer" || v == "on" || v == "true",
+            "inline_paint" => p.inline_paint = v == "true" || v == "on",
+            "latency_hud" => p.latency_hud = v == "true" || v == "on",
             _ => {}
         }
     }
@@ -1645,6 +1705,12 @@ struct App {
     /// pty output arrived this loop turn; about_to_wait paints once so a flood
     /// of chunks collapses to a single frame
     pty_dirty: bool,
+    /// input-to-photon instrumentation: the time of the first input not yet
+    /// reflected on screen (None once painted), the last present time, and a
+    /// rolling meter feeding the optional latency hud
+    input_at: Option<Instant>,
+    last_present: Option<Instant>,
+    lat: LatencyMeter,
     /// the tab/split layout changed since the last session write
     session_dirty: bool,
     /// debounce deadline for the session write; re-armed on every layout change
@@ -1731,6 +1797,9 @@ impl App {
             sync_redraw_pending: None,
             resize_settle: None,
             pty_dirty: false,
+            input_at: None,
+            last_present: None,
+            lat: LatencyMeter::default(),
             session_dirty: false,
             session_flush_at: None,
             plugins: Vec::new(),
@@ -2487,7 +2556,9 @@ impl App {
             y: m.y,
             hovered: m.hovered,
         });
+        let hud = if self.persisted.latency_hud { self.lat.hud() } else { None };
         if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_latency_hud(hud);
             r.set_status(git, clock, sessions);
             r.set_palette(palette_view);
             r.set_pane_menu(pane_menu_view);
@@ -2521,6 +2592,7 @@ impl App {
             }
             self.last_title = title;
         }
+        let mut present_now: Option<Instant> = None;
         let App {
             pw,
             selection,
@@ -2568,8 +2640,18 @@ impl App {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            if let Err(e) = r.render(&views, *focused, *maximized, focus_ease, false) {
-                log::error!("render error: {e:#}");
+            match r.render(&views, *focused, *maximized, focus_ease, false) {
+                Ok(()) => present_now = Some(Instant::now()),
+                Err(e) => log::error!("render error: {e:#}"),
+            }
+        }
+        // input-to-photon + frame-interval sampling for the latency hud
+        if let Some(now) = present_now {
+            if let Some(prev) = self.last_present.replace(now) {
+                self.lat.record_frame((now - prev).as_secs_f32() * 1000.0);
+            }
+            if let Some(t) = self.input_at.take() {
+                self.lat.record_input((now - t).as_secs_f32() * 1000.0);
             }
         }
     }
@@ -3588,6 +3670,12 @@ impl App {
         if self.persisted.plugin_sandbox {
             let _ = writeln!(s, "plugin_sandbox=appcontainer");
         }
+        if self.persisted.inline_paint {
+            let _ = writeln!(s, "inline_paint=true");
+        }
+        if self.persisted.latency_hud {
+            let _ = writeln!(s, "latency_hud=true");
+        }
         let _ = std::fs::write(&path, s);
     }
 
@@ -3893,6 +3981,11 @@ impl App {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event: ke, .. } => {
+                // input-to-photon: stamp the first keypress not yet reflected on
+                // screen; paint() clears it once the resulting frame presents
+                if ke.state == ElementState::Pressed && self.input_at.is_none() {
+                    self.input_at = Some(Instant::now());
+                }
                 if !self.handle_shortcut(&ke, event_loop) && ke.state == ElementState::Pressed {
                     let id = self.active_focused_id();
                     let (app_cursor, kbd) = id
@@ -5367,11 +5460,17 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
-        // coalesced pty-output paint: one redraw per loop turn no matter how many
-        // pty chunks arrived since the last frame
+        // coalesced pty-output paint: one frame per loop turn no matter how many
+        // pty chunks arrived since the last frame. inline_paint (experimental)
+        // paints here directly, skipping the request_redraw sub-vsync hop; either
+        // way it stays one present per loop turn
         if self.pty_dirty {
             self.pty_dirty = false;
-            self.redraw();
+            if self.persisted.inline_paint {
+                self.paint();
+            } else {
+                self.redraw();
+            }
         }
         // a resize drag is in flight: hold the grid/pty reflow until it settles
         // (~90ms of quiet), then reflow once instead of per pixel-step. this
@@ -5558,6 +5657,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_percentiles_and_hud() {
+        let mut m = LatencyMeter::default();
+        assert_eq!(m.hud(), None);
+        for v in [10.0, 1.0, 5.0, 2.0, 8.0, 3.0, 4.0, 6.0, 7.0, 9.0] {
+            m.record_input(v);
+        }
+        let (p50, p95) = percentiles(&m.input_ms).unwrap();
+        assert_eq!((p50, p95), (6.0, 10.0));
+        // the cap keeps the meter bounded no matter how much is recorded
+        for _ in 0..500 {
+            m.record_frame(16.6);
+        }
+        assert!(m.frame_ms.len() <= 120);
+        assert!(m.hud().unwrap().contains("in->photon"));
+    }
 
     #[test]
     fn cwd_path_parses_osc7_uris() {

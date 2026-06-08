@@ -550,6 +550,8 @@ pub struct Renderer {
     /// per-widget clickable band (x, y, w, h), parallel to `dock`; rebuilt each
     /// frame by draw_dock so widget_at can route clicks to the owning plugin
     dock_hitboxes: Vec<(f32, f32, f32, f32)>,
+    /// optional input-to-photon hud line, drawn bottom-left for latency testing
+    latency_hud: Option<String>,
 
     pub cols: usize,
     pub rows: usize,
@@ -1196,6 +1198,7 @@ impl Renderer {
             rename_view: None,
             dock: Vec::new(),
             dock_hitboxes: Vec::new(),
+            latency_hud: None,
             cols: 0,
             rows: 0,
         };
@@ -1260,6 +1263,11 @@ impl Renderer {
         } else {
             (224.0 * self.scale).round().min(self.config.width as f32 * 0.4)
         }
+    }
+
+    /// set the latency hud line (None hides it)
+    pub fn set_latency_hud(&mut self, line: Option<String>) {
+        self.latency_hud = line;
     }
 
     /// replace the dock's widget list. returns true if the dock's presence
@@ -3052,6 +3060,9 @@ impl Renderer {
             }
         }
 
+        // latency hud (diagnostic) drawn last so it stays on top
+        self.draw_latency_hud(&mut out, track);
+
         out
     }
 
@@ -3244,6 +3255,24 @@ impl Renderer {
     /// the right-side plugin dock: a flat instrument panel listing each Tier-1
     /// widget (title in the accent color, then its text lines). drawn in the
     /// content band, to the right of the reflowed panes
+    /// draw the input-to-photon latency line bottom-left on a faint backing rect
+    fn draw_latency_hud(&mut self, out: &mut Vec<Instance>, track: f32) {
+        let Some(line) = self.latency_hud.clone() else {
+            return;
+        };
+        let s = self.scale;
+        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let pad = (8.0 * s).round();
+        let tw = self.text_w(FontId::Chrome, &line, track);
+        let (bw, bh) = (tw + pad * 2.0, chrome_h + pad);
+        let bx = pad;
+        let by = (self.config.height as f32 - bh - pad).max(0.0);
+        Self::push_rect(out, bx, by, bw, bh, self.palette.ink0, 0.72);
+        Self::stroke_rect(out, (bx, by, bw, bh), s.max(1.0), self.palette.rule2);
+        let ty = (by + (bh - chrome_h) / 2.0).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &line, self.palette.paper, 1.0, track);
+    }
+
     #[allow(non_snake_case)]
     fn draw_dock(&mut self, out: &mut Vec<Instance>, track: f32) {
         let s = self.scale;
