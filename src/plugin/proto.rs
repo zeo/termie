@@ -414,4 +414,54 @@ mod tests {
             other => panic!("expected widget, got {other:?}"),
         }
     }
+
+    #[test]
+    fn tier2_text_truncates_to_240_chars() {
+        let long = "x".repeat(500);
+        let line = format!(
+            r#"{{"t":"declare_widget","widget":{{"id":"w","title":"T","draw":[{{"t":"text","x":0,"y":0,"text":"{long}","color":"text"}}]}}}}"#
+        );
+        match PluginCmd::from_line(&line).unwrap() {
+            PluginCmd::DeclareWidget(w) => match &w.draw[0] {
+                DrawCmd::Text { text, .. } => assert_eq!(text.chars().count(), 240),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected widget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier2_canvas_h_clamps_to_bounds() {
+        let parse_h = |h: &str| -> Option<f32> {
+            let line = format!(
+                r#"{{"t":"declare_widget","widget":{{"id":"w","title":"T","canvas_h":{h},"draw":[{{"t":"rect","x":0,"y":0,"w":1,"h":1,"color":"ink"}}]}}}}"#
+            );
+            match PluginCmd::from_line(&line).unwrap() {
+                PluginCmd::DeclareWidget(w) => w.canvas_h,
+                _ => None,
+            }
+        };
+        assert_eq!(parse_h("1"), Some(8.0)); // below the floor
+        assert_eq!(parse_h("72"), Some(72.0)); // in range
+        assert_eq!(parse_h("9000"), Some(360.0)); // above the ceiling
+    }
+
+    #[test]
+    fn tier2_color_spec_is_preserved_verbatim() {
+        // the protocol carries the color string as-is; the renderer resolves it
+        let line = r##"{"t":"declare_widget","widget":{"id":"w","title":"T","draw":[{"t":"rect","x":0,"y":0,"w":1,"h":1,"color":"#6486a6"},{"t":"text","x":0,"y":0,"text":"hi","color":"accent"}]}}"##;
+        match PluginCmd::from_line(line).unwrap() {
+            PluginCmd::DeclareWidget(w) => {
+                match &w.draw[0] {
+                    DrawCmd::Rect { color, .. } => assert_eq!(color, "#6486a6"),
+                    other => panic!("expected rect, got {other:?}"),
+                }
+                match &w.draw[1] {
+                    DrawCmd::Text { color, .. } => assert_eq!(color, "accent"),
+                    other => panic!("expected text, got {other:?}"),
+                }
+            }
+            other => panic!("expected widget, got {other:?}"),
+        }
+    }
 }

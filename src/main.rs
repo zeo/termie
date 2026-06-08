@@ -1523,13 +1523,20 @@ fn vk_from_name(name: &str) -> Option<u32> {
 }
 
 fn load_persisted() -> Persisted {
-    let mut p = Persisted::default();
     let Some(path) = config_path() else {
-        return p;
+        return Persisted::default();
     };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return p;
+        return Persisted::default();
     };
+    parse_persisted(&text)
+}
+
+/// parse the key=value config text into Persisted, leaving defaults for any key
+/// absent or malformed; split out from load_persisted so the settings parser is
+/// unit-testable without touching %APPDATA%
+fn parse_persisted(text: &str) -> Persisted {
+    let mut p = Persisted::default();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -5707,6 +5714,96 @@ mod tests {
         }
         assert!(m.frame_ms.len() <= 120);
         assert!(m.hud().unwrap().contains("in->photon"));
+    }
+
+    #[test]
+    fn latency_hud_segments_match_recorded_data() {
+        // nothing recorded yet -> nothing to show
+        assert_eq!(LatencyMeter::default().hud(), None);
+        // frame samples only -> a frame segment, no input-to-photon segment
+        let mut f = LatencyMeter::default();
+        f.record_frame(16.6);
+        let line = f.hud().unwrap();
+        assert!(line.contains("frame") && !line.contains("in->photon"));
+        // input samples only -> an input-to-photon segment, no frame segment
+        let mut i = LatencyMeter::default();
+        i.record_input(4.0);
+        let line = i.hud().unwrap();
+        assert!(line.contains("in->photon") && !line.contains("frame"));
+        // both -> one combined line carrying both segments
+        let mut b = LatencyMeter::default();
+        b.record_input(4.0);
+        b.record_frame(16.6);
+        let line = b.hud().unwrap();
+        assert!(line.contains("in->photon") && line.contains("frame"));
+    }
+
+    #[test]
+    fn latency_percentiles_edges() {
+        use std::collections::VecDeque;
+        // a single sample is both p50 and p95
+        let one: VecDeque<f32> = [7.0].into_iter().collect();
+        assert_eq!(percentiles(&one), Some((7.0, 7.0)));
+        // an empty set has no percentiles
+        assert_eq!(percentiles(&VecDeque::new()), None);
+        // percentiles sort first, so insertion order can't change the result
+        let shuffled: VecDeque<f32> = [5.0, 1.0, 4.0, 2.0, 3.0].into_iter().collect();
+        let sorted: VecDeque<f32> = [1.0, 2.0, 3.0, 4.0, 5.0].into_iter().collect();
+        assert_eq!(percentiles(&shuffled), percentiles(&sorted));
+    }
+
+    #[test]
+    fn latency_meter_is_capped_at_120_samples() {
+        let mut m = LatencyMeter::default();
+        for _ in 0..1000 {
+            m.record_input(1.0);
+            m.record_frame(2.0);
+        }
+        assert_eq!(m.input_ms.len(), 120);
+        assert_eq!(m.frame_ms.len(), 120);
+    }
+
+    #[test]
+    fn config_parses_feature_flags_and_aliases() {
+        // the opt-in sandbox accepts each of its documented spellings
+        assert!(parse_persisted("plugin_sandbox=appcontainer").plugin_sandbox);
+        assert!(parse_persisted("plugin_sandbox=on").plugin_sandbox);
+        assert!(parse_persisted("plugin_sandbox=true").plugin_sandbox);
+        assert!(!parse_persisted("plugin_sandbox=off").plugin_sandbox);
+        assert!(!Persisted::default().plugin_sandbox);
+
+        assert!(parse_persisted("inline_paint=true").inline_paint);
+        assert!(parse_persisted("inline_paint=on").inline_paint);
+        assert!(!parse_persisted("inline_paint=false").inline_paint);
+
+        assert!(parse_persisted("latency_hud=true").latency_hud);
+        assert!(parse_persisted("latency_hud=on").latency_hud);
+        assert!(!parse_persisted("latency_hud=nope").latency_hud);
+
+        assert_eq!(parse_persisted("wsl_distro=Ubuntu").wsl_distro.as_deref(), Some("Ubuntu"));
+        // an empty value leaves the default (no distro pinned)
+        assert_eq!(parse_persisted("wsl_distro=").wsl_distro, None);
+    }
+
+    #[test]
+    fn config_round_trips_the_serialized_flag_lines() {
+        // exactly what the settings writer emits for the opt-in features
+        let text = "plugin_sandbox=appcontainer\ninline_paint=true\nlatency_hud=true\nwsl_distro=Arch\n";
+        let p = parse_persisted(text);
+        assert!(p.plugin_sandbox && p.inline_paint && p.latency_hud);
+        assert_eq!(p.wsl_distro.as_deref(), Some("Arch"));
+    }
+
+    #[test]
+    fn config_ignores_unknown_keys_and_malformed_lines() {
+        let text = "\nfrobnicate=yes\nlatency_hud=true\n   \nplugin_sandbox\n";
+        let p = parse_persisted(text);
+        // the one real key still takes effect
+        assert!(p.latency_hud);
+        // a bare key with no '=' is skipped, not read as enabling the sandbox
+        assert!(!p.plugin_sandbox);
+        // unknown keys leave everything else at its default
+        assert_eq!(p.scrollback, Persisted::default().scrollback);
     }
 
     #[test]

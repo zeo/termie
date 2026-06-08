@@ -255,4 +255,54 @@ mod tests {
         assert!(remove("../etc", &dir).is_err());
         assert!(remove("", &dir).is_err());
     }
+
+    fn temp_subdir(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut d = std::env::temp_dir();
+        d.push(format!("termie-mkt-{tag}-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn find_manifest_root_handles_root_nested_and_ambiguous() {
+        // plugin.json directly in base -> base itself is the root
+        let base = temp_subdir("root");
+        std::fs::write(base.join("plugin.json"), "{}").unwrap();
+        assert_eq!(find_manifest_root(&base).as_deref(), Some(base.as_path()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // plugin.json one level down -> that single subdir is the root
+        let base = temp_subdir("nested");
+        let sub = base.join("inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("plugin.json"), "{}").unwrap();
+        assert_eq!(find_manifest_root(&base), Some(sub));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // two subdirs and no manifest at base -> ambiguous, so None
+        let base = temp_subdir("ambiguous");
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::create_dir_all(base.join("b")).unwrap();
+        assert_eq!(find_manifest_root(&base), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_deletes_a_safe_plugin_dir() {
+        let base = temp_subdir("remove");
+        std::fs::create_dir_all(base.join("pet")).unwrap();
+        std::fs::write(base.join("pet").join("plugin.json"), "{}").unwrap();
+        assert!(base.join("pet").exists());
+        remove("pet", &base).expect("removing a real plugin dir succeeds");
+        assert!(!base.join("pet").exists());
+        // removing what's already gone errors, and unsafe ids stay rejected
+        assert!(remove("pet", &base).is_err());
+        assert!(remove("../escape", &base).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

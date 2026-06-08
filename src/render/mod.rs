@@ -192,7 +192,7 @@ pub struct MarketView {
 
 /// what a click in the marketplace overlay landed on; row indices are into the
 /// view's `rows`
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketHit {
     /// the card body — select the row
     Card(usize),
@@ -3367,11 +3367,7 @@ impl Renderer {
         for cmd in draw {
             match cmd {
                 DockDraw::Rect { x, y, w, h, color } => {
-                    let rx = bx + x * bw;
-                    let ry = by + y * bh;
-                    let rw = (w * bw).min(bx + bw - rx).max(0.0);
-                    let rh = (h * bh).min(by + bh - ry).max(0.0);
-                    if rw >= 1.0 && rh >= 1.0 {
+                    if let Some((rx, ry, rw, rh)) = canvas_rect_px((bx, by, bw, bh), *x, *y, *w, *h) {
                         let c = self.dock_color(color);
                         Self::push_rect(out, rx.round(), ry.round(), rw, rh, c, 1.0);
                     }
@@ -3396,25 +3392,7 @@ impl Renderer {
     /// resolve a Tier-2 color spec (a palette role name or a #hex string) to an
     /// Rgb, falling back to the dock body color for anything unrecognized
     fn dock_color(&self, spec: &str) -> Rgb {
-        let p = &self.palette;
-        if let Some(hex) = spec.strip_prefix('#')
-            && let Some(c) = Self::parse_hex_rgb(hex)
-        {
-            return c;
-        }
-        match spec {
-            "paper" => p.paper,
-            "text" | "text2" => p.text2,
-            "mute" => p.mute,
-            "rule" => p.rule,
-            "rule2" => p.rule2,
-            "ink" | "ink1" => p.ink1,
-            "ink0" => p.ink0,
-            "ink3" => p.ink3,
-            "ink4" => p.ink4,
-            "accent" => p.paper,
-            _ => p.text2,
-        }
+        resolve_dock_color(&self.palette, spec)
     }
 
     /// parse "#rgb" or "#rrggbb" (leading # already stripped) into an Rgb
@@ -4345,6 +4323,46 @@ impl Renderer {
     }
 }
 
+/// resolve a Tier-2 color spec (a palette role name or a #hex string) to an Rgb,
+/// falling back to the dock body color for anything unrecognized; a pure mirror
+/// of dock_color so the role table stays unit-testable
+fn resolve_dock_color(p: &Palette, spec: &str) -> Rgb {
+    if let Some(hex) = spec.strip_prefix('#')
+        && let Some(c) = Renderer::parse_hex_rgb(hex)
+    {
+        return c;
+    }
+    match spec {
+        "paper" => p.paper,
+        "text" | "text2" => p.text2,
+        "mute" => p.mute,
+        "rule" => p.rule,
+        "rule2" => p.rule2,
+        "ink" | "ink1" => p.ink1,
+        "ink0" => p.ink0,
+        "ink3" => p.ink3,
+        "ink4" => p.ink4,
+        "accent" => p.paper,
+        _ => p.text2,
+    }
+}
+
+/// map a Tier-2 primitive's normalized rect (x,y,w,h in 0..1) into the pixel box
+/// (bx,by,bw,bh), clipping the right and bottom edges to the box so a plugin can
+/// never paint past its own canvas; None when the mapped rect is sub-pixel
+fn canvas_rect_px(box_px: (f32, f32, f32, f32), x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    let (bx, by, bw, bh) = box_px;
+    let rx = bx + x * bw;
+    let ry = by + y * bh;
+    let rw = (w * bw).min(bx + bw - rx).max(0.0);
+    let rh = (h * bh).min(by + bh - ry).max(0.0);
+    if rw >= 1.0 && rh >= 1.0 {
+        Some((rx, ry, rw, rh))
+    } else {
+        None
+    }
+}
+
 /// vertical crop of an image quad to a pane's visible height [0, content_h].
 /// `top_y` is the quad's top in pane-local pixels (negative when scrolled above
 /// the viewport), `height` its native pixel height. returns (visible_top,
@@ -4442,6 +4460,40 @@ mod tests {
         assert!(Renderer::parse_hex_rgb("12345").is_none());
         assert!(Renderer::parse_hex_rgb("gg00zz").is_none());
     }
+
+    #[test]
+    fn dock_color_resolves_roles_hex_and_fallback() {
+        use super::{resolve_dock_color, Palette, Rgb, ThemeId};
+        let p = Palette::from_theme(ThemeId::Instrument);
+        assert_eq!(resolve_dock_color(&p, "paper"), p.paper);
+        assert_eq!(resolve_dock_color(&p, "ink"), p.ink1);
+        assert_eq!(resolve_dock_color(&p, "ink1"), p.ink1);
+        assert_eq!(resolve_dock_color(&p, "rule2"), p.rule2);
+        // accent maps to the high-contrast paper color, like the widget title
+        assert_eq!(resolve_dock_color(&p, "accent"), p.paper);
+        // a #hex spec wins over the role table
+        assert_eq!(resolve_dock_color(&p, "#6486a6"), Rgb::new(0x64, 0x86, 0xa6));
+        // anything unrecognized falls back to the dock body color
+        assert_eq!(resolve_dock_color(&p, "chartreuse"), p.text2);
+        assert_eq!(resolve_dock_color(&p, "#zzz"), p.text2);
+    }
+
+    #[test]
+    fn canvas_rect_clips_to_its_box() {
+        use super::canvas_rect_px;
+        let b = (100.0_f32, 200.0_f32, 80.0_f32, 40.0_f32);
+        // a full-box primitive maps to the whole box
+        assert_eq!(canvas_rect_px(b, 0.0, 0.0, 1.0, 1.0), Some((100.0, 200.0, 80.0, 40.0)));
+        // a primitive starting mid-box and over-wide is clipped to the box edges
+        let (rx, ry, rw, rh) = canvas_rect_px(b, 0.5, 0.5, 1.0, 1.0).unwrap();
+        assert_eq!((rx, ry), (140.0, 220.0));
+        assert!((rx + rw - (b.0 + b.2)).abs() < 1e-4, "right edge must stay inside the box");
+        assert!((ry + rh - (b.1 + b.3)).abs() < 1e-4, "bottom edge must stay inside the box");
+        // a sub-pixel primitive is dropped
+        assert_eq!(canvas_rect_px(b, 0.0, 0.0, 0.001, 0.001), None);
+        // a zero-room primitive at the far corner is dropped
+        assert_eq!(canvas_rect_px(b, 1.0, 1.0, 0.5, 0.5), None);
+    }
 }
 
 /// round a tightly-packed RGBA row up to wgpu's 256-byte copy alignment
@@ -4506,5 +4558,101 @@ mod gpu_tests {
             super::build_cell_pipeline(&device, &uniform_bgl, &atlas_bgl, wgpu::TextureFormat::Bgra8UnormSrgb);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "cell pipeline failed validation: {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    // a real headless renderer, or None when no gpu adapter is present (e.g. CI),
+    // so these skip rather than fail — mirrors gpu_tests::headless_device
+    fn headless() -> Option<Renderer> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        // tall enough that both market rows render, so two distinct rows can be
+        // routed; scale 1.0 keeps the layout math simple
+        Some(Renderer::new_headless(1280, 900, 14.0, 12.5, 1.0))
+    }
+
+    fn tmp_png(tag: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("termie-hittest-{tag}-{}.png", std::process::id()));
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn market_clicks_route_to_close_chip_and_card() {
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_tabs(vec!["a".into()], 0);
+        r.set_market(Some(MarketView {
+            rows: vec![
+                MarketRowView { name: "tamagotchi".into(), version: "1.2".into(), description: "a pet".into(), permissions: vec![], installed: true, enabled: true },
+                MarketRowView { name: "relay".into(), version: "0.4".into(), description: "bus".into(), permissions: vec!["write_pty".into()], installed: false, enabled: false },
+            ],
+            selected: 0,
+            status: String::new(),
+            loading: false,
+            fetch_failed: false,
+        }));
+        r.settle_overlay();
+        let _ = r.render_png(&[], true, false, false, &tmp_png("market"));
+
+        // every registered region must resolve to the hit it was built for, and a
+        // card or chip must map back to its own row index
+        let mut seen: Vec<MarketHit> = Vec::new();
+        for &((x, y, w, h), expected) in &r.market_hits {
+            let got = r.market_hit_at(x + w / 2.0, y + h / 2.0).expect("a registered region must hit");
+            assert_eq!(got, expected, "the centre of a region resolved to the wrong hit");
+            seen.push(expected);
+        }
+        // the close control, plus a body card and an action chip for each row
+        for want in [MarketHit::Close, MarketHit::Card(0), MarketHit::Chip(0), MarketHit::Card(1), MarketHit::Chip(1)] {
+            assert!(seen.contains(&want), "{want:?} should be hittable");
+        }
+        // a point in the far corner is outside every region
+        assert_eq!(r.market_hit_at(2.0, 2.0), None);
+        let _ = std::fs::remove_file(tmp_png("market"));
+    }
+
+    #[test]
+    fn dock_tier2_widget_is_hittable_and_paints() {
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_tabs(vec!["a".into()], 0);
+        r.set_dock(vec![
+            DockWidget {
+                title: "Gauge".into(),
+                lines: vec!["60%".into()],
+                draw: vec![
+                    DockDraw::Rect { x: 0.0, y: 0.0, w: 1.0, h: 0.25, color: "ink".into() },
+                    DockDraw::Rect { x: 0.0, y: 0.0, w: 0.6, h: 0.25, color: "#6486a6".into() },
+                    DockDraw::Text { x: 0.0, y: 0.3, text: "60%".into(), color: "paper".into() },
+                ],
+                canvas_h: Some(64.0),
+            },
+            DockWidget { title: "Status".into(), lines: vec!["ok".into()], draw: vec![], canvas_h: None },
+        ]);
+        let _ = r.render_png(&[], true, false, false, &tmp_png("dock"));
+
+        // the dock carved one clickable band per widget; a point inside band i
+        // must select widget i
+        assert_eq!(r.dock_hitboxes.len(), 2, "two widgets should yield two bands");
+        for (i, &(x, y, w, h)) in r.dock_hitboxes.iter().enumerate() {
+            assert_eq!(r.widget_at(x + w / 2.0, y + h / 2.0), Some(i), "a point in band {i} should select widget {i}");
+        }
+        // a point far outside the dock hits no widget
+        assert_eq!(r.widget_at(5.0, 5.0), None);
+        let _ = std::fs::remove_file(tmp_png("dock"));
     }
 }
