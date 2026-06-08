@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.3 — 2026-06-08
 
 ### Terminal fidelity
 - **Kitty PNG images** (`f=100`): the graphics protocol now decodes PNG payloads (paletted / grayscale / 16-bit are normalized to RGBA8), alongside the existing raw RGB (`f=24`) and RGBA (`f=32`).
