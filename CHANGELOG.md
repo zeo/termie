@@ -4,6 +4,7 @@
 
 ### Plugins
 - **Tier-2 widget drawing** (plugin protocol `api_version` 2): a plugin can now send an immediate-mode `draw` list — `rect` and `text` primitives in coordinates normalized to the widget canvas, colored by palette role or `#hex` — painted in a `canvas_h`-tall box under the widget title. Each primitive is clipped to the widget so a plugin can never paint over the terminal, and the list is bounded (256 primitives, coordinates clamped). Tier-1 text widgets are unchanged, and a v1 plugin that never sends a draw list is unaffected. The reference tamagotchi plugin upgrades to graphical food/joy meters on a v2 host and falls back to text bars on an older one.
+- **AppContainer sandboxing** (opt-in): set `plugin_sandbox=appcontainer` in `config` to run every plugin inside a Windows AppContainer — low integrity, with no access to your files, registry, network, windows, or other processes unless granted. A plugin's `network` permission maps to the internetClient capability, and the plugin's install directory is granted read+execute so its executable loads. Off by default; on a sandbox-launch failure the plugin is skipped rather than run unconfined.
 
 ## v0.1.3 — 2026-06-08
 

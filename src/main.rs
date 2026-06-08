@@ -967,6 +967,37 @@ fn discover_plugins() -> Vec<Discovered> {
     out
 }
 
+/// spawn one plugin, confined to a windows appcontainer when `sandbox` is set,
+/// otherwise as a normal child process. the appcontainer path needs the plugin's
+/// install dir (for the working dir + exe grant) and maps the `network`
+/// permission to the internetClient capability
+fn spawn_plugin(
+    sandbox: bool,
+    id: &str,
+    d: &Discovered,
+    on_msg: impl Fn(plugin::PluginMsg) + Send + 'static,
+) -> std::io::Result<plugin::Plugin> {
+    #[cfg(windows)]
+    if sandbox
+        && let Some(dir) = plugins_dir().map(|b| b.join(&d.manifest.id))
+    {
+        let net = d.granted.iter().any(|g| g == "network");
+        let moniker = plugin::sandbox::moniker_for(&d.manifest.id);
+        return plugin::Plugin::spawn_sandboxed(
+            id.to_string(),
+            &moniker,
+            std::path::Path::new(&d.program),
+            &d.manifest.args,
+            &dir,
+            net,
+            on_msg,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = sandbox;
+    plugin::Plugin::spawn(id.to_string(), &d.program, &d.manifest.args, on_msg)
+}
+
 /// build a pane (pty + child + screen) without starting its reader thread.
 /// the slow part (process spawn) — safe to run off the main thread
 /// parsed command line. always-new-window means each launch is its own process,
@@ -1204,6 +1235,9 @@ struct Persisted {
     quake_key: Option<(u32, u32)>,
     /// the WSL distribution `new tab: wsl` launches (None = wsl.exe default)
     wsl_distro: Option<String>,
+    /// run plugins inside a windows appcontainer for privilege isolation
+    /// (`plugin_sandbox=appcontainer`); off by default
+    plugin_sandbox: bool,
 }
 
 impl Default for Persisted {
@@ -1227,6 +1261,7 @@ impl Default for Persisted {
             opacity: 85,
             quake_key: None,
             wsl_distro: None,
+            plugin_sandbox: false,
         }
     }
 }
@@ -1489,6 +1524,7 @@ fn load_persisted() -> Persisted {
                     p.wsl_distro = Some(v.to_string());
                 }
             }
+            "plugin_sandbox" => p.plugin_sandbox = v == "appcontainer" || v == "on" || v == "true",
             _ => {}
         }
     }
@@ -2022,14 +2058,18 @@ impl App {
     fn start_plugins(&mut self) {
         // only launch enabled plugins; disabled ones still appear in the
         // marketplace UI but never spawn a process
+        let sandbox = self.persisted.plugin_sandbox;
         for d in discover_plugins().into_iter().filter(|d| d.enabled) {
             let id = d.manifest.id.clone();
             // the index this plugin will occupy once pushed
             let idx = self.plugins.len();
             let proxy = self.proxy.clone();
-            match plugin::Plugin::spawn(id.clone(), &d.program, &d.manifest.args, move |msg| {
+            let on_msg = move |msg| {
                 let _ = proxy.send_event(UserEvent::Plugin { id: idx, msg });
-            }) {
+            };
+            // sandboxed launch is opt-in; on failure we fail closed (skip the
+            // plugin) rather than run it unconfined
+            match spawn_plugin(sandbox, &id, &d, on_msg) {
                 Ok(mut p) => {
                     // handshake: tell the plugin our api version + the perms the
                     // user actually granted (intersected with what it declared)
@@ -3544,6 +3584,9 @@ impl App {
         let _ = writeln!(s, "font={}", r.font_name());
         if let Some(d) = &self.persisted.wsl_distro {
             let _ = writeln!(s, "wsl_distro={d}");
+        }
+        if self.persisted.plugin_sandbox {
+            let _ = writeln!(s, "plugin_sandbox=appcontainer");
         }
         let _ = std::fs::write(&path, s);
     }

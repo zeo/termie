@@ -11,11 +11,13 @@ pub mod json;
 mod manifest;
 pub mod market;
 mod proto;
+#[cfg(windows)]
+pub mod sandbox;
 
 pub use manifest::{id_is_safe, Manifest, KNOWN_PERMISSIONS};
 pub use proto::{DrawCmd, HostEvent, PluginCmd, API_VERSION};
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 
@@ -25,11 +27,31 @@ pub enum PluginMsg {
     Exited,
 }
 
+/// the OS process behind a plugin: either a normal child or, when sandboxing is
+/// enabled, an appcontainer-confined process spawned through `sandbox`
+enum Proc {
+    Std(Child),
+    #[cfg(windows)]
+    Sandbox(sandbox::Sandboxed),
+}
+
+impl Proc {
+    fn kill(&mut self) {
+        match self {
+            Proc::Std(c) => {
+                let _ = c.kill();
+            }
+            #[cfg(windows)]
+            Proc::Sandbox(s) => s.kill(),
+        }
+    }
+}
+
 /// a running plugin process. dropping or calling kill() stops it. the App
 /// tracks plugins by their Vec index, so no id is stored here; `id` is only
 /// used to label this plugin's log lines from the reader thread
 pub struct Plugin {
-    child: Child,
+    proc: Proc,
     writer: Option<Box<dyn Write + Send>>,
 }
 
@@ -51,12 +73,46 @@ impl Plugin {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let stdout = child.stdout.take().expect("piped stdout");
+        let stdout: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped stdout"));
         let writer = child.stdin.take().map(|w| Box::new(w) as Box<dyn Write + Send>);
+        Self::start_reader(id, stdout, on_msg);
+        Ok(Plugin { proc: Proc::Std(child), writer })
+    }
 
-        // reader thread: parse each line, forward to the event loop. a line that
-        // isn't valid json is dropped (logged, labeled by id) rather than
-        // killing the plugin
+    /// spawn `program args...` as a plugin confined to a windows appcontainer
+    /// named `moniker`, with `dir` as its working dir and granted dir, allowing
+    /// outbound network only when `net` is set
+    #[cfg(windows)]
+    pub fn spawn_sandboxed(
+        id: impl Into<String>,
+        moniker: &str,
+        program: &std::path::Path,
+        args: &[String],
+        dir: &std::path::Path,
+        net: bool,
+        on_msg: impl Fn(PluginMsg) + Send + 'static,
+    ) -> std::io::Result<Plugin> {
+        let id = id.into();
+        let mut sb = sandbox::spawn(moniker, program, args, dir, net)?;
+        let stdout: Box<dyn Read + Send> = Box::new(
+            sb.take_stdout()
+                .ok_or_else(|| std::io::Error::other("sandbox stdout missing"))?,
+        );
+        let writer = sb
+            .take_stdin()
+            .map(|w| Box::new(w) as Box<dyn Write + Send>);
+        Self::start_reader(id, stdout, on_msg);
+        Ok(Plugin { proc: Proc::Sandbox(sb), writer })
+    }
+
+    /// reader thread: parse each line, forward to the event loop. a line that
+    /// isn't valid json is dropped (logged, labeled by id) rather than killing
+    /// the plugin
+    fn start_reader(
+        id: String,
+        stdout: Box<dyn Read + Send>,
+        on_msg: impl Fn(PluginMsg) + Send + 'static,
+    ) {
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -83,8 +139,6 @@ impl Plugin {
                 }
             }
         });
-
-        Ok(Plugin { child, writer })
     }
 
     /// send a host event to the plugin (newline-delimited). best-effort: a write
@@ -101,7 +155,7 @@ impl Plugin {
     pub fn kill(&mut self) {
         // closing stdin lets a well-behaved plugin exit cleanly; then ensure it
         let _ = self.writer.take();
-        let _ = self.child.kill();
+        self.proc.kill();
     }
 }
 

@@ -8,12 +8,24 @@ take termie down.
 
 See `docs/plugin-system-plan.md` for the full design and rationale.
 
-> Status: implemented through Tier-2 rendering. The plugin host and protocol,
-> Tier-1 widgets and the dock, Tier-2 immediate-mode drawing, the in-process bus,
-> local install/enable/disable, and the in-app store all work. OS sandboxing and a
-> cross-machine bus are possible later work. The protocol below is the **v2**
-> contract (`api_version` 2); a v1 plugin that never sends a draw list keeps
-> working unchanged.
+> Status: implemented through Tier-2 rendering, with an opt-in OS sandbox. The
+> plugin host and protocol, Tier-1 widgets and the dock, Tier-2 immediate-mode
+> drawing, the in-process bus, local install/enable/disable, and the in-app store
+> all work, and `plugin_sandbox=appcontainer` confines each plugin to a Windows
+> AppContainer. A cross-machine bus is possible later work. The protocol below is
+> the **v2** contract (`api_version` 2); a v1 plugin that never sends a draw list
+> keeps working unchanged.
+
+## Sandboxing (opt-in)
+
+By default a plugin runs as a normal subprocess with the user's rights — crash
+isolation, not privilege isolation. Setting `plugin_sandbox=appcontainer` in
+`%APPDATA%\termie\config` instead launches every plugin inside a Windows
+AppContainer: low integrity, with no access to the user's files, registry,
+network, windows, or other processes unless granted. A plugin's `network`
+permission maps to the internetClient capability; the plugin's own install
+directory is granted read+execute so its executable loads. A plugin that needs
+un-granted access won't work sandboxed, so this is off by default.
 
 ## Where plugins live
 
