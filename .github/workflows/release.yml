@@ -1,0 +1,49 @@
+name: release
+
+# build, test, and attach the Windows binary when a version tag is pushed.
+# the zip mirrors a manual release: termie.exe + the assets folder beside it,
+# named termie-<tag>-windows-x64.zip
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    if: github.actor == 'lintowe'
+    runs-on: [self-hosted, windows-vm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test
+        run: cargo test
+
+      - name: build (release, LTO)
+        run: cargo build --release
+
+      - name: package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stage = Join-Path $env:RUNNER_TEMP "termie-pkg"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\termie.exe (Join-Path $stage 'termie.exe') -Force
+          Copy-Item assets (Join-Path $stage 'assets') -Recurse -Force
+          $zip = "termie-$tag-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          fail_on_unmatched_files: true
