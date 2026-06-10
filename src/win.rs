@@ -241,14 +241,30 @@ pub fn show_fatal_error(msg: &str) {
 #[cfg(not(windows))]
 pub fn show_fatal_error(_msg: &str) {}
 
+/// the clipboard is a shared resource — a clipboard manager or another app
+/// often holds it for a few ms exactly when we want it. retry briefly (1+2+4+8
+/// ms backoff) instead of silently dropping the copy or paste
+#[cfg(windows)]
+fn open_clipboard_retry() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::OpenClipboard;
+    for attempt in 0..5u32 {
+        if unsafe { OpenClipboard(Some(HWND(std::ptr::null_mut()))) }.is_ok() {
+            return true;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(1 << attempt));
+        }
+    }
+    false
+}
+
 /// set the clipboard to `text` as CF_UNICODETEXT via Win32 directly (avoids a
 /// clipboard crate that drags in image-decoder dependencies for text-only use)
 #[cfg(windows)]
 pub fn clipboard_set(text: &str) {
-    use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, SetClipboardData};
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -263,10 +279,10 @@ pub fn clipboard_set(text: &str) {
     wide.push(0);
     let bytes = wide.len() * std::mem::size_of::<u16>();
 
+    if !open_clipboard_retry() {
+        return;
+    }
     unsafe {
-        if OpenClipboard(Some(HWND(std::ptr::null_mut()))).is_err() {
-            return;
-        }
         // wrap the body so the clipboard is always closed, even on early return
         let res = (|| {
             EmptyClipboard().ok()?;
@@ -294,16 +310,16 @@ pub fn clipboard_set(text: &str) {
 /// read CF_UNICODETEXT from the clipboard as a String (empty if none/unavailable)
 #[cfg(windows)]
 pub fn clipboard_get() -> String {
-    use windows::Win32::Foundation::{HGLOBAL, HWND};
-    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     let mut out = String::new();
+    if !open_clipboard_retry() {
+        return out;
+    }
     unsafe {
-        if OpenClipboard(Some(HWND(std::ptr::null_mut()))).is_err() {
-            return out;
-        }
         if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32)
             && !h.0.is_null() {
                 let hglobal = HGLOBAL(h.0);

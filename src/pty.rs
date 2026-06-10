@@ -59,7 +59,10 @@ pub enum PtyMsg {
 
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    // input goes through a dedicated writer thread: a child that stops reading
+    // (paused pager, stopped process) fills the ConPTY input pipe, and a direct
+    // write_all from the ui thread would freeze the whole window on a big paste
+    writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     // reader is parked until start_reader() spawns the output thread; this lets
     // a pane be built off the main thread and only start emitting once registered
@@ -152,11 +155,20 @@ impl Pty {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let mut writer = pair.master.take_writer()?;
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            // exits when the Pty drops (channel closes) or the pipe breaks
+            while let Ok(chunk) = writer_rx.recv() {
+                if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
 
         Ok(Pty {
             master: pair.master,
-            writer,
+            writer_tx,
             child,
             reader: Some(reader),
         })
@@ -199,9 +211,10 @@ impl Pty {
         });
     }
 
+    /// queue bytes for the child; the writer thread does the blocking write, so
+    /// input order is preserved and the ui thread never blocks on the pipe
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let _ = self.writer_tx.send(bytes.to_vec());
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -278,9 +291,11 @@ fn resolve_shell(kind: ShellKind) -> String {
 impl Pty {
     /// a no-op pty for tests: build a Pane without spawning a real shell
     pub(crate) fn null() -> Pty {
+        // the receiver is dropped, so writes are discarded without a thread
+        let (writer_tx, _) = std::sync::mpsc::channel();
         Pty {
             master: Box::new(null_pty::NullMaster),
-            writer: Box::new(std::io::sink()),
+            writer_tx,
             child: Box::new(null_pty::NullChild),
             reader: None,
         }
