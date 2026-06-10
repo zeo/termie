@@ -63,6 +63,8 @@ cargo run --release
 | `Ctrl+Shift+O` | split horizontal |
 | `Ctrl+Shift+P` | command palette |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste |
+| `Ctrl+Insert` / `Shift+Insert` | copy / paste (classic chords) |
+| `F11` | toggle fullscreen |
 | `Ctrl+Shift+W` | close pane |
 | `Ctrl+Shift+B` | broadcast input to all panes |
 | `Ctrl+Shift+F` | find in scrollback |

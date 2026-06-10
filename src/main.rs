@@ -165,6 +165,7 @@ enum PaletteAction {
     Paste,
     CloseFocusedPane,
     ToggleZoom,
+    ToggleFullscreen,
     RenameTab,
     /// prompt-jump passes through to the program when there are no OSC-133 marks
     JumpPromptPrev,
@@ -187,6 +188,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("settings", PaletteAction::Settings),
     ("pane mode", PaletteAction::PaneMode),
     ("zoom pane", PaletteAction::ToggleZoom),
+    ("toggle fullscreen", PaletteAction::ToggleFullscreen),
     ("rename tab", PaletteAction::RenameTab),
     ("quake drop-down", PaletteAction::Quake),
     ("cycle theme", PaletteAction::Theme),
@@ -496,6 +498,12 @@ fn parse_key(s: &str) -> Option<Key> {
         "f10" => Key::Named(NamedKey::F10),
         "f11" => Key::Named(NamedKey::F11),
         "f12" => Key::Named(NamedKey::F12),
+        "insert" | "ins" => Key::Named(NamedKey::Insert),
+        "delete" | "del" => Key::Named(NamedKey::Delete),
+        "home" => Key::Named(NamedKey::Home),
+        "end" => Key::Named(NamedKey::End),
+        "pageup" | "pgup" => Key::Named(NamedKey::PageUp),
+        "pagedown" | "pgdn" => Key::Named(NamedKey::PageDown),
         s if s.chars().count() == 1 => Key::Character(s.into()),
         _ => return None,
     })
@@ -547,6 +555,10 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         (cs, chr("t"), A::NewTab),
         (cs, chr("c"), A::Copy),
         (cs, chr("v"), A::Paste),
+        // the classic conhost chords, kept by windows terminal too
+        (ctrl, Key::Named(NamedKey::Insert), A::Copy),
+        (ModifiersState::SHIFT, Key::Named(NamedKey::Insert), A::Paste),
+        (ModifiersState::empty(), Key::Named(NamedKey::F11), A::ToggleFullscreen),
         (cs, chr("w"), A::CloseFocusedPane),
         (cs, chr("e"), A::SplitV),
         (cs, chr("o"), A::SplitH),
@@ -3098,6 +3110,7 @@ impl App {
             PaletteAction::Paste => self.paste(),
             PaletteAction::CloseFocusedPane => self.close_focused_pane(event_loop),
             PaletteAction::ToggleZoom => self.toggle_zoom(),
+            PaletteAction::ToggleFullscreen => self.toggle_fullscreen(),
             PaletteAction::RenameTab => {
                 if let Some(tab) = self.pw.tabs.get(self.pw.active_tab) {
                     let buf = tab.title.clone().unwrap_or_default();
@@ -4156,6 +4169,20 @@ impl App {
         win.focus_window();
         self.quake_shown = true;
         self.redraw();
+    }
+
+    /// borderless fullscreen on the window's current monitor, F11 to toggle —
+    /// the custom chrome stays, so tabs and the status bar remain reachable
+    fn toggle_fullscreen(&mut self) {
+        if let Some(win) = self.pw.window.as_ref() {
+            let on = win.fullscreen().is_some();
+            win.set_fullscreen(if on {
+                None
+            } else {
+                Some(winit::window::Fullscreen::Borderless(None))
+            });
+            self.redraw();
+        }
     }
 
     /// report a mouse event to the pane under the cursor if it has mouse mode on;
@@ -5942,6 +5969,14 @@ mod tests {
         let (m2, k2) = parse_combo("alt+enter").unwrap();
         assert_eq!(m2, ModifiersState::ALT);
         assert_eq!(k2, Key::Named(NamedKey::Enter));
+        // nav keys parse with their aliases; a bare key carries empty modifiers
+        let (m3, k3) = parse_combo("shift+ins").unwrap();
+        assert_eq!(m3, ModifiersState::SHIFT);
+        assert_eq!(k3, Key::Named(NamedKey::Insert));
+        let (m4, k4) = parse_combo("f11").unwrap();
+        assert_eq!(m4, ModifiersState::empty());
+        assert_eq!(k4, Key::Named(NamedKey::F11));
+        assert_eq!(parse_combo("pgdn").unwrap().1, Key::Named(NamedKey::PageDown));
         assert!(parse_combo("ctrl+").is_none());
     }
 
@@ -5963,6 +5998,13 @@ mod tests {
         assert!(has(cs, "_", PaletteAction::FontDec));
         // Ctrl+Shift+P is deliberately NOT a default (dedicated pane-mode handler)
         assert!(!d.iter().any(|(m, k, _)| *m == cs && key_matches(&Key::Character("p".into()), k)));
+        // the classic conhost chords and bare-F11 fullscreen ship as defaults
+        let named = |m: ModifiersState, k: NamedKey, a: PaletteAction| {
+            d.iter().any(|(bm, bk, ba)| *bm == m && *bk == Key::Named(k) && *ba == a)
+        };
+        assert!(named(ctrl, NamedKey::Insert, PaletteAction::Copy));
+        assert!(named(ModifiersState::SHIFT, NamedKey::Insert, PaletteAction::Paste));
+        assert!(named(ModifiersState::empty(), NamedKey::F11, PaletteAction::ToggleFullscreen));
         // label resolution covers palette + keybinding-only + select-tab
         assert_eq!(action_from_label("new tab"), Some(PaletteAction::NewTab));
         assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));

@@ -7,6 +7,8 @@
 
 ### Workflow
 - **`Ctrl`+mouse-wheel font zoom**, matching Windows Terminal; the palette's font increase / decrease / reset remain.
+- **Borderless fullscreen** on `F11` (also "toggle fullscreen" on the palette, rebindable or unbindable via `keybindings.conf` like everything else).
+- The classic conhost chords — **`Ctrl+Insert` copy, `Shift+Insert` paste** — now ship as defaults, and `keybindings.conf` understands `insert` / `delete` / `home` / `end` / `pageup` / `pagedown` (plus `ins`/`del`/`pgup`/`pgdn` aliases) as combo keys.
 
 ### Performance
 - **No GPU frames while minimized**: terminal output streaming into a minimized (or quake-hidden) window still updates the grid and the taskbar progress but skips painting; the first turn after restore paints the latest state.
