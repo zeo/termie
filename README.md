@@ -79,7 +79,7 @@ cargo build --release  # optimized, ~7.6 MB
 
 ## plugins
 
-Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be written in any language and be as heavy as it likes while the core stays lean. They render widgets in a side dock — Tier-1 text or Tier-2 immediate-mode graphics — talk to each other over an in-process bus, and can be confined to a Windows AppContainer (opt-in). The in-app marketplace (palette → "plugins") browses, installs, enables/disables, and removes them; the registry lives at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins). Two reference plugins ship in [`plugins/`](plugins/).
+Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be written in any language and be as heavy as it likes while the core stays lean. They render widgets in a side dock — Tier-1 text or Tier-2 immediate-mode graphics — talk to each other over an in-process bus, and can be confined to a Windows AppContainer (opt-in). The in-app marketplace (palette → "plugins") browses, installs, enables/disables, and removes them; the registry — plugin source plus the catalog — lives at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins), which is also where you contribute one.
 
 ## license
 

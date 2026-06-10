@@ -376,20 +376,22 @@ mod tests {
         assert_eq!(is_ac, 1, "sandboxed child should be in an appcontainer");
     }
 
-    // confirms a real plugin's stdio protocol survives the sandbox pipes: spawn
-    // the reference tamagotchi confined and read its `ready` handshake back.
-    // #[ignore]d (profile + process side effects) and skips if the plugin isn't
-    // built. run with `cargo test -- --ignored`
+    // confirms a real plugin's stdio protocol survives the sandbox pipes: spawn a
+    // plugin confined and read its `ready` handshake back. point TERMIE_TEST_PLUGIN
+    // at a built plugin exe (plugins live in the termie-plugins repo). #[ignore]d
+    // (profile + process side effects); run with `cargo test -- --ignored`
     #[test]
     #[ignore = "creates an appcontainer profile + process"]
     fn sandboxed_plugin_stdio_roundtrips() {
         use std::io::Read;
         use windows::Win32::Security::Isolation::DeleteAppContainerProfile;
 
-        let exe = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("plugins/tamagotchi/target/release/tamagotchi.exe");
+        let Some(exe) = std::env::var_os("TERMIE_TEST_PLUGIN").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set TERMIE_TEST_PLUGIN to a built plugin exe");
+            return;
+        };
         if !exe.exists() {
-            eprintln!("skip: build plugins/tamagotchi first");
+            eprintln!("skip: TERMIE_TEST_PLUGIN not found: {}", exe.display());
             return;
         }
         let dir = exe.parent().unwrap();

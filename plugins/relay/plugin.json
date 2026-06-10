@@ -1,8 +1,0 @@
-{
-  "id": "relay",
-  "name": "Session Relay",
-  "version": "0.1.0",
-  "api_version": 1,
-  "entry": { "cmd": "relay.exe", "args": [] },
-  "permissions": []
-}

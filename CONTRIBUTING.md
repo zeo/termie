@@ -16,17 +16,12 @@ cargo build --release    # optimized, ~7.6 MB
 
 The `--ignored` tests spawn a real shell through the pty and aren't run in CI (they're timing-sensitive); run them locally when changing the pty or terminal-response path.
 
-The bundled example plugins are independent crates. If you touch them, build each:
-
-```powershell
-cargo build --release --manifest-path plugins/tamagotchi/Cargo.toml
-cargo build --release --manifest-path plugins/relay/Cargo.toml
-```
+Plugins live in their own repo — [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins) — which is also where you add or change one (see its `CONTRIBUTING.md`).
 
 ## House style
 
 - **No rustfmt.** termie keeps its own source layout, and CI does not run `cargo fmt`. Don't reformat files you aren't otherwise changing — match the surrounding style.
-- **Keep the build warning-clean.** `cargo clippy --all-targets` passes with no warnings today, for the main crate and both example plugins. Keep it that way.
+- **Keep the build warning-clean.** `cargo clippy --all-targets` passes with no warnings today. Keep it that way.
 - Prefer the standard library and existing dependencies over pulling in new ones; a new production dependency needs a real reason.
 - Comments explain why, not what — skip the ones that just restate the code.
 
@@ -52,7 +47,7 @@ A new terminal feature should land with a golden scenario or a unit test that lo
 ## Pull requests
 
 - Keep commits small and focused, with a clear summary line. The history uses short prefixes (`fix:`, `perf:`, `feat:`, `test:`, `polish:`) — follow suit.
-- Make sure `cargo test` and `cargo clippy --all-targets` pass. CI runs build + tests, clippy, a `cargo-audit` scan, and builds the example plugins on every push and pull request.
+- Make sure `cargo test` and `cargo clippy --all-targets` pass. CI runs build + tests, clippy, and a `cargo-audit` scan on every push and pull request.
 - Say what changed and why, and link any issue the PR closes.
 
 ## License
