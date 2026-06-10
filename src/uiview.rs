@@ -135,8 +135,8 @@ pub fn maybe_run() -> bool {
     };
 
     let samples: [&[u8]; 2] = [
-        b"\x1b[1;32m$\x1b[0m cargo build --release\r\n   \x1b[2mCompiling\x1b[0m termie v0.1.0\r\n\x1b[33mwarning\x1b[0m: unused variable\r\n    \x1b[1;34m-->\x1b[0m src/main.rs:42\r\n\x1b[1;32m    Finished\x1b[0m in 21.8s\r\n",
-        b"\x1b[36m>\x1b[0m git diff\r\n\x1b[2mdiff --git a/src/main.rs\x1b[0m\r\n\r\n\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed line\x1b[0m\r\n",
+        b"\x1b[1;32m$\x1b[0m cargo build --release\r\n\x1b[2m   Compiling\x1b[0m termie v0.2.0\r\n\x1b[1;32m    Finished\x1b[0m `release` profile in 18.4s\r\n\x1b[1;32m$\x1b[0m cargo test\r\n\x1b[1;32m    Running\x1b[0m unittests src/main.rs\r\n\r\nrunning 165 tests\r\n\x1b[32m........................................\x1b[0m\r\n\x1b[32m..................\x1b[0m\x1b[33miiiii\x1b[0m\x1b[32m............\x1b[0m\r\n\r\ntest result: \x1b[1;32mok\x1b[0m. 160 passed; 0 failed; 5 ignored\r\n\r\n\x1b[1;32m$\x1b[0m cargo clippy --all-targets\r\n\x1b[1;32m    Finished\x1b[0m `dev` profile \xe2\x80\x94 no warnings\r\n\x1b[1;32m$\x1b[0m \x1b[7m \x1b[0m\r\n",
+        b"\x1b[36m>\x1b[0m git status -sb\r\n\x1b[32m## main...origin/main\x1b[0m\r\nnothing to commit, working tree clean\r\n\x1b[36m>\x1b[0m git log --oneline -5\r\n\x1b[33m0e5a185\x1b[0m fix: clip the browse button\r\n\x1b[33mf64cfcf\x1b[0m fix: ease the settings panel\r\n\x1b[33m083f635\x1b[0m fix: run the marketplace windowless\r\n\x1b[33m21a1abf\x1b[0m docs: rewrite the readme\r\n\x1b[33mb782251\x1b[0m release: v0.2.0\r\n\x1b[36m>\x1b[0m exa --tree --level=1 src\r\n\x1b[34msrc\x1b[0m\r\n\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 main.rs  grid.rs  term.rs  pty.rs\r\n\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 \x1b[34mrender/\x1b[0m  \x1b[34mplugin/\x1b[0m\r\n\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 input.rs  color.rs  win.rs\r\n\x1b[36m>\x1b[0m \x1b[7m \x1b[0m\r\n",
     ];
 
     let mut terms: Vec<Terminal> = Vec::new();

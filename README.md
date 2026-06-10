@@ -2,6 +2,8 @@
 
 A fast, lightweight GPU terminal multiplexer for Windows — tabs, split panes, and many shells across many repos in one window.
 
+![termie](shot.png)
+
 - downloads: [GitHub Releases](https://github.com/lintowe/termie/releases) (Windows x64 zip)
 - plugins: registry at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins)
 - license: MIT OR Apache-2.0
