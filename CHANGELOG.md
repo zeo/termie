@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Terminal fidelity
-- **Taskbar progress** (ConEmu OSC 9;4): a program reporting progress — winget, TUIs, CI scripts — now lights up termie's Windows taskbar button: green for normal progress, red for error, yellow for paused, pulsing for indeterminate. Progress from every pane in the window is folded into one value (error wins, then paused, then the largest percentage), clears when the reporting pane closes or resets, and keeps updating while the window is minimized — which is exactly when the taskbar is what you're watching.
+- **Taskbar progress** (ConEmu OSC 9;4): a program reporting progress — winget, CI scripts, build tools — now lights up termie's Windows taskbar button: green for normal progress, red for error, yellow for paused, pulsing for indeterminate. Progress from every pane in the window is folded into one value (error wins, then paused, then the largest percentage), clears when the reporting pane closes or resets, and keeps updating while the window is minimized — which is exactly when the taskbar is what you're watching.
 
 ### Workflow
 - **Launch into the current folder**: typing `termie` in File Explorer's address bar (or the Run box, or from a shell sitting in a repo) now opens the first tab in that directory, the way `cmd` does — Windows Terminal lands in your home dir unless you pass `-d .`. A plain Start-menu / desktop launch (its working dir is your home dir) still restores the saved session; a folder or `--cwd` launch is an ad-hoc window and won't overwrite that session.
@@ -55,7 +55,7 @@
 ## v0.1.1 — 2026-06-08
 
 ### Terminal fidelity
-- **Kitty keyboard protocol** (disambiguate + report-event-types): `Shift+Enter` now inserts a newline in TUIs, with faithful modified-key reporting. termie advertises `TERM_PROGRAM=ghostty` so TUIs enable it; `Ctrl+J` and `\`-then-Enter remain as universal fallbacks.
+- **Kitty keyboard protocol** (disambiguate + report-event-types): `Shift+Enter` now inserts a newline in TUIs that support it, with faithful modified-key reporting. termie advertises `TERM_PROGRAM=ghostty` so those apps enable it; `Ctrl+J` and `\`-then-Enter remain as universal fallbacks.
 - **OSC 8 hyperlinks** (Ctrl-click to open), **OSC 52** clipboard writes (read queries refused so a remote program can't exfiltrate the clipboard), and **OSC 4 / 10 / 11 / 12** color queries.
 - **Underline styles** (single / double / curly / dotted / dashed), **strikethrough**, and **blink** are now rendered — previously parsed but never drawn.
 - **Reflow on resize**: soft-wrapped lines rejoin and rewrap to the new width across scrollback and the live screen, preserving the cursor position.

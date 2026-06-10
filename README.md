@@ -1,41 +1,64 @@
-<div align="center">
-
 # termie
 
-**A fast, lightweight GPU terminal multiplexer for Windows — a cockpit for running AI TUIs across many repos at once.**
+A fast, lightweight GPU terminal multiplexer for Windows — tabs, split panes, and many shells across many repos in one window.
 
-[![CI](https://github.com/lintowe/termie/actions/workflows/ci.yml/badge.svg)](https://github.com/lintowe/termie/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+- downloads: [GitHub Releases](https://github.com/lintowe/termie/releases) (Windows x64 zip)
+- plugins: registry at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins)
+- license: MIT OR Apache-2.0
 
-</div>
+> Early but daily-usable. Windows-first; the terminal core is portable.
 
-termie is a from-scratch terminal emulator + multiplexer written in Rust. It renders on the GPU (wgpu) in a single-process [winit](https://github.com/rust-windowing/winit) app, ships as a ~7.6 MB binary, and is built around one job: driving several long-running CLI sessions (many shells) across different repositories without a pile of disconnected windows.
+## features
 
-> Status: early but daily-usable. Windows-first; the terminal core is portable.
+GPU-rendered (wgpu glyph-atlas), a ~7.6 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps a started PowerShell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
 
-## Highlights
+Tabs and recursive split panes — split vertically or horizontally, drag dividers, swap panes, tear a pane off into its own window, and broadcast input to every pane in a tab. Splits and "new tab here" open in the focused pane's directory; pick a per-tab shell (`pwsh` / `cmd` / `wsl`) from the command palette.
 
-- **GPU-rendered, lightweight.** wgpu glyph-atlas rendering, an instrument-panel aesthetic, a ~7.6 MB stripped release binary, and a lean dependency tree.
-- **Fast to open shells.** A pre-warmed shell pool keeps a started PowerShell ready so new tabs/splits feel instant; the window appears before any shell finishes spawning.
-- **Tabs + recursive split panes.** Split vertically/horizontally, drag dividers, swap panes, tear a pane off into its own window, and broadcast input to every pane in a tab (cockpit mode).
-- **Built for many repos.** Splits and a "new tab here" command open in the focused pane's directory; per-tab shell choice (`pwsh` / `cmd` / `wsl`) from the palette; drag a file in to type its path; right-click to copy the selection or paste.
-- **Command palette.** `Ctrl+Shift+P` for fuzzy access to every action.
-- **Faithful keyboard + modern escapes.** The kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs, plus accurate modified-key reporting), OSC 8 clickable hyperlinks, OSC 52 clipboard writes, OSC 4/10/11/12 color queries, OSC 9;4 progress shown on the Windows taskbar button, and curly/double/dotted underline styles, strikethrough, and blink.
-- **Real terminal emulation.** [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting (SGR + legacy), bracketed paste, OSC-7 cwd (tab labels + window title), URL detection (Ctrl-click to open), DECSCUSR cursor shapes, and DEC 2026 synchronized output for tear-free frames.
-- **Inline images + color emoji.** Displays images sent over the kitty graphics protocol (raw RGB / RGBA / PNG, scroll-anchored to the cell grid) and renders color emoji — both packed into a dedicated RGBA atlas beside the monochrome glyph cache.
-- **Sessions, IME, and a screen-reader path.** Restores the tab and split layout on launch with crash recovery, composes input through the IME (CJK and friends), and exposes the focused pane to assistive tech via AccessKit.
-- **Themes, fonts, and customization.** Three built-in themes (Instrument / Koi / Paper), bundled Maple Mono Nerd Font, lazy system-font discovery, adjustable font size, padding, cursor shape/blink, and window opacity in an in-app settings panel — plus per-user color overrides (`colors.conf`) and rebindable keys (`keybindings.conf`).
-- **Plugin system + in-app marketplace.** Extend termie without bloating the core: plugins run as separate OS processes over a small JSON protocol, so they can be written in any language and can't slow startup or crash the app. See [docs/plugin-system-plan.md](docs/plugin-system-plan.md) and [plugins/README.md](plugins/README.md).
+Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting, bracketed paste, OSC 7 cwd (tab labels + window title), reflow on resize, the kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs), OSC 8 hyperlinks, OSC 52 clipboard writes, OSC 4/10/11/12 color queries, OSC 9;4 taskbar progress, underline styles, strikethrough, blink, and DEC 2026 synchronized output for tear-free frames.
 
-## Install
+Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG) and full-color emoji, both packed into a dedicated RGBA atlas beside the glyph cache. IME composition, a screen-reader path via AccessKit, and session restore (tab + split layout) with crash recovery.
 
-### Download (no toolchain needed)
+A command palette (`Ctrl+Shift+P`) for fuzzy access to every action. Three built-in themes, a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. An optional Quake-style drop-down (`quake_key`).
 
-Grab the `termie-<version>-windows-x64.zip` from the [latest release](https://github.com/lintowe/termie/releases/latest), extract it anywhere, and run `termie.exe`. Keep the `assets` folder next to the executable — that's where the bundled font lives. The build is unsigned, so Windows SmartScreen may warn on first launch; choose **More info → Run anyway**.
+A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and can be confined to a Windows AppContainer. An in-app marketplace browses and installs them.
 
-### Build from source
+## install
 
-Requires the [Rust toolchain](https://rustup.rs/) (stable). From a clone:
+Download `termie-<version>-windows-x64.zip` from the [latest release](https://github.com/lintowe/termie/releases/latest), extract it anywhere, and run `termie.exe`. Keep the `assets` folder beside the executable — that's where the bundled font lives. The build is unsigned, so SmartScreen may warn on first launch: **More info → Run anyway**.
+
+## keybindings
+
+| key | action |
+|---|---|
+| `Ctrl+T` / `Ctrl+W` | new / close tab |
+| `Ctrl+Tab` / `Ctrl+1`..`9` | next / nth tab |
+| `Ctrl+Shift+E` / `Ctrl+Shift+O` | split vertical / horizontal |
+| `Ctrl+Shift+P` | command palette |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste (also `Ctrl+Insert` / `Shift+Insert`) |
+| `Ctrl+Shift+F` | find in scrollback |
+| `Ctrl+Shift+B` | broadcast input to every pane |
+| `Ctrl+Shift+W` | close pane |
+| `Ctrl+Up` / `Ctrl+Down` | jump to previous / next prompt |
+| `F11` | fullscreen |
+| `Ctrl`+wheel | font zoom |
+
+Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list is in the command palette.
+
+## shells
+
+Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with WSL also selectable. PowerShell launches `-NoLogo -NoProfile` (profile loading is opt-in) with telemetry and update checks off for a fast prompt. Set the default in settings, or open a one-off tab in any shell from the palette.
+
+## configuration
+
+Drop files in `%APPDATA%\termie\`:
+
+- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` (drop-down hotkey), `plugin_sandbox=appcontainer` (sandbox every plugin), `latency_hud=true` (input-to-photon readout).
+- `colors.conf` — override theme colors, one `key=color` per line (`fg`, `bg`, `cursor`, `sel`, `ansi0`..`ansi255`; `#rrggbb`, `#rgb`, or `r,g,b`).
+- `keybindings.conf` — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`.
+
+## build from source
+
+Requires the [Rust toolchain](https://rustup.rs/) (stable).
 
 ```powershell
 git clone https://github.com/lintowe/termie
@@ -43,99 +66,23 @@ cd termie
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-This builds in release, installs to `%LOCALAPPDATA%\Programs\termie`, bundles the fonts, and adds the directory to your user `PATH`. Restart your shell, then run `termie`. Remove it with `uninstall.ps1`.
-
-To just run it without installing:
-
-```powershell
-cargo run --release
-```
-
-## Keybindings
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+T` | new tab |
-| `Ctrl+W` | close tab |
-| `Ctrl+Tab` | next tab |
-| `Ctrl+1`..`9` | go to tab |
-| `Ctrl+Shift+E` | split vertical |
-| `Ctrl+Shift+O` | split horizontal |
-| `Ctrl+Shift+P` | command palette |
-| `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste |
-| `Ctrl+Insert` / `Shift+Insert` | copy / paste (classic chords) |
-| `F11` | toggle fullscreen |
-| `Ctrl+Shift+W` | close pane |
-| `Ctrl+Shift+B` | broadcast input to all panes |
-| `Ctrl+Shift+F` | find in scrollback |
-| `Ctrl+Up` / `Ctrl+Down` | jump to previous / next shell prompt |
-
-In find, `Enter` / `Shift+Enter` step through matches and `Esc` closes. Double-click selects a word, triple-click selects the line. `Ctrl`+mouse-wheel zooms the font (also on the palette as font increase / decrease / reset). Prompt jumping uses OSC 133 marks, emitted by most shells once their shell-integration hook is enabled (starship, or the zsh/bash/fish integration scripts, or PowerShell's `PSReadLine`); without it the prompt keys pass through to the running program.
-
-Open the command palette (`Ctrl+Shift+P`) for settings, theme cycling, pane mode, and the plugins marketplace.
-
-## Shells
-
-Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with **WSL** also selectable; the default shell is set in settings, and the palette's "new tab: pwsh / cmd / wsl" opens a one-off tab in any shell. PowerShell launches with `-NoLogo -NoProfile` (profile loading is opt-in) and telemetry/update-check disabled for a fast prompt.
-
-## Customization
-
-Drop files in `%APPDATA%\termie\`:
-
-- **`colors.conf`** — override theme colors, one `key=color` per line. Keys include `fg`, `bg`, `cursor`, `sel`, and `ansi0`..`ansi255`; colors are `#rrggbb`, `#rgb`, or `r,g,b`. Overrides apply on top of the selected built-in theme.
-- **`keybindings.conf`** — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`. Action names match the command-palette entries; bindings take precedence over the built-in defaults.
-- **`config`** — general settings the in-app panel also writes (e.g. `scrollback`, `shell`, `theme`). One extra opt-in lives here: **`quake_key=ctrl+grave`** registers a process-global hotkey that drops termie down from the top of the screen (full width, always-on-top) and hides it again — a Quake-style terminal. Modifiers are `ctrl`/`alt`/`shift`/`win`; the key can be a letter, digit, `f1`–`f12`, or a name like `grave`/`space`/`tab`. A real modifier is required. The palette's "quake drop-down" toggles it too. Unset by default. A second opt-in, **`plugin_sandbox=appcontainer`**, runs every plugin inside a Windows AppContainer — low integrity, with no access to your files, registry, network, windows, or other processes unless granted (a plugin's `network` permission grants outbound internet). Off by default; the curated store and per-plugin permissions are the baseline. A diagnostic opt-in, **`latency_hud=true`**, draws a live input-to-photon and frame-time readout in the bottom-left. By default termie paints terminal output inline for the lowest input-to-photon latency (tear-free under vsync); **`inline_paint=false`** restores the older request-redraw path if you ever need it.
-
-## Plugins
-
-Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be any language and as heavy as it likes while the core stays lean. They render widgets in a side dock — **Tier-1** text or **Tier-2** immediate-mode graphics (drawn meters, bars, and labels) — talk to each other over an in-process bus, and can be confined to a Windows AppContainer sandbox (opt-in). The in-app marketplace (palette → "plugins") browses, installs, enables/disables, and removes them; sensitive permissions are off by default and shown at install. Two reference plugins live in [`plugins/`](plugins/): a tamagotchi pet and a session relay.
-
-## Building & development
+This builds in release, installs to `%LOCALAPPDATA%\Programs\termie`, bundles the fonts, adds the directory to your user `PATH`, and registers an "Open in termie" context-menu entry. Restart your shell, then run `termie`. Remove it with `uninstall.ps1`. To run without installing, use `cargo run --release`.
 
 ```powershell
 cargo build            # debug
-cargo test             # unit tests
+cargo test             # unit tests (incl. golden snapshots)
 cargo clippy --all-targets
 cargo build --release  # optimized, ~7.6 MB
 ```
 
-CI (GitHub Actions) runs build + tests, clippy, a `cargo-audit` security scan, and builds the bundled example plugins on every push.
+## plugins
 
-### Headless rendering harness
+Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be written in any language and be as heavy as it likes while the core stays lean. They render widgets in a side dock — Tier-1 text or Tier-2 immediate-mode graphics — talk to each other over an in-process bus, and can be confined to a Windows AppContainer (opt-in). The in-app marketplace (palette → "plugins") browses, installs, enables/disables, and removes them; the registry lives at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins). Two reference plugins ship in [`plugins/`](plugins/).
 
-Terminal and rendering changes are verifiable without opening a window — they run through the real parser, grid, and glyph atlas:
+## license
 
-```powershell
-cargo run -- --termview --scenario sgr      # dump the grid + state as text
-cargo run -- --termview --seq "\e[31mhi"    # feed an escape sequence (also --file, --resize COLSxROWS)
-cargo run -- --termview --scenario wrap --png out.png   # render the same scene to an image
-```
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Bundled fonts and other third-party material keep their own licenses — see [THIRDPARTY.md](THIRDPARTY.md).
 
-`cargo test golden` checks a set of fixed scenarios (SGR, diff bars, soft-wrap, reflow grow/shrink, background-color erase, kitty queries, OSC, cursor moves, underline styles) against checked-in snapshots in [`tests/golden/`](tests/golden). A terminal or rendering change shows up as a diff in the failing test. After an **intended** change, re-bless the snapshots and review the diff before committing:
-
-```powershell
-$env:BLESS=1; cargo test golden; $env:BLESS=$null
-git diff tests/golden    # read exactly what changed
-```
-
-### Layout
-
-```
-src/
-  main.rs         App, event loop, tab/pane tree, shell pool
-  render/         wgpu renderer, glyph atlas, shaders, chrome/UI
-  term.rs         vte Perform: CSI/OSC/SGR handling
-  grid.rs         terminal grid, scrollback, wrapping
-  pty.rs          ConPTY via portable-pty
-  plugin/         plugin host, JSON protocol, manifest, marketplace
-  color.rs        themes + sRGB conversion
-plugins/          first-party reference plugins (independent crates)
-```
-
-## License
-
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Bundled fonts and other third-party material are covered by their own licenses — see [THIRDPARTY.md](THIRDPARTY.md).
-
-## Built with
+## built with
 
 [wgpu](https://github.com/gfx-rs/wgpu) · [winit](https://github.com/rust-windowing/winit) · [vte](https://github.com/alacritty/vte) · [portable-pty](https://github.com/wezterm/wezterm/tree/main/pty) · [cosmic-text](https://github.com/pop-os/cosmic-text)

@@ -2358,7 +2358,7 @@ impl Renderer {
             '\u{2594}' => Self::push_rect(out, x, y, w, h / 8.0, col, 1.0), // upper eighth
             '\u{2595}' => Self::push_rect(out, x + w * 7.0 / 8.0, y, w / 8.0, h, col, 1.0), // right eighth
             // quadrant blocks (▖▗▘▙▚▛▜▝▞▟): 2x2 sub-cell fills, so low-res block
-            // art (e.g. mosaic logos) tiles solid instead of leaving gaps
+            // art and mosaic logos tile solid instead of leaving gaps
             '\u{2596}'..='\u{259F}' => {
                 let (hw, hh) = (w / 2.0, h / 2.0);
                 // bits: 1=upper-left 2=upper-right 4=lower-left 8=lower-right

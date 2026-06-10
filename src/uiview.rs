@@ -136,7 +136,7 @@ pub fn maybe_run() -> bool {
 
     let samples: [&[u8]; 2] = [
         b"\x1b[1;32m$\x1b[0m cargo build --release\r\n   \x1b[2mCompiling\x1b[0m termie v0.1.0\r\n\x1b[33mwarning\x1b[0m: unused variable\r\n    \x1b[1;34m-->\x1b[0m src/main.rs:42\r\n\x1b[1;32m    Finished\x1b[0m in 21.8s\r\n",
-        b"\x1b[36m>\x1b[0m a TUI\r\n\x1b[2mbuilding...\x1b[0m\r\n\r\nbuild finished.\r\n\x1b[32m+ added\x1b[0m  \x1b[31m- removed\x1b[0m\r\n",
+        b"\x1b[36m>\x1b[0m git diff\r\n\x1b[2mdiff --git a/src/main.rs\x1b[0m\r\n\r\n\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed line\x1b[0m\r\n",
     ];
 
     let mut terms: Vec<Terminal> = Vec::new();

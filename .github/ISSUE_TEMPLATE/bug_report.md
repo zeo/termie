@@ -18,7 +18,7 @@ running when it happened).
 - termie version (the About panel, or the commit you built from):
 - Windows version:
 - Shell (pwsh / powershell / cmd / wsl):
-- Program running in the pane, if relevant (vim, a pager, …):
+- Program running in the pane, if relevant (vim, a pager, a TUI, …):
 - GPU / driver, if it looks like a rendering issue:
 
 **Logs / screenshots**

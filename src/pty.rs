@@ -138,11 +138,11 @@ impl Pty {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERMIE", "1");
-        // some TUIs only enable the kitty keyboard protocol
-        // (the thing that makes shift+enter a newline) when TERM_PROGRAM names a
-        // terminal on their static allowlist; they never query the terminal.
-        // ghostty is the narrowest-capability match and shares the kitty
-        // keyboard family termie genuinely implements
+        // some TUIs only enable the kitty keyboard protocol (the thing that makes
+        // shift+enter a newline) when TERM_PROGRAM names a terminal on their
+        // static allowlist; they never query the terminal. ghostty is the
+        // narrowest-capability match and shares the kitty keyboard family termie
+        // genuinely implements
         cmd.env("TERM_PROGRAM", "ghostty");
         // trim pwsh/.NET startup work: skip the background update check + telemetry
         cmd.env("POWERSHELL_UPDATECHECK", "Off");

@@ -2576,7 +2576,7 @@ impl App {
         // without bracketed paste a multiline paste runs each line as its own
         // command the moment it lands; hold it behind a confirm so a stray paste
         // can't fire a string of commands. bracketed-paste programs (modern
-        // shells, TUIs) buffer the whole paste safely, so they go straight
+        // shells, full-screen apps) buffer the whole paste safely, so they go straight
         let multiline = normalized.trim_end_matches('\r').contains('\r');
         if !bracketed && multiline {
             let lines = normalized.split('\r').filter(|l| !l.is_empty()).count();
