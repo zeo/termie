@@ -25,6 +25,7 @@
 - Non-sandboxed plugins no longer flash a **console window** on launch — the host spawns them with `CREATE_NO_WINDOW`, matching the sandbox path — so a console-subsystem plugin like the reference tamagotchi stays windowless.
 - The reference **tamagotchi** pet is now animated and interactive: a pixel creature that idles, blinks, hops, and naps, startles into a sparkly bounce on a `bell`, perks up on focus changes, and pets/feeds itself when you click its card — with food and joy shown as segmented gauges. It only emits a frame when the drawing actually changes, so an idle pet lets the terminal idle too (now declares `api_version` 2).
 - Both reference plugins (**tamagotchi**, **relay**) are built as Windows GUI-subsystem binaries, so they never flash a console window even on an older host that predates the `CREATE_NO_WINDOW` spawn fix.
+- The plugin **marketplace** no longer flashes a console window while browsing: the `gh` / `curl` / `tar` helpers it shells out to (and the AppContainer `icacls` grant) are spawned with `CREATE_NO_WINDOW`.
 
 ### Rendering
 - **Lower input latency by default**: terminal output now paints inline instead of through the request-redraw hop, shaving up to a frame of input→photon latency while staying tear-free under Fifo vsync and one present per loop turn. Set `inline_paint=false` to restore the previous path. An optional latency HUD (`latency_hud=true`) draws a live input→photon (p50/p95) and frame-interval readout in the bottom-left for measuring it.

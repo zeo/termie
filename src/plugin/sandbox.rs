@@ -17,6 +17,7 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
@@ -301,6 +302,7 @@ fn grant_app_packages(dir: &Path) {
         .arg("/Q")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW.0)
         .status();
 }
 

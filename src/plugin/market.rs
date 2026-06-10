@@ -71,6 +71,21 @@ pub fn parse_index(text: &str) -> Vec<Entry> {
         .collect()
 }
 
+/// build a console command that won't flash a window: termie is a gui app, so a
+/// bare gh/curl/tar spawn pops a console window. CREATE_NO_WINDOW suppresses it
+#[cfg(windows)]
+fn quiet_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+#[cfg(not(windows))]
+fn quiet_command(program: &str) -> Command {
+    Command::new(program)
+}
+
 /// fetch raw bytes for a catalog URL. files under the catalog repo go through
 /// the GitHub CLI (`gh api … Accept: raw`) so a private repo works with the
 /// user's login; anything else — or a missing/unauthenticated gh — falls back
@@ -79,7 +94,7 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let repo_path = url.strip_prefix(CATALOG_RAW_PREFIX);
     if let Some(path) = repo_path {
         let api = format!("repos/{CATALOG_REPO}/contents/{path}?ref={CATALOG_REF}");
-        match Command::new("gh")
+        match quiet_command("gh")
             .args(["api", &api, "-H", "Accept: application/vnd.github.raw"])
             .output()
         {
@@ -88,7 +103,7 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
             Err(e) => log::warn!("gh unavailable ({e}); trying curl"),
         }
     }
-    match Command::new("curl").args(["-fsSL", "--max-time", "60", url]).output() {
+    match quiet_command("curl").args(["-fsSL", "--max-time", "60", url]).output() {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(_) if repo_path.is_some() => {
             Err("couldn't reach the catalog — install the GitHub CLI and run `gh auth login`".to_string())
@@ -126,7 +141,7 @@ pub fn install(entry: &Entry, plugins_dir: &Path, temp_dir: &Path) -> Result<Man
     std::fs::write(&archive, &bytes).map_err(|e| format!("write archive: {e}"))?;
 
     // unpack with tar (handles .zip on modern Windows). -C extracts into unpack
-    let ex = Command::new("tar")
+    let ex = quiet_command("tar")
         .arg("-xf")
         .arg(&archive)
         .arg("-C")
