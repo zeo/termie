@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 — 2026-06-13
 
 ### Fixes
 - **Address-bar launch lands in the folder again**: typing `termie` in File Explorer's address bar opens the first tab in that folder, not your home dir. The address bar starts a windows-subsystem app with no working directory of its own, so termie inherits Explorer's home dir and the process cwd is useless for this; it now recovers the folder from the Explorer window it was launched from. A shell-in-a-repo launch (real process cwd) is unchanged, and Start-menu / desktop / taskbar / Run-box launches — none of which have an Explorer window in the foreground — still restore the saved session.
+- **A double-click no longer opens in termie's own folder**: double-clicking `termie.exe` sets the process cwd to the exe's folder, so a bare launch opened the first tab there. The exe's own directory is now treated as incidental — the same as the home dir — so a double-click behaves like a plain Start-menu launch (restore the saved session) instead of opening a tab inside the install folder.
 
 ## 0.2.2 — 2026-06-11
 
