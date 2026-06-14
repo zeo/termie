@@ -33,11 +33,13 @@ jobs:
         shell: powershell
         run: |
           $ver = "${{ github.ref_name }}" -replace '^v',''
-          $wix = Join-Path $env:RUNNER_TEMP 'wix3'
+          # WiX 3.14 runs on .NET Framework 4.x (present on the runner); the older
+          # 3.11 toolset needs .NET 3.5, which the runner doesn't have.
+          $wix = Join-Path $env:RUNNER_TEMP 'wix314'
           if (-not (Test-Path "$wix\candle.exe")) {
-            Write-Host "downloading WiX 3.11 toolset..."
-            $zip = Join-Path $env:RUNNER_TEMP 'wix311-binaries.zip'
-            Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip' -OutFile $zip -UseBasicParsing -MaximumRedirection 5
+            Write-Host "downloading WiX 3.14 toolset..."
+            $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+            Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip -UseBasicParsing -MaximumRedirection 5
             Expand-Archive $zip -DestinationPath $wix -Force
           }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
