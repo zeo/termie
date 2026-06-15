@@ -2636,6 +2636,20 @@ impl App {
 
     /// render one frame: window title + every visible pane
     fn paint(&mut self) {
+        // a minimized or zero-area window has no real surface to present to;
+        // painting it anyway lets the compositor keep a stretched/stale frame
+        // that flashes huge and blurry on restore/alt-tab. skip the frame and
+        // leave pty_dirty set so the resize+focus events on restore repaint the
+        // latest grid at the true size
+        if let Some(w) = self.pw.window.as_ref() {
+            if w.is_minimized().unwrap_or(false) {
+                return;
+            }
+            let s = w.inner_size();
+            if s.width == 0 || s.height == 0 {
+                return;
+            }
+        }
         let clock = win::local_hm();
         let focus_ease = self.focus_ease();
         let git = self.pw.git.clone();
@@ -4407,8 +4421,10 @@ impl App {
                     self.redraw();
                 }
             }
-            // ctrl-hover a url: underline it and show a hand (click opens)
-            let new_link = if self.mods.control_key() && !self.pw.settings_open {
+            // ctrl-hover a url: underline it and show a hand (click opens). read
+            // the real ctrl key, not tracked mods, so a missed release can't
+            // leave it latched on and underline whatever the mouse passes over
+            let new_link = if win::ctrl_held() && !self.pw.settings_open {
                 self.focused_url_at(px, py).map(|(r, a, b, _)| (r, a, b))
             } else {
                 None
@@ -4605,7 +4621,7 @@ impl App {
                 }
                 // ctrl+click opens a web link under the cursor (before any TUI
                 // forwarding, so it works inside mouse-reporting apps too)
-                if state == ElementState::Pressed && self.mods.control_key()
+                if state == ElementState::Pressed && win::ctrl_held()
                     && let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
                         win::open_url(&url);
                         return;

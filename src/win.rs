@@ -383,6 +383,21 @@ pub fn spawn_global_hotkey(_id: i32, _modifiers: u32, _vk: u32, _on_press: impl 
     false
 }
 
+/// whether either ctrl key is physically down right now, read from the os rather
+/// than tracked modifier state. winit can miss a ctrl release (after a focus
+/// change or a tui that grabs input), leaving the tracked state stuck; reading
+/// the real key here keeps the ctrl-hover link from latching on without ctrl
+#[cfg(windows)]
+pub fn ctrl_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn ctrl_held() -> bool {
+    false
+}
+
 /// the foreground window right now, as a raw HWND value (0 if none). captured at
 /// startup to remember which window launched us, before we create our own
 #[cfg(windows)]
