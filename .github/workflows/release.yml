@@ -11,6 +11,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # bypass the runner's machine-level sccache wrapper, whose server drops
+  # connections mid-build (it killed the first v0.3.0 run); Swatinem/rust-cache
+  # still caches dependencies between runs
+  RUSTC_WRAPPER: ""
 
 jobs:
   release:
@@ -49,8 +53,27 @@ jobs:
           & "$wix\light.exe" -nologo -sice:ICE61 -sice:ICE60 -sice:ICE69 -out "dist\termie-$ver-windows-x64.msi" $obj
           if ($LASTEXITCODE -ne 0) { throw "light failed with exit code $LASTEXITCODE" }
 
+      - name: build setup (native installer)
+        shell: powershell
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          # stage the payload exactly as it installs: exe + assets + licenses
+          $stage = Join-Path $env:RUNNER_TEMP 'termie-payload'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target\release\termie.exe $stage\
+          Copy-Item assets $stage\assets -Recurse
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRDPARTY.md $stage\
+          Set-Content (Join-Path $stage 'VERSION') $ver
+          $env:TERMIE_PAYLOAD_DIR = $stage
+          cargo build --release --manifest-path setup/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "setup build failed" }
+          Copy-Item setup\target\release\termie-setup.exe "dist\termie-$ver-setup.exe"
+
       - name: attach to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/termie-*-windows-x64.msi
+          files: |
+            dist/termie-*-setup.exe
+            dist/termie-*-windows-x64.msi
           fail_on_unmatched_files: true
