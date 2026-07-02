@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Fixes
+- **The mouse wheel scrolls pagers now.** `less`, `man`, `git log`, and other full-screen apps without mouse reporting used to sit dead under the wheel (the alternate screen has no scrollback to scroll). The wheel now translates to arrow keys there — the "alternate scroll" behavior other terminals ship by default.
+- **Slow touchpad scrolling works.** A gentle two-finger scroll delivers a few pixels per event, which rounded to zero lines and went nowhere; the fractional remainder now accumulates so precision touchpads scroll smoothly at any speed.
+- **A tmux/neovim keyboard probe no longer corrupts colors.** The `CSI > 4;2 m` modifyOtherKeys negotiation was mis-read as SGR 4;2 and painted dim underlined text; sequences with a `>`/`?` marker are now kept out of the styling path.
+- **Saving settings no longer deletes your `quake_key`.** The settings panel rewrites the config file, and the drop-down hotkey line was silently dropped from it every time — it now survives.
+- **README had the command palette on the wrong shortcut** (`Ctrl+Shift+P`, which is pane mode). It's `Ctrl+P`, as the settings panel always said.
 - **Scrollback stays put while output streams.** Scrolling up to read history and having a build (or an agent) print one more line no longer yanks you back to the bottom — the view now stays anchored to the exact text you were reading as new lines flow underneath. Typing or pasting still snaps you back to the live prompt, which is the behavior every other modern terminal settled on.
 - **AltGr works on European layouts.** AltGr arrives as Ctrl+Alt on Windows, so typing `[` on a German layout (AltGr+8) was sent as `ESC [` — the start of an escape sequence — instead of a bracket, with the same corruption for `]`, `{`, `}`, `@`, `\`, `€` and every other AltGr character, in both the legacy and kitty keyboard encodings. Layout-translated text is now sent exactly as typed; a bare Ctrl+Alt chord keeps its escape encoding.
 
@@ -12,6 +17,7 @@
 - **Kitty graphics cell-box sizing** (`c=` / `r=`): an image sent with a requested column/row box now draws scaled to that box instead of at its native pixel size — one axis alone keeps the aspect ratio, per the protocol. This is how `icat`-style tools fit a picture to your pane width.
 
 ### Workflow
+- **Prompt jump works out of the box.** `Ctrl+Up`/`Ctrl+Down` jump between prompts — the feature was fully built but nothing ever emitted the OSC 133 marks it listens for; the injected pwsh prompt hook now emits them. The hook also **wraps your own prompt instead of replacing it**: with profile loading on, starship / oh-my-posh keep working and still get cwd tracking and prompt marks.
 - **Alt+drag selects a rectangle** (block/column selection, like Windows Terminal and WezTerm): grab a column of values out of `ls` output or a log without dragging whole lines along. Copy joins the rows with newlines and trims each row's trailing spaces. Inside a mouse-capturing TUI, add shift the way you would for any selection (`Shift+Alt+drag`).
 - **Shift+click extends the selection** to the clicked cell instead of starting over — the anchor-extend every other terminal and editor does. Works with shift-drag, respects copy-on-select, and still lets shift bypass an app's mouse capture first.
 - **A bell in a background tab now shows a dot on that tab.** Run an agent or a long build in another tab and the tab marks itself the moment its shell rings the bell (`BEL` — Claude Code and most CI-ish tools ring it when they finish or need input), so you can see *which* tab wants you instead of cycling through them. Viewing the tab clears the dot; while a tab is hovered the dot yields to the close button.

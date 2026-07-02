@@ -1331,6 +1331,9 @@ struct Persisted {
     font: Option<String>,
     opacity: i32,
     quake_key: Option<(u32, u32)>,
+    /// the quake_key line as written, kept so save_config can re-emit it —
+    /// the parsed (mods, vk) tuple can't be turned back into the user's text
+    quake_key_raw: Option<String>,
     /// the WSL distribution `new tab: wsl` launches (None = wsl.exe default)
     wsl_distro: Option<String>,
     /// run plugins inside a windows appcontainer for privilege isolation
@@ -1364,6 +1367,7 @@ impl Default for Persisted {
             font: None,
             opacity: 85,
             quake_key: None,
+            quake_key_raw: None,
             wsl_distro: None,
             plugin_sandbox: false,
             inline_paint: true,
@@ -1682,7 +1686,10 @@ fn parse_persisted(text: &str) -> Persisted {
                     p.font = Some(v.to_string());
                 }
             }
-            "quake_key" => p.quake_key = parse_quake_key(v),
+            "quake_key" => {
+                p.quake_key = parse_quake_key(v);
+                p.quake_key_raw = p.quake_key.is_some().then(|| v.to_string());
+            }
             "wsl_distro" => {
                 if !v.is_empty() {
                     p.wsl_distro = Some(v.to_string());
@@ -1836,6 +1843,9 @@ struct App {
     session_flush_at: Option<Instant>,
     /// when the status-bar notification readout (OSC 9/777 text) expires
     notice_until: Option<Instant>,
+    /// fractional wheel-scroll remainder, so slow precision-touchpad deltas
+    /// accumulate into whole lines instead of rounding away
+    wheel_accum: f32,
     /// set when this window was launched into a specific folder or command (the
     /// address bar, a `--cwd` context-menu verb, or `-- command`); such an
     /// ad-hoc window must never overwrite the saved session, so writes are
@@ -1934,6 +1944,7 @@ impl App {
             session_dirty: false,
             session_flush_at: None,
             notice_until: None,
+            wheel_accum: 0.0,
             session_ephemeral: false,
             plugins: Vec::new(),
             plugins_started: false,
@@ -3930,6 +3941,11 @@ impl App {
         let _ = writeln!(s, "line_height={}", r.line_height());
         let _ = writeln!(s, "theme={}", r.theme().name());
         let _ = writeln!(s, "font={}", r.font_name());
+        if let Some(q) = &self.persisted.quake_key_raw {
+            // an opt-in the panel can't edit; dropping it here silently killed
+            // the user's drop-down hotkey on every settings change
+            let _ = writeln!(s, "quake_key={q}");
+        }
         if let Some(d) = &self.persisted.wsl_distro {
             let _ = writeln!(s, "wsl_distro={d}");
         }
@@ -4629,10 +4645,36 @@ impl App {
             && let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
                 && let Some(root) = tab.root.as_mut()
                     && let Some(p) = find_pane_mut(root, id) {
-                        // alt screen has no scrollback — don't local-scroll it
+                        // fractional accumulator: a slow precision-touchpad
+                        // scroll delivers a few px per event, which used to
+                        // round to zero lines and go nowhere
+                        self.wheel_accum += lines;
+                        let step = self.wheel_accum.trunc();
+                        if step == 0.0 {
+                            return;
+                        }
+                        self.wheel_accum -= step;
                         if !p.term.using_alt {
-                            p.term.grid.scroll_view(lines.round() as isize);
+                            p.term.grid.scroll_view(step as isize);
                             self.redraw();
+                        } else {
+                            // the alt screen has no scrollback: translate the
+                            // wheel to arrow keys (the default-on "alternate
+                            // scroll" other terminals ship) so pagers — less,
+                            // man, git log — scroll under the wheel
+                            let seq: &[u8] = if step > 0.0 {
+                                if p.term.app_cursor_keys { b"\x1bOA" } else { b"\x1b[A" }
+                            } else if p.term.app_cursor_keys {
+                                b"\x1bOB"
+                            } else {
+                                b"\x1b[B"
+                            };
+                            let n = step.abs() as usize;
+                            let mut buf = Vec::with_capacity(seq.len() * n);
+                            for _ in 0..n {
+                                buf.extend_from_slice(seq);
+                            }
+                            p.pty.write(&buf);
                         }
                     }
     }
