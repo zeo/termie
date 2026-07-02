@@ -121,7 +121,7 @@ pub struct PaneView<'a> {
     pub rect: (f32, f32, f32, f32),
     pub focused: bool,
     /// active selection range (row, col) within this pane's viewport
-    pub sel: Option<((usize, usize), (usize, usize))>,
+    pub sel: Option<SelSpan>,
     /// accent-border opacity after the shell rang the bell: 1 then eased to 0
     /// (0 = no flash) so the bell border fades out instead of snapping off
     pub flash: f32,
@@ -275,6 +275,9 @@ type Rect = (f32, f32, f32, f32);
 type TabEntry = (usize, Rect, Rect);
 /// resolved per-pane paint origin: (origin x, origin y, focused, pane rect)
 type PaneInfo = (f32, f32, bool, Rect);
+/// a selection span in viewport cells: (start, end, block) — block marks an
+/// alt+drag rectangular selection
+pub type SelSpan = ((usize, usize), (usize, usize), bool);
 /// snapshot of a tab row for painting: index, tab rect, close rect, label,
 /// active, hovered, close-hovered, attention (bell in a background tab)
 type TabItem = (usize, Rect, Rect, String, bool, bool, bool, bool);
@@ -2500,7 +2503,7 @@ impl Renderer {
         blink_on: bool,
         beam_w: f32,
         style: CursorShape,
-        sel: Option<((usize, usize), (usize, usize))>,
+        sel: Option<SelSpan>,
         link: Option<(usize, usize, usize)>,
         matches: &[(usize, usize, usize, bool)],
         bold_as_bright: bool,
@@ -2514,7 +2517,7 @@ impl Renderer {
         let cur = grid.cursor;
         let show_cursor = cur.visible && !scrolled;
         let (crow, ccol) = (cur.row, cur.col.min(grid.cols.saturating_sub(1)));
-        let sel_norm = sel.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        let sel_norm = sel.map(|(a, b, block)| if a <= b { (a, b, block) } else { (b, a, block) });
 
         // find-match highlights drawn beneath glyphs; current match is brighter
         for &(mr, mc, mlen, cur) in matches {
@@ -2552,7 +2555,17 @@ impl Renderer {
                 let y = oy + r as f32 * cell_h;
                 let is_cursor = show_cursor && r == crow && c == ccol;
                 let selected = sel_norm
-                    .map(|(s, e)| (r, c) >= s && (r, c) <= e)
+                    .map(|(s, e, block)| {
+                        if block {
+                            // rectangle: rows and cols span independently
+                            r >= s.0
+                                && r <= e.0
+                                && c >= s.1.min(e.1)
+                                && c <= s.1.max(e.1)
+                        } else {
+                            (r, c) >= s && (r, c) <= e
+                        }
+                    })
                     .unwrap_or(false);
 
                 if bg != palette.bg {

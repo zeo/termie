@@ -137,6 +137,8 @@ struct Sel {
     pane: usize,
     start: (usize, usize),
     end: (usize, usize),
+    /// alt+drag: rectangular column selection (rows and cols span independently)
+    block: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2637,7 +2639,7 @@ impl App {
             .get(self.pw.active_tab)
             .and_then(|t| t.root.as_ref())
             .and_then(|r| find_pane(r, sel.pane))
-            .map(|p| p.term.grid.selected_text(sel.start, sel.end))
+            .map(|p| p.term.grid.selected_text(sel.start, sel.end, sel.block))
             .unwrap_or_default();
         if !text.is_empty() {
             win::clipboard_set(&text);
@@ -2828,7 +2830,7 @@ impl App {
                                     term: &p.term,
                                     rect: *rect,
                                     focused: *id == tab.focused,
-                                    sel: selection.filter(|s| s.pane == *id).map(|s| (s.start, s.end)),
+                                    sel: selection.filter(|s| s.pane == *id).map(|s| (s.start, s.end, s.block)),
                                     flash: p
                                         .flash
                                         .map(|t| {
@@ -4856,7 +4858,7 @@ impl App {
                                             .map(|g| g.word_bounds(row, col))
                                             .unwrap_or((col, col));
                                         self.selection =
-                                            Some(Sel { pane, start: (row, lo), end: (row, hi) });
+                                            Some(Sel { pane, start: (row, lo), end: (row, hi), block: false });
                                         self.selecting = false;
                                         if self.config.copy_on_select {
                                             self.copy_selection();
@@ -4866,7 +4868,7 @@ impl App {
                                         let hi =
                                             grid.map(|g| g.line_last_col(row)).unwrap_or(0);
                                         self.selection =
-                                            Some(Sel { pane, start: (row, 0), end: (row, hi) });
+                                            Some(Sel { pane, start: (row, 0), end: (row, hi), block: false });
                                         self.selecting = false;
                                         if self.config.copy_on_select {
                                             self.copy_selection();
@@ -4877,6 +4879,8 @@ impl App {
                                             pane,
                                             start: (row, col),
                                             end: (row, col),
+                                            // alt+drag selects a rectangle
+                                            block: self.mods.alt_key(),
                                         });
                                         self.selecting = true;
                                     }

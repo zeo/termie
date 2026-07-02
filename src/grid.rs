@@ -420,19 +420,27 @@ impl Grid {
     /// linear text within [start, end] (row, col) over the visible viewport,
     /// trailing blanks trimmed per row. rows are viewport-relative, so this
     /// reads through line_at to stay correct when scrolled into history
-    pub fn selected_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+    pub fn selected_text(&self, start: (usize, usize), end: (usize, usize), block: bool) -> String {
         let (mut a, mut b) = (start, end);
         if a > b {
             std::mem::swap(&mut a, &mut b);
         }
+        // a block selection spans the same column range on every row
+        let (bc0, bc1) = (a.1.min(b.1), a.1.max(b.1));
         let mut out = String::new();
         for row in a.0..=b.0.min(self.rows.saturating_sub(1)) {
             let line = self.line_at(row);
             // clamp both ends to the line length: a resize can shrink lines
             // between mouse-down and copy, leaving start col past the new width
             let len = line.len();
-            let from = (if row == a.0 { a.1 } else { 0 }).min(len);
-            let to = (if row == b.0 { (b.1 + 1).min(self.cols) } else { self.cols }).min(len);
+            let (from, to) = if block {
+                (bc0.min(len), (bc1 + 1).min(self.cols).min(len))
+            } else {
+                (
+                    (if row == a.0 { a.1 } else { 0 }).min(len),
+                    (if row == b.0 { (b.1 + 1).min(self.cols) } else { self.cols }).min(len),
+                )
+            };
             let mut s = String::new();
             for cell in &line[from..to.max(from)] {
                 if cell.cluster != 0 {
@@ -1245,7 +1253,7 @@ mod tests {
         // the combiner did not advance into a new cell
         assert_eq!(g.cursor.col, 1);
         // copy returns the whole grapheme, not just the base char
-        assert_eq!(g.selected_text((0, 0), (0, 0)), "e\u{0301}");
+        assert_eq!(g.selected_text((0, 0), (0, 0), false), "e\u{0301}");
         // a leading combiner with no base is dropped (no panic, no cluster)
         let mut g2 = Grid::new(2, 8);
         g2.put_char('\u{0301}');
@@ -1394,9 +1402,28 @@ mod tests {
         g.scroll_view(g.scrollback.len() as isize);
         // viewport rows now show scrollback, and a selection over them must copy
         // what is visible, not the live screen
-        assert_eq!(g.selected_text((0, 0), (0, 1)), "aa");
-        assert_eq!(g.selected_text((1, 0), (1, 1)), "bb");
-        assert_eq!(g.selected_text((0, 0), (1, 1)), "aa\nbb");
+        assert_eq!(g.selected_text((0, 0), (0, 1), false), "aa");
+        assert_eq!(g.selected_text((1, 0), (1, 1), false), "bb");
+        assert_eq!(g.selected_text((0, 0), (1, 1), false), "aa\nbb");
+    }
+
+    #[test]
+    fn block_selection_copies_a_column_rectangle() {
+        let mut g = Grid::new(4, 8);
+        for line in ["abcd", "efgh", "ijkl"] {
+            for c in line.chars() {
+                g.put_char(c);
+            }
+            g.linefeed();
+            g.carriage_return();
+        }
+        // a 2-wide rectangle over the middle columns of three rows
+        assert_eq!(g.selected_text((0, 1), (2, 2), true), "bc\nfg\njk");
+        // endpoints given in any corner order select the same rectangle
+        assert_eq!(g.selected_text((2, 2), (0, 1), true), "bc\nfg\njk");
+        assert_eq!(g.selected_text((0, 2), (2, 1), true), "bc\nfg\njk");
+        // stream mode over the same endpoints runs through line ends instead
+        assert_eq!(g.selected_text((0, 1), (2, 2), false), "bcd\nefgh\nijk");
     }
 
     #[test]
