@@ -607,8 +607,27 @@ impl GlyphAtlas {
                 self.image_cache.insert(key, None);
                 None
             }
-            // atlas full: don't cache, retry next frame once space frees
-            ImagePack::NoSpace => None,
+            // atlas full (or the image is bigger than the current dim): grow
+            // to the max — same move as the glyph path — and retry once. an
+            // image between 1024 and 2048 px used to hit this every frame
+            // forever, silently never rendering while re-packing each paint
+            ImagePack::NoSpace => {
+                const MAX_DIM: u32 = 2048;
+                self.repack_at(MAX_DIM);
+                match self.pack_image(rgba, w, h) {
+                    ImagePack::Ok(g) => {
+                        self.image_cache.insert(key, Some(g));
+                        Some(g)
+                    }
+                    // still no room: cache the miss so the raster isn't
+                    // retried every frame (the cache clears on the next
+                    // repack, which is when space could actually appear)
+                    _ => {
+                        self.image_cache.insert(key, None);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -827,6 +846,19 @@ mod tests {
     // growing the atlas must REALLOCATE the cpu buffers, not just zero them:
     // rasterize copies rows at a dim stride, so a stale 1024-sized buffer would
     // index out of bounds the moment dim bumps to 2048
+    #[test]
+    fn oversized_image_grows_the_atlas() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
+        assert_eq!(atlas.dim, 1024);
+        // taller than the 1024 atlas but within the 2048 max: must grow, not
+        // silently fail-and-retry forever
+        let (w, h) = (64u32, 1500u32);
+        let rgba = vec![128u8; (w * h * 4) as usize];
+        let g = atlas.get_image(7, &rgba, w, h);
+        assert!(g.is_some(), "the atlas must grow to fit a 1024..2048 image");
+        assert_eq!(atlas.dim, 2048);
+    }
+
     #[test]
     fn repack_at_reallocates_on_grow() {
         let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);

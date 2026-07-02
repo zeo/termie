@@ -1944,15 +1944,20 @@ impl Renderer {
         let n = self.tabs.len();
 
         let mut tabs = Vec::new();
+        // shrink-to-fit: every tab stays visible and clickable no matter how
+        // many are open (a hard 54px floor used to slide the strip under the
+        // window controls and push the '+' off-screen)
         let tab_w = if n == 0 {
             0.0
         } else {
-            (avail / n as f32).min(200.0 * s).max(54.0 * s)
+            (avail / n as f32).min(200.0 * s).max(1.0)
         };
+        // below this the close target would eat the whole tab; drop it and
+        // give the label the full width (middle-click still closes)
+        let cc = if tab_w >= 34.0 * s { (18.0 * s).round() } else { 0.0 };
         for i in 0..n {
             let x = start + i as f32 * tab_w;
             let rect = (x, 0.0, tab_w, h);
-            let cc = (18.0 * s).round();
             let close = (x + tab_w - cc - 6.0 * s, (h - cc) / 2.0, cc, cc);
             tabs.push((i, rect, close));
         }
@@ -3019,8 +3024,9 @@ impl Renderer {
 
             // the close icon shows only on the active or hovered tab, so an idle
             // tab gives its whole width to the label — legible names instead of the
-            // one-char truncation a busy title bar / hidpi otherwise forces
-            let show_close = *active || *hov;
+            // one-char truncation a busy title bar / hidpi otherwise forces.
+            // very narrow tabs (a packed strip) drop the close target entirely
+            let show_close = (*active || *hov) && close.2 > 0.0;
             let label_end = if show_close { close.0 } else { tx + tw - 8.0 * self.scale };
             let avail = (label_end - (tx + 10.0 * self.scale)).max(0.0);
             let maxc = (avail / cw_c).floor().max(0.0) as usize;
