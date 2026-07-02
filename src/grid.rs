@@ -146,6 +146,9 @@ pub struct Grid {
     pub region_bottom: usize,
     /// DECOM origin mode: CUP/VPA address relative to the scroll region top
     pub origin_mode: bool,
+    /// DECAWM autowrap (mode 7): off pins prints at the right margin instead
+    /// of wrapping to the next line
+    pub autowrap: bool,
     /// origin mode saved by DECSC, restored by DECRC
     saved_origin: bool,
     /// scrollback view offset (lines scrolled up from the live bottom)
@@ -235,6 +238,7 @@ impl Grid {
             region_top: 0,
             region_bottom: rows - 1,
             origin_mode: false,
+            autowrap: true,
             saved_origin: false,
             view_offset: 0,
             total_scrolled: 0,
@@ -736,16 +740,24 @@ impl Grid {
             return;
         }
         if self.cursor.wrap_pending {
-            self.lines[self.cursor.row].wrapped = true;
-            self.cursor.col = 0;
-            self.linefeed();
             self.cursor.wrap_pending = false;
+            // DECAWM off pins the cursor at the margin: prints overwrite the
+            // last column instead of wrapping
+            if self.autowrap {
+                self.lines[self.cursor.row].wrapped = true;
+                self.cursor.col = 0;
+                self.linefeed();
+            }
         }
         // a double-width glyph that won't fit in the last column wraps first
         if w == 2 && self.cursor.col + 2 > self.cols {
-            self.lines[self.cursor.row].wrapped = true;
-            self.cursor.col = 0;
-            self.linefeed();
+            if self.autowrap {
+                self.lines[self.cursor.row].wrapped = true;
+                self.cursor.col = 0;
+                self.linefeed();
+            } else {
+                self.cursor.col = self.cols.saturating_sub(2);
+            }
         }
         let row = self.cursor.row;
         let col = self.cursor.col;
@@ -765,7 +777,7 @@ impl Grid {
         }
         if col + w >= self.cols {
             self.cursor.col = self.cols - 1;
-            self.cursor.wrap_pending = true;
+            self.cursor.wrap_pending = self.autowrap;
         } else {
             self.cursor.col += w;
         }

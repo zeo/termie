@@ -168,6 +168,8 @@ impl Terminal {
         self.apply_sgr(&[&[0u16][..]]);
         self.grid.set_scroll_region(0, self.grid.rows - 1);
         self.grid.origin_mode = false;
+        // DECSTR restores autowrap to its set default
+        self.grid.autowrap = true;
         self.grid.cursor.shape_set = false;
         self.grid.cursor.shape_blink = None;
         // DECSTR turns the text cursor back on (DECTCEM)
@@ -179,6 +181,7 @@ impl Terminal {
         let on = match mode {
             1 => self.app_cursor_keys,
             6 => self.grid.origin_mode,
+            7 => self.grid.autowrap,
             25 => self.grid.cursor.visible,
             1000 => self.mouse_proto == MouseProto::Normal,
             1002 => self.mouse_proto == MouseProto::Button,
@@ -298,6 +301,13 @@ impl Terminal {
             match mode {
                 1 => self.app_cursor_keys = enable,
                 6 => self.grid.set_origin_mode(enable),
+                7 => {
+                    // DECAWM: off pins prints at the right margin (tput rmam)
+                    self.grid.autowrap = enable;
+                    if !enable {
+                        self.grid.cursor.wrap_pending = false;
+                    }
+                }
                 25 => self.grid.cursor.visible = enable,
                 2026 => self.sync_output = enable,
                 1000 => self.mouse_proto = if enable { MouseProto::Normal } else { MouseProto::Off },
@@ -1133,6 +1143,22 @@ mod tests {
         // CSI 4 SP q -> underline
         feed(&mut t, b"\x1b[4 q");
         assert_eq!(t.grid.cursor.shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn decawm_off_pins_the_margin() {
+        let mut t = Terminal::new(2, 4);
+        // autowrap off: printing past the margin overwrites the last column
+        feed(&mut t, b"\x1b[?7labcdef");
+        assert_eq!(t.grid.lines[0][3].c, 'f');
+        assert_eq!(t.grid.cursor.row, 0);
+        assert_eq!(t.grid.cursor.col, 3);
+        // DECRQM reports it reset; re-enabling wraps again
+        feed(&mut t, b"\x1b[?7$p");
+        assert_eq!(t.responses, b"\x1b[?7;2$y");
+        t.responses.clear();
+        feed(&mut t, b"\x1b[?7hgh");
+        assert_eq!(t.grid.lines[1][0].c, 'h');
     }
 
     #[test]

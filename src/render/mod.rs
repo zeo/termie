@@ -2560,7 +2560,13 @@ impl Renderer {
                 let mut fg = palette.resolve_fg(fg_c);
                 let bg = palette.resolve_bg(bg_c);
                 if cell.attrs.dim {
-                    fg = Rgb::new(fg.r / 2, fg.g / 2, fg.b / 2);
+                    // 2/3 in sRGB ≈ 0.42 linear — reads as dim but stays
+                    // legible; a straight half was ~0.2 linear, near-invisible
+                    fg = Rgb::new(
+                        (fg.r as u16 * 2 / 3) as u8,
+                        (fg.g as u16 * 2 / 3) as u8,
+                        (fg.b as u16 * 2 / 3) as u8,
+                    );
                 }
                 // blinking cells hide their glyph + decorations on the off phase
                 let blink_hidden = cell.attrs.blink && !blink_on;
@@ -2624,9 +2630,14 @@ impl Renderer {
                                 } else {
                                     cell_w
                                 };
-                                Self::push_rect(out, x, y, cw, cell_h, palette.cursor, alpha);
                                 if focused {
+                                    Self::push_rect(out, x, y, cw, cell_h, palette.cursor, alpha);
                                     fg = palette.bg;
+                                } else {
+                                    // an unfocused pane shows a hollow block so
+                                    // the glyph under it stays readable
+                                    let t = beam_w.max(1.0);
+                                    Self::stroke_rect(out, (x, y, cw, cell_h), t, palette.cursor);
                                 }
                             }
                         }
