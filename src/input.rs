@@ -32,6 +32,14 @@ pub fn key_to_bytes(
     let alt = mods.alt_key();
     let shift = mods.shift_key();
 
+    // AltGr arrives as ctrl+alt on windows. when the layout translated the
+    // chord into printable text (a European layout's [, ], {, }, @, €), that
+    // text is what the user typed — send it bare instead of ESC-prefixing it
+    // (which would emit "ESC [", the start of a CSI sequence) or CSI-u
+    // encoding it. a bare ctrl+alt chord produces no translated text, so it
+    // keeps its escape encoding
+    let altgr = ctrl && alt && text.is_some_and(|t| !t.is_empty() && !t.chars().any(char::is_control));
+
     // modifier code per the xterm/kitty spec (1 + bitfield: shift 1, alt 2,
     // ctrl 4, super 8)
     let mod_code = 1
@@ -138,6 +146,7 @@ pub fn key_to_bytes(
     // base (unshifted) codepoint; this also disambiguates ctrl+i from Tab etc
     if disambiguate
         && (ctrl || alt)
+        && !altgr
         && let Key::Character(s) = logical
         && let Some(c) = s.chars().next()
     {
@@ -169,8 +178,9 @@ pub fn key_to_bytes(
 
     let mut out = Vec::new();
     // legacy alt sends an ESC prefix; under the protocol alt is folded into the
-    // CSI u modifier field above, so don't double-encode here
-    if alt && !disambiguate {
+    // CSI u modifier field above, so don't double-encode here. AltGr text is
+    // never prefixed — it is ordinary typing, not a meta chord
+    if alt && !disambiguate && !altgr {
         out.push(0x1b);
     }
     out.extend_from_slice(text.as_bytes());
@@ -348,6 +358,26 @@ mod tests {
             press(Key::Named(NamedKey::ArrowLeft), M::SUPER, 1),
             Some(b"\x1b[1;9D".to_vec())
         );
+    }
+
+    #[test]
+    fn altgr_text_is_sent_bare() {
+        // AltGr is ctrl+alt on windows; a German layout's AltGr+8 produces "["
+        // and it must arrive as "[" — an ESC prefix would start a CSI sequence
+        let altgr = M::CONTROL | M::ALT;
+        assert_eq!(
+            key_to_bytes(&ch("["), Some("["), ElementState::Pressed, false, altgr, false, 0),
+            Some(b"[".to_vec())
+        );
+        // the same under the kitty protocol: text, not a CSI u report
+        assert_eq!(
+            key_to_bytes(&ch("{"), Some("{"), ElementState::Pressed, false, altgr, false, 1),
+            Some(b"{".to_vec())
+        );
+        // a bare ctrl+alt chord (no layout translation -> no text) keeps its
+        // escape encoding: legacy ESC prefix, kitty CSI u
+        assert_eq!(press(ch("a"), altgr, 0), Some(b"\x1ba".to_vec()));
+        assert_eq!(press(ch("a"), altgr, 1), Some(b"\x1b[97;7u".to_vec()));
     }
 
     #[test]
