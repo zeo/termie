@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-07-02
 
 ### Fixes
 - **Copying soft-wrapped text no longer breaks it.** A long URL or command that wrapped across rows used to gain hard newlines at every wrap point when copied; the selection now copies the logical line unbroken (real newlines still break, and alt+drag block copies stay one line per row).
@@ -45,17 +45,12 @@
 - **Program notifications ring through the same channel**: an iTerm2-style `OSC 9 ; message` or rxvt/tmux `OSC 777 ; notify` now counts as a bell — tab dot, taskbar flash, border flash — instead of being dropped. ConEmu's numeric `OSC 9` subcommands (progress, cwd) are still told apart and handled as before.
 - **The notification's text shows on the status bar** for a few seconds — a bell-marked readout in the right cluster ("claude: waiting for your approval"), so you know *why* a tab is dotted before you switch to it. Torn-off windows show it on their own bar.
 
-## 0.2.11-rc1 — 2026-06-25
-
-### Resiliency
-- **COM API resource cleanup**: Implemented an RAII `ComGuard` structure to balance successful COM initializations on the main GUI thread, preventing resource/reference count leaks when querying Explorer directories.
-- **Robust plugin installation**: The directory move fallback now performs transactional cleanups. If the copy operation fails when installing a plugin across filesystem volumes, the partial folder is deleted to prevent a corrupted installation.
-
-### Security
-- **Plugin IPC message length limits**: Implemented a 256 KB message length limit on the reader thread for plugin stdout streams. Any line exceeding the limit is safely logged, discarded, and resynchronized, avoiding memory inflation or OOM crash vectors from rogue plugins.
-
-### Diagnostics
-- **Color override warnings**: Added console/log warnings in `colors.conf` parsing to report missing `=` signs or unparseable colors, making theme troubleshooting straightforward.
+### Resiliency & security
+(first published here; previously tagged as 0.2.11-rc1)
+- **COM API resource cleanup**: an RAII guard balances COM initializations on the GUI thread, preventing reference-count leaks when querying Explorer directories.
+- **Robust plugin installation**: a failed cross-volume plugin install now cleans up its partial folder instead of leaving a corrupted installation.
+- **Plugin IPC message length limits**: a 256 KB per-line cap on plugin stdout; an oversized line is logged, discarded, and the stream resynchronized, so a rogue plugin can't inflate memory.
+- **Color override warnings**: `colors.conf` parsing reports missing `=` signs and unparseable colors.
 
 ## 0.2.10 — 2026-06-18
 
