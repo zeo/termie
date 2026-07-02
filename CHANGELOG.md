@@ -13,6 +13,7 @@
 - **A bell in a background tab now shows a dot on that tab.** Run an agent or a long build in another tab and the tab marks itself the moment its shell rings the bell (`BEL` — Claude Code and most CI-ish tools ring it when they finish or need input), so you can see *which* tab wants you instead of cycling through them. Viewing the tab clears the dot; while a tab is hovered the dot yields to the close button.
 - **A bell while the window is unfocused flashes the taskbar button** (until you refocus, the standard Windows attention signal) — so an agent finishing in a minimized or covered termie still reaches you. Torn-off pane windows get the same treatment, scoped to their own taskbar button and tabs.
 - **Program notifications ring through the same channel**: an iTerm2-style `OSC 9 ; message` or rxvt/tmux `OSC 777 ; notify` now counts as a bell — tab dot, taskbar flash, border flash — instead of being dropped. ConEmu's numeric `OSC 9` subcommands (progress, cwd) are still told apart and handled as before.
+- **The notification's text shows on the status bar** for a few seconds — a bell-marked readout in the right cluster ("claude: waiting for your approval"), so you know *why* a tab is dotted before you switch to it. Torn-off windows show it on their own bar.
 
 ## 0.2.11-rc1 — 2026-06-25
 

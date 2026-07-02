@@ -74,6 +74,9 @@ pub struct Terminal {
     pub cwd_dirty: bool,
     pub last_osc133: Option<Osc133>,
     pub bell: bool,
+    /// the message body of an OSC 9 / OSC 777 notification, drained by the app
+    /// into the status-bar readout (the bell flag carries the attention signal)
+    pub notify: Option<String>,
 
     /// bytes the terminal wants to send back to the pty (DSR/DA replies)
     pub responses: Vec<u8>,
@@ -121,6 +124,7 @@ impl Terminal {
             cwd_dirty: false,
             last_osc133: None,
             bell: false,
+            notify: None,
             responses: Vec::new(),
             dirty: true,
             sync_output: false,
@@ -478,6 +482,35 @@ pub(crate) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// flatten OSC notification params into one displayable line: parts joined
+/// with ": " (title: body), control bytes dropped, bounded so a hostile
+/// program can't grow the status readout without limit
+fn notification_text(parts: &[&[u8]]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        let s = String::from_utf8_lossy(part);
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        out.extend(s.chars().filter(|c| !c.is_control()));
+        if out.len() >= 200 {
+            break;
+        }
+    }
+    if out.len() > 200 {
+        let mut cut = 200;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    out
 }
 
 fn param_at(params: &Params, idx: usize, default: u16) -> u16 {
@@ -856,15 +889,18 @@ impl Perform for Terminal {
                 } else if params.get(1).is_some_and(|p| !p.is_empty() && !p.iter().all(u8::is_ascii_digit)) {
                     // OSC 9 ; message — an iTerm2-style notification; ring it
                     // through the bell so it dots the tab and flashes the
-                    // taskbar. numeric-first bodies are other ConEmu
-                    // subcommands (9;9 cwd, 9;10 …), not toasts
+                    // taskbar, and keep the text for the status-bar readout.
+                    // numeric-first bodies are other ConEmu subcommands
+                    // (9;9 cwd, 9;10 …), not toasts
                     self.bell = true;
+                    self.notify = Some(notification_text(&params[1..]));
                 }
             }
             b"777" => {
                 // rxvt/tmux notification convention: OSC 777 ; notify ; title ; body
                 if params.get(1).copied() == Some(b"notify") {
                     self.bell = true;
+                    self.notify = Some(notification_text(&params[2..]));
                 }
             }
             b"133" => {
@@ -1290,16 +1326,24 @@ mod tests {
     fn osc_notifications_ring_the_bell() {
         let mut t = Terminal::new(2, 10);
         // an iTerm2-style toast rings the bell (routed to tab dot + taskbar)
+        // and keeps its text for the status-bar readout
         feed(&mut t, b"\x1b]9;build done\x1b\\");
         assert!(t.bell);
+        assert_eq!(t.notify.take().as_deref(), Some("build done"));
         t.bell = false;
-        // rxvt/tmux convention
+        // rxvt/tmux convention: title and body join into one line
         feed(&mut t, b"\x1b]777;notify;title;body\x1b\\");
         assert!(t.bell);
+        assert_eq!(t.notify.take().as_deref(), Some("title: body"));
+        t.bell = false;
+        // a message with embedded control bytes is sanitized
+        feed(&mut t, b"\x1b]9;a\x01b\x1b\\");
+        assert_eq!(t.notify.take().as_deref(), Some("ab"));
         t.bell = false;
         // progress and other numeric ConEmu subcommands stay silent
         feed(&mut t, b"\x1b]9;4;1;50\x1b\\\x1b]9;9;C:/x\x1b\\\x1b]777;other\x1b\\");
         assert!(!t.bell);
+        assert!(t.notify.is_none());
     }
 
     #[test]

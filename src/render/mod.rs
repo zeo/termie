@@ -565,6 +565,9 @@ pub struct Renderer {
     status_git: Option<String>,
     status_clock: String,
     status_sessions: usize,
+    /// transient program-notification text shown in the status bar's right
+    /// cluster in place of READY (the app expires it after a few seconds)
+    notice: Option<String>,
     /// cached status-bar strings so the per-frame paint doesn't re-format them:
     /// (cols, rows, "W×H") and (sessions, "n")
     status_size: (usize, usize, String),
@@ -1224,6 +1227,7 @@ impl Renderer {
             status_git: None,
             status_clock: String::new(),
             status_sessions: 1,
+            notice: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
             status_tabs: (usize::MAX, String::new()),
             plugins_installed: Vec::new(),
@@ -1755,6 +1759,11 @@ impl Renderer {
     /// rang shows a dot where its close icon would sit
     pub fn set_tab_attention(&mut self, attention: Vec<bool>) {
         self.tab_attention = attention;
+    }
+
+    /// transient status-bar notification text (None clears the readout)
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
     }
 
     pub fn set_tabs(&mut self, tabs: Vec<String>, active: usize) {
@@ -3121,33 +3130,52 @@ impl Renderer {
             sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "\u{f126}", b, track, wide, scale, RULE_2, TEXT_2);
         }
         sx += gap;
-        let _ = Self::seg(&mut self.atlas, &mut out, sx, st_top, "TABS", &self.status_tabs.1, track, wide, scale, RULE_2, MUTE);
+        let left_end = Self::seg(&mut self.atlas, &mut out, sx, st_top, "TABS", &self.status_tabs.1, track, wide, scale, RULE_2, MUTE);
 
-        // right cluster (right→left): version · READY/PANE · clock
+        // right cluster (right→left): version · READY/PANE · clock. a live
+        // program notification takes the READY and clock slots for its text,
+        // truncated to the room left of the left cluster
         let ver = concat!("termie ", env!("CARGO_PKG_VERSION"));
         let ver_w = self.text_w(FontId::Chrome, ver, track);
-        let (ready, ready_col) = if self.broadcast {
-            ("BROADCAST", PAPER)
-        } else if self.pane_mode {
-            ("PANE MODE", PAPER)
-        } else {
-            ("READY", TEXT_2)
-        };
-        let ready_w = self.text_w(FontId::Chrome, ready, wide);
         let rx_ver = w - pad - ver_w;
         let _ = Self::draw_text(
             &mut self.atlas, &mut out, FontId::Chrome, rx_ver, st_top, ver, RULE_2, 1.0, track,
         );
-        let rx_ready = rx_ver - (16.0 * self.scale).round() - ready_w;
-        let _ = Self::draw_text(
-            &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, ready_col, 1.0, wide,
-        );
-        if !self.status_clock.is_empty() {
-            let clk_w = self.text_w(FontId::Chrome, &self.status_clock, track);
-            let rx_clk = rx_ready - (16.0 * self.scale).round() - clk_w;
+        if let Some(n) = self.notice.clone() {
+            let avail = (rx_ver - (16.0 * self.scale).round() - left_end - gap).max(0.0);
+            let maxc = (avail / cw_c).floor().max(0.0) as usize;
+            let mut shown = String::from("\u{f0f3}  ");
+            if n.chars().count() + 3 > maxc && maxc > 4 {
+                shown.extend(n.chars().take(maxc - 4));
+                shown.push('\u{2026}');
+            } else {
+                shown.push_str(&n);
+            }
+            let nw = self.text_w(FontId::Chrome, &shown, track);
+            let rx_n = (rx_ver - (16.0 * self.scale).round() - nw).max(left_end + gap);
             let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, rx_clk, st_top, &self.status_clock, MUTE, 1.0, track,
+                &mut self.atlas, &mut out, FontId::Chrome, rx_n, st_top, &shown, PAPER, 1.0, track,
             );
+        } else {
+            let (ready, ready_col) = if self.broadcast {
+                ("BROADCAST", PAPER)
+            } else if self.pane_mode {
+                ("PANE MODE", PAPER)
+            } else {
+                ("READY", TEXT_2)
+            };
+            let ready_w = self.text_w(FontId::Chrome, ready, wide);
+            let rx_ready = rx_ver - (16.0 * self.scale).round() - ready_w;
+            let _ = Self::draw_text(
+                &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, ready_col, 1.0, wide,
+            );
+            if !self.status_clock.is_empty() {
+                let clk_w = self.text_w(FontId::Chrome, &self.status_clock, track);
+                let rx_clk = rx_ready - (16.0 * self.scale).round() - clk_w;
+                let _ = Self::draw_text(
+                    &mut self.atlas, &mut out, FontId::Chrome, rx_clk, st_top, &self.status_clock, MUTE, 1.0, track,
+                );
+            }
         }
 
         // ---- overlays ---- (bloom in: stamp the open, then scale the whole

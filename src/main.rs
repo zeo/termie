@@ -1834,6 +1834,8 @@ struct App {
     /// debounce deadline for the session write; re-armed on every layout change
     /// so a burst (e.g. a divider drag) collapses to one write after it settles
     session_flush_at: Option<Instant>,
+    /// when the status-bar notification readout (OSC 9/777 text) expires
+    notice_until: Option<Instant>,
     /// set when this window was launched into a specific folder or command (the
     /// address bar, a `--cwd` context-menu verb, or `-- command`); such an
     /// ad-hoc window must never overwrite the saved session, so writes are
@@ -1931,6 +1933,7 @@ impl App {
             lat: LatencyMeter::default(),
             session_dirty: false,
             session_flush_at: None,
+            notice_until: None,
             session_ephemeral: false,
             plugins: Vec::new(),
             plugins_started: false,
@@ -4939,6 +4942,19 @@ impl App {
         }
     }
 
+    /// put a program notification's text on the status bar for a few seconds;
+    /// lands on whichever window's renderer is swapped in
+    fn show_notice(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_notice(Some(text.to_string()));
+        }
+        self.notice_until = Some(Instant::now() + Duration::from_secs(5));
+        self.redraw();
+    }
+
     /// push the merged OSC 9;4 progress of every pane in this window onto the
     /// taskbar button; the COM call is skipped while the value is unchanged
     fn sync_taskbar_progress(&mut self) {
@@ -5298,6 +5314,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut in_sync = false;
                 let mut rang = false;
                 let mut rang_tab: Option<usize> = None;
+                let mut note: Option<String> = None;
                 let mut newly_ready = false;
                 let mut cwd_changed = false;
                 for (ti, tab) in self.pw.tabs.iter_mut().enumerate() {
@@ -5330,6 +5347,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 rang = true;
                                 rang_tab = Some(ti);
                             }
+                            if let Some(text) = p.term.notify.take() {
+                                note = Some(text);
+                            }
                             found = true;
                             break;
                         }
@@ -5350,6 +5370,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut sat_cwd = false;
                     let mut sat_rang = false;
                     let mut sat_rang_tab: Option<usize> = None;
+                    let mut sat_note: Option<String> = None;
                     for (ti, tab) in self.pw.tabs.iter_mut().enumerate() {
                         if let Some(root) = tab.root.as_mut()
                             && let Some(p) = find_pane_mut(root, id)
@@ -5377,6 +5398,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 p.flash = Some(Instant::now());
                                 sat_rang = true;
                                 sat_rang_tab = Some(ti);
+                            }
+                            if let Some(text) = p.term.notify.take() {
+                                sat_note = Some(text);
                             }
                             break;
                         }
@@ -5406,6 +5430,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if sat_cwd {
                         self.sync_tabs();
+                    }
+                    // the swapped-in renderer is the satellite's own, so the
+                    // notice lands on that window's status bar
+                    if let Some(text) = sat_note {
+                        self.show_notice(&text);
                     }
                     // same bell routing as the main window, scoped to this
                     // satellite's tabs and taskbar button via the swap
@@ -5441,6 +5470,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // let plugins react to the bell (host -> plugin event direction)
                 if rang && !self.plugins.is_empty() {
                     self.plugins_broadcast(&plugin::HostEvent::Bell { pane: id as u64 });
+                }
+                // a notification's text shows in the status bar for a few seconds
+                if let Some(text) = note {
+                    self.show_notice(&text);
                 }
                 // route the bell to the user: dot a background tab, flash the
                 // taskbar of an unfocused window (viewing the tab clears both)
@@ -6026,6 +6059,25 @@ impl ApplicationHandler<UserEvent> for App {
             ));
             return;
         }
+        // a status-bar notification readout expires after a few seconds; clear
+        // it everywhere (a satellite's pump may have set it on its own bar)
+        if let Some(t) = self.notice_until
+            && Instant::now() >= t
+        {
+            self.notice_until = None;
+            if let Some(r) = self.pw.renderer.as_mut() {
+                r.set_notice(None);
+            }
+            for sat in &mut self.satellites {
+                if let Some(r) = sat.renderer.as_mut() {
+                    r.set_notice(None);
+                }
+                if let Some(w) = sat.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            self.redraw();
+        }
         // only tick (~2 redraws/sec) when a blinking cursor is actually on screen;
         // otherwise stay event-driven so idle panes cost nothing. content changes
         // already request redraws from their own events (pty output, keys, resize)
@@ -6056,7 +6108,11 @@ impl ApplicationHandler<UserEvent> for App {
         // a torn-off window mid-animation needs ~60fps wakeups; take the soonest
         // of the main window's need and the satellite tick so neither is starved
         let sat_ms = sat_anim.then_some(16u64);
-        match main_ms.into_iter().chain(sat_ms).min() {
+        // a live notice must wake the loop at its expiry even when otherwise idle
+        let notice_ms: Option<u64> = self
+            .notice_until
+            .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 10);
+        match main_ms.into_iter().chain(sat_ms).chain(notice_ms).min() {
             Some(ms) => event_loop
                 .set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(ms))),
             None => event_loop.set_control_flow(ControlFlow::Wait),

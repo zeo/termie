@@ -39,6 +39,11 @@ pub fn maybe_run() -> bool {
             // a bell rang in the two background tabs
             r.set_tab_attention(vec![false, true, true]);
         }
+        "notice" => {
+            // an OSC 9 notification's text on the status bar
+            r.set_tab_attention(vec![false, true, false]);
+            r.set_notice(Some("claude: waiting for your approval in web-ui".into()));
+        }
         "gear" => {
             r.set_hovered(Some(Hot::Gear));
         }
