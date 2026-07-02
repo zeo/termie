@@ -832,8 +832,7 @@ impl Perform for Terminal {
                 }
             }
             b"9" => {
-                // OSC 9 ; 4 ; state ; percent — ConEmu taskbar progress. other
-                // OSC 9 subcommands (toasts etc.) are ignored
+                // OSC 9 ; 4 ; state ; percent — ConEmu taskbar progress
                 if params.get(1).copied() == Some(b"4") {
                     let num = |i: usize| {
                         params
@@ -848,6 +847,18 @@ impl Perform for Terminal {
                         3 => Some((3, 0)),
                         _ => self.progress,
                     };
+                } else if params.get(1).is_some_and(|p| !p.is_empty() && !p.iter().all(u8::is_ascii_digit)) {
+                    // OSC 9 ; message — an iTerm2-style notification; ring it
+                    // through the bell so it dots the tab and flashes the
+                    // taskbar. numeric-first bodies are other ConEmu
+                    // subcommands (9;9 cwd, 9;10 …), not toasts
+                    self.bell = true;
+                }
+            }
+            b"777" => {
+                // rxvt/tmux notification convention: OSC 777 ; notify ; title ; body
+                if params.get(1).copied() == Some(b"notify") {
+                    self.bell = true;
                 }
             }
             b"133" => {
@@ -1253,12 +1264,28 @@ mod tests {
         assert_eq!(t.progress, Some((3, 0)));
         feed(&mut t, b"\x1b]9;4;0;0\x1b\\");
         assert_eq!(t.progress, None);
-        // a non-progress OSC 9 (toast) is ignored
+        // a non-progress OSC 9 (toast) never touches progress
         feed(&mut t, b"\x1b]9;hello\x1b\\");
         assert_eq!(t.progress, None);
         // RIS clears a live progress
         feed(&mut t, b"\x1b]9;4;1;10\x1b\\\x1bc");
         assert_eq!(t.progress, None);
+    }
+
+    #[test]
+    fn osc_notifications_ring_the_bell() {
+        let mut t = Terminal::new(2, 10);
+        // an iTerm2-style toast rings the bell (routed to tab dot + taskbar)
+        feed(&mut t, b"\x1b]9;build done\x1b\\");
+        assert!(t.bell);
+        t.bell = false;
+        // rxvt/tmux convention
+        feed(&mut t, b"\x1b]777;notify;title;body\x1b\\");
+        assert!(t.bell);
+        t.bell = false;
+        // progress and other numeric ConEmu subcommands stay silent
+        feed(&mut t, b"\x1b]9;4;1;50\x1b\\\x1b]9;9;C:/x\x1b\\\x1b]777;other\x1b\\");
+        assert!(!t.bell);
     }
 
     #[test]
