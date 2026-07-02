@@ -13,6 +13,7 @@ mod pty;
 mod render;
 mod session;
 mod term;
+mod update;
 mod win;
 #[cfg(debug_assertions)]
 mod termview;
@@ -60,6 +61,11 @@ enum UserEvent {
     Market(Result<Vec<plugin::market::Entry>, String>),
     /// the global quake hotkey fired (from the hotkey thread)
     ToggleQuake,
+    /// a release check finished (None = up to date / unreachable); bool =
+    /// the user asked from the palette, so silence is worth a status notice
+    UpdateCheckDone(Option<update::Update>, bool),
+    /// the setup exe finished downloading (or failed) on a worker thread
+    UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
 }
@@ -181,6 +187,8 @@ enum PaletteAction {
     ScrollTop,
     ScrollBottom,
     ClearScrollback,
+    /// check for a newer release / confirm installing a pending one
+    InstallUpdate,
     /// 0-based tab index (Ctrl+1..9)
     SelectTab(u8),
 }
@@ -212,6 +220,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("scroll to top", PaletteAction::ScrollTop),
     ("scroll to bottom", PaletteAction::ScrollBottom),
     ("clear scrollback", PaletteAction::ClearScrollback),
+    ("install update", PaletteAction::InstallUpdate),
     ("broadcast input", PaletteAction::ToggleBroadcast),
     ("close pane", PaletteAction::CloseFocusedPane),
     ("font increase", PaletteAction::FontInc),
@@ -295,6 +304,8 @@ enum ConfirmAction {
     Quit,
     /// close the current torn-off window and its panes
     CloseWindow,
+    /// download the pending update and restart into it
+    InstallUpdate,
 }
 
 /// tab-rename text field overlay: which tab is being renamed + the current input
@@ -1365,6 +1376,8 @@ struct Persisted {
     inline_paint: bool,
     /// draw the input-to-photon latency hud (`latency_hud=true`); off by default
     latency_hud: bool,
+    /// daily update check against GitHub releases; `update_check=false` opts out
+    update_check: bool,
 }
 
 impl Default for Persisted {
@@ -1392,6 +1405,7 @@ impl Default for Persisted {
             plugin_sandbox: false,
             inline_paint: true,
             latency_hud: false,
+            update_check: true,
         }
     }
 }
@@ -1764,6 +1778,7 @@ fn parse_persisted(text: &str) -> Persisted {
             "plugin_sandbox" => p.plugin_sandbox = v == "appcontainer" || v == "on" || v == "true",
             "inline_paint" => p.inline_paint = v == "true" || v == "on",
             "latency_hud" => p.latency_hud = v == "true" || v == "on",
+            "update_check" => p.update_check = v != "false" && v != "off",
             // a typo used to be discarded with zero feedback
             other => log::warn!("config: unknown key `{other}` ignored"),
         }
@@ -1913,6 +1928,10 @@ struct App {
     /// fractional wheel-scroll remainder, so slow precision-touchpad deltas
     /// accumulate into whole lines instead of rounding away
     wheel_accum: f32,
+    /// a newer release found by the update check, until installed or ignored
+    update: Option<update::Update>,
+    /// the daily check ran this session (it runs once, deferred after boot)
+    update_checked: bool,
     /// set when this window was launched into a specific folder or command (the
     /// address bar, a `--cwd` context-menu verb, or `-- command`); such an
     /// ad-hoc window must never overwrite the saved session, so writes are
@@ -2012,6 +2031,8 @@ impl App {
             session_flush_at: None,
             notice_until: None,
             wheel_accum: 0.0,
+            update: None,
+            update_checked: false,
             session_ephemeral: false,
             plugins: Vec::new(),
             plugins_started: false,
@@ -2792,6 +2813,15 @@ impl App {
             ConfirmAction::PasteBytes { pane, bytes } => self.send_paste_bytes(pane, &bytes),
             ConfirmAction::CloseTab { tab } => self.do_close_tab(tab, event_loop),
             ConfirmAction::Quit => self.quit_app(event_loop),
+            ConfirmAction::InstallUpdate => {
+                if let Some(u) = self.update.clone() {
+                    self.show_notice(&format!("downloading {}\u{2026}", u.version));
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        let _ = proxy.send_event(UserEvent::UpdateDownloaded(update::download(&u)));
+                    });
+                }
+            }
             ConfirmAction::CloseWindow => {
                 // kill + empty the swapped-in window's tabs; satellite_event's
                 // post-swap cleanup removes the now-empty window
@@ -3393,6 +3423,25 @@ impl App {
                     g.clear_scrollback();
                 }
                 self.redraw();
+            }
+            PaletteAction::InstallUpdate => {
+                if let Some(u) = &self.update {
+                    // an update is already known: straight to the confirm
+                    self.pw.confirm = Some(ConfirmState {
+                        prompt: format!("install termie {} and restart?", u.version),
+                        hint: "enter: update \u{b7} esc: not now".to_string(),
+                        action: ConfirmAction::InstallUpdate,
+                    });
+                    self.redraw();
+                } else {
+                    // fresh manual check; the result event carries manual=true
+                    self.show_notice("checking for updates\u{2026}");
+                    update::mark_checked();
+                    let proxy = self.proxy.clone();
+                    update::check(move |found| {
+                        let _ = proxy.send_event(UserEvent::UpdateCheckDone(found, true));
+                    });
+                }
             }
             PaletteAction::NewTab => self.new_tab(),
             PaletteAction::NewTabHere => {
@@ -4112,6 +4161,10 @@ impl App {
         if self.persisted.latency_hud {
             let _ = writeln!(s, "latency_hud=true");
         }
+        if !self.persisted.update_check {
+            // on by default; persist only the opt-out
+            let _ = writeln!(s, "update_check=false");
+        }
         let _ = std::fs::write(&path, s);
     }
 
@@ -4388,6 +4441,15 @@ impl App {
         match self.cur_sat {
             Some(i) => &self.satellites[i],
             None => &self.pw,
+        }
+    }
+
+    /// the MAIN window's renderer even while a satellite is swapped into
+    /// self.pw (update chips live on the main status bar only)
+    fn main_pw_renderer(&mut self) -> Option<&mut Renderer> {
+        match self.cur_sat {
+            Some(i) => self.satellites[i].renderer.as_mut(),
+            None => self.pw.renderer.as_mut(),
         }
     }
 
@@ -4886,6 +4948,14 @@ impl App {
                     if state == ElementState::Pressed {
                         self.market_click(cx, cy);
                     }
+                    return;
+                }
+                // the status-bar UPDATE chip opens the install confirm
+                if state == ElementState::Pressed
+                    && self.update.is_some()
+                    && self.pw.renderer.as_ref().is_some_and(|r| r.update_chip_at(cx, cy))
+                {
+                    self.run_action(PaletteAction::InstallUpdate, event_loop);
                     return;
                 }
                 // scroll-thumb drag: a press on the thumb (or its track) grabs it
@@ -5915,6 +5985,42 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ToggleQuake => self.toggle_quake(),
+            UserEvent::UpdateCheckDone(found, manual) => {
+                match found {
+                    Some(u) => {
+                        // chip on the status bar; installing stays user-driven
+                        if let Some(r) = self.main_pw_renderer() {
+                            r.set_update(Some(u.version.clone()));
+                        }
+                        if manual {
+                            self.pw.confirm = Some(ConfirmState {
+                                prompt: format!("install termie {} and restart?", u.version),
+                                hint: "enter: update \u{b7} esc: not now".to_string(),
+                                action: ConfirmAction::InstallUpdate,
+                            });
+                        } else {
+                            self.show_notice(&format!(
+                                "update {} available \u{2014} palette: install update",
+                                u.version
+                            ));
+                        }
+                        self.update = Some(u);
+                        self.redraw();
+                    }
+                    None if manual => {
+                        self.show_notice("termie is up to date");
+                    }
+                    None => {}
+                }
+            }
+            UserEvent::UpdateDownloaded(result) => match result {
+                Ok(path) => match update::run_setup(&path) {
+                    // the installer takes over: update, relaunch, session restore
+                    Ok(()) => self.quit_app(event_loop),
+                    Err(e) => self.show_notice(&format!("update failed to start: {e}")),
+                },
+                Err(e) => self.show_notice(&format!("update download failed: {e}")),
+            },
             UserEvent::Accessibility(e) => match e.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => self.update_a11y(),
                 // read-only v1: the screen reader can't drive actions
@@ -6126,6 +6232,18 @@ impl ApplicationHandler<UserEvent> for App {
             if !self.plugins_started {
                 self.plugins_started = true;
                 self.start_plugins();
+            }
+            // one deferred daily update check, entirely off-thread; failures
+            // are silent (an update check must never bother anyone)
+            if !self.update_checked && !self.pw.tabs.is_empty() {
+                self.update_checked = true;
+                if self.persisted.update_check && update::due() {
+                    update::mark_checked();
+                    let proxy = self.proxy.clone();
+                    update::check(move |found| {
+                        let _ = proxy.send_event(UserEvent::UpdateCheckDone(found, false));
+                    });
+                }
             }
         }
         // debug-only: drive TERMIE_BENCH auto-opens once the first shell + pool

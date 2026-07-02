@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Installing & updating
+- **A native installer replaces the WiX wizard.** `termie-<version>-setup.exe` is a single small window in termie's own instrument style — install path, four checkboxes, one INSTALL button. It installs per-user with **no admin prompt**, migrates an old MSI install (asking first), registers everything the MSI did (PATH, shortcuts, "Open in termie", Add/Remove Programs), and carries its own uninstaller. The MSI remains attached to releases for scripted installs.
+- **termie updates itself now.** Once a day it quietly asks GitHub for the latest release; a newer one shows an `UPDATE x.y.z` chip on the status bar. Click it — or run **install update** from the palette, which also works as a manual "check now" — confirm, and the new build installs and relaunches with your session restored. Nothing downloads without that confirmation, pre-releases are never offered, and `update_check=false` turns the check off.
+
 ## 0.3.0 — 2026-07-02
 
 ### Fixes

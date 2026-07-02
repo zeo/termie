@@ -580,6 +580,10 @@ pub struct Renderer {
     /// transient program-notification text shown in the status bar's right
     /// cluster in place of READY (the app expires it after a few seconds)
     notice: Option<String>,
+    /// a newer release's version: draws a clickable UPDATE chip on the status
+    /// bar until installed. its hit rect is rebuilt each paint
+    update_chip: Option<String>,
+    update_hit: Option<(f32, f32, f32, f32)>,
     /// cached status-bar strings so the per-frame paint doesn't re-format them:
     /// (cols, rows, "W×H") and (sessions, "n")
     status_size: (usize, usize, String),
@@ -1240,6 +1244,8 @@ impl Renderer {
             status_clock: String::new(),
             status_sessions: 1,
             notice: None,
+            update_chip: None,
+            update_hit: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
             status_tabs: (usize::MAX, String::new()),
             plugins_installed: Vec::new(),
@@ -1776,6 +1782,16 @@ impl Renderer {
     /// transient status-bar notification text (None clears the readout)
     pub fn set_notice(&mut self, notice: Option<String>) {
         self.notice = notice;
+    }
+
+    /// a pending update's version for the status-bar chip (None clears it)
+    pub fn set_update(&mut self, version: Option<String>) {
+        self.update_chip = version;
+    }
+
+    /// whether a point is on the UPDATE chip (click = install flow)
+    pub fn update_chip_at(&self, x: f32, y: f32) -> bool {
+        self.update_hit.map(|r| in_rect(x, y, r)).unwrap_or(false)
     }
 
     pub fn set_tabs(&mut self, tabs: Vec<String>, active: usize) {
@@ -3207,6 +3223,7 @@ impl Renderer {
         let _ = Self::draw_text(
             &mut self.atlas, &mut out, FontId::Chrome, rx_ver, st_top, ver, RULE_2, 1.0, track,
         );
+        self.update_hit = None;
         if let Some(n) = self.notice.clone() {
             let avail = (rx_ver - (16.0 * self.scale).round() - left_end - gap).max(0.0);
             let maxc = (avail / cw_c).floor().max(0.0) as usize;
@@ -3235,12 +3252,25 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, ready_col, 1.0, wide,
             );
+            let mut right_edge = rx_ready;
             if !self.status_clock.is_empty() {
                 let clk_w = self.text_w(FontId::Chrome, &self.status_clock, track);
                 let rx_clk = rx_ready - (16.0 * self.scale).round() - clk_w;
                 let _ = Self::draw_text(
                     &mut self.atlas, &mut out, FontId::Chrome, rx_clk, st_top, &self.status_clock, MUTE, 1.0, track,
                 );
+                right_edge = rx_clk;
+            }
+            // a pending release: a bright clickable chip, gone once installed
+            if let Some(v) = self.update_chip.clone() {
+                let label = format!("\u{f062} UPDATE {v}");
+                let lw = self.text_w(FontId::Chrome, &label, wide);
+                let ux = right_edge - (20.0 * self.scale).round() - lw;
+                let _ = Self::draw_text(
+                    &mut self.atlas, &mut out, FontId::Chrome, ux, st_top, &label, PAPER, 1.0, wide,
+                );
+                self.update_hit =
+                    Some((ux - 6.0 * self.scale, sb_y, lw + 12.0 * self.scale, self.status_bar_h));
             }
         }
 

@@ -26,7 +26,9 @@ A plugin system: plugins run as separate processes over a small JSON protocol, r
 
 ## install
 
-Download `termie-<version>-windows-x64.msi` from the [latest release](https://github.com/lintowe/termie/releases/latest) and run it. The installer adds termie to your Start menu and desktop, puts it on your `PATH` so `termie` works from any shell, registers an "Open in termie" right-click entry, and shows up in Add/Remove Programs. Installing a newer version replaces the old one — no second copy. It installs for all users, so Windows asks for admin once; the build is unsigned, so SmartScreen may warn first: **More info → Run anyway**.
+Download `termie-<version>-setup.exe` from the [latest release](https://github.com/lintowe/termie/releases/latest) and run it — a small native installer in termie's own style, not a wizard. It installs per-user (no admin prompt), and the options are right on its one page: `PATH`, Start-menu and desktop shortcuts, and the "Open in termie" right-click entry. It shows up in Add/Remove Programs, replaces any older install (including the previous MSI, after asking), and uninstalls cleanly. The build is unsigned, so SmartScreen may warn first: **More info → Run anyway**.
+
+termie checks for a newer release once a day and shows a small `UPDATE` chip on the status bar when one exists — click it (or run "install update" from the palette) and the new version installs and relaunches with your session restored. Nothing ever downloads without that confirmation; turn the check off entirely with `update_check=false` in `config`. An MSI is still attached to each release for anyone scripting installs.
 
 ## keybindings
 

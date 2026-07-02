@@ -74,7 +74,7 @@ pub fn parse_index(text: &str) -> Vec<Entry> {
 /// build a console command that won't flash a window: termie is a gui app, so a
 /// bare gh/curl/tar spawn pops a console window. CREATE_NO_WINDOW suppresses it
 #[cfg(windows)]
-fn quiet_command(program: &str) -> Command {
+pub(crate) fn quiet_command(program: &str) -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new(program);
@@ -82,7 +82,7 @@ fn quiet_command(program: &str) -> Command {
     cmd
 }
 #[cfg(not(windows))]
-fn quiet_command(program: &str) -> Command {
+pub(crate) fn quiet_command(program: &str) -> Command {
     Command::new(program)
 }
 
