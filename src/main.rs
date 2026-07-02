@@ -175,6 +175,12 @@ enum PaletteAction {
     /// prompt-jump passes through to the program when there are no OSC-133 marks
     JumpPromptPrev,
     JumpPromptNext,
+    /// keyboard scrollback: a page (or straight to an end) of history
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollTop,
+    ScrollBottom,
+    ClearScrollback,
     /// 0-based tab index (Ctrl+1..9)
     SelectTab(u8),
 }
@@ -201,6 +207,11 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("find", PaletteAction::OpenFind),
     ("copy", PaletteAction::Copy),
     ("paste", PaletteAction::Paste),
+    ("scroll page up", PaletteAction::ScrollPageUp),
+    ("scroll page down", PaletteAction::ScrollPageDown),
+    ("scroll to top", PaletteAction::ScrollTop),
+    ("scroll to bottom", PaletteAction::ScrollBottom),
+    ("clear scrollback", PaletteAction::ClearScrollback),
     ("broadcast input", PaletteAction::ToggleBroadcast),
     ("close pane", PaletteAction::CloseFocusedPane),
     ("font increase", PaletteAction::FontInc),
@@ -566,6 +577,11 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         // the classic conhost chords, kept by windows terminal too
         (ctrl, Key::Named(NamedKey::Insert), A::Copy),
         (ModifiersState::SHIFT, Key::Named(NamedKey::Insert), A::Paste),
+        // keyboard scrollback nav (conhost/WT convention)
+        (ModifiersState::SHIFT, Key::Named(NamedKey::PageUp), A::ScrollPageUp),
+        (ModifiersState::SHIFT, Key::Named(NamedKey::PageDown), A::ScrollPageDown),
+        (cs, Key::Named(NamedKey::Home), A::ScrollTop),
+        (cs, Key::Named(NamedKey::End), A::ScrollBottom),
         (ModifiersState::empty(), Key::Named(NamedKey::F11), A::ToggleFullscreen),
         (cs, chr("w"), A::CloseFocusedPane),
         (cs, chr("e"), A::SplitV),
@@ -1465,6 +1481,52 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(base).join("termie").join("config"))
 }
 
+/// %APPDATA%\termie\termie.log — the `log` facade's sink. the release build is
+/// a windowed app with no console, so without this every parser warning
+/// (colors.conf typos, bad keybinding lines, unknown config keys) vanished
+struct FileLog(std::sync::Mutex<std::fs::File>);
+
+impl log::Log for FileLog {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if let Ok(mut f) = self.0.lock() {
+            use std::io::Write as _;
+            let _ = writeln!(f, "{} [{}] {}", win::local_hm(), record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_file_log() {
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(base).join("termie");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("termie.log");
+    // bound the file: start over once it passes ~512 KB
+    let oversized = std::fs::metadata(&path).map(|m| m.len() > 512 * 1024).unwrap_or(false);
+    let mut opts = std::fs::OpenOptions::new();
+    if oversized {
+        opts.write(true).truncate(true).create(true);
+    } else {
+        opts.append(true).create(true);
+    }
+    let Ok(f) = opts.open(&path) else {
+        return;
+    };
+    if log::set_logger(Box::leak(Box::new(FileLog(std::sync::Mutex::new(f))))).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
 fn session_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("APPDATA")?;
     Some(std::path::PathBuf::from(base).join("termie").join("session.json"))
@@ -1698,7 +1760,8 @@ fn parse_persisted(text: &str) -> Persisted {
             "plugin_sandbox" => p.plugin_sandbox = v == "appcontainer" || v == "on" || v == "true",
             "inline_paint" => p.inline_paint = v == "true" || v == "on",
             "latency_hud" => p.latency_hud = v == "true" || v == "on",
-            _ => {}
+            // a typo used to be discarded with zero feedback
+            other => log::warn!("config: unknown key `{other}` ignored"),
         }
     }
     p
@@ -3240,6 +3303,38 @@ impl App {
                     self.redraw();
                 }
                 return moved;
+            }
+            // scroll_view clamps to the scrollback length, so these are safe
+            // no-ops on the alt screen (which has no history)
+            PaletteAction::ScrollPageUp => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.scroll_view(g.rows.saturating_sub(1) as isize);
+                }
+                self.redraw();
+            }
+            PaletteAction::ScrollPageDown => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.scroll_view(-(g.rows.saturating_sub(1) as isize));
+                }
+                self.redraw();
+            }
+            PaletteAction::ScrollTop => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.scroll_view(g.scrollback.len() as isize);
+                }
+                self.redraw();
+            }
+            PaletteAction::ScrollBottom => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.scroll_view(-(g.view_offset as isize));
+                }
+                self.redraw();
+            }
+            PaletteAction::ClearScrollback => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.clear_scrollback();
+                }
+                self.redraw();
             }
             PaletteAction::NewTab => self.new_tab(),
             PaletteAction::NewTabHere => {
@@ -6233,6 +6328,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     timing("process start");
+    // give the log facade a sink (file, since release has no console); the
+    // harness early-returns above stay log-free
+    install_file_log();
     // stop child shells (esp. pool shells racing exit) from popping OS error dialogs
     win::suppress_child_error_dialogs();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

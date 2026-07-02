@@ -42,6 +42,8 @@ Download `termie-<version>-windows-x64.msi` from the [latest release](https://gi
 | `Ctrl+Shift+B` | broadcast input to every pane |
 | `Ctrl+Shift+W` | close pane |
 | `Ctrl+Up` / `Ctrl+Down` | jump to previous / next prompt |
+| `Shift+PgUp` / `Shift+PgDn` | scroll a page of history |
+| `Ctrl+Shift+Home` / `Ctrl+Shift+End` | scroll to the top / bottom |
 | `F11` | fullscreen |
 | `Ctrl`+wheel | font zoom |
 
@@ -58,6 +60,8 @@ Drop files in `%APPDATA%\termie\`:
 - `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` (drop-down hotkey), `plugin_sandbox=appcontainer` (sandbox every plugin), `latency_hud=true` (input-to-photon readout).
 - `colors.conf` — override theme colors, one `key=color` per line (`fg`, `bg`, `cursor`, `sel`, `ansi0`..`ansi255`; `#rrggbb`, `#rgb`, or `r,g,b`).
 - `keybindings.conf` — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`.
+
+Mistyped lines in any of these are reported to `%APPDATA%\termie\termie.log`.
 
 ## build from source
 

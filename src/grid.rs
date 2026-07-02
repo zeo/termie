@@ -955,9 +955,7 @@ impl Grid {
                 // ED 3 (xterm) additionally erases the saved-lines buffer —
                 // `clear`, `printf '\e[3J'`, and shell clear-scrollback rely on it
                 if mode == 3 {
-                    self.scrollback.clear();
-                    self.view_offset = 0;
-                    self.prune_prompts();
+                    self.clear_scrollback();
                 }
             }
             _ => {}
@@ -1163,6 +1161,14 @@ impl Grid {
         if self.placements.len() > 1024 {
             self.placements.remove(0);
         }
+    }
+
+    /// erase the saved-lines buffer, keeping the live screen (ED 3 and the
+    /// "clear scrollback" action)
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.view_offset = 0;
+        self.prune_prompts();
     }
 
     /// drop only the placements of a given image (kitty a=d for one image id)
