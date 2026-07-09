@@ -182,6 +182,15 @@ pub fn init_process_security() {
 /// allowed to activate and call the handoff class object. process-wide and
 /// once-only; RPC_E_TOO_LATE (something already set security) is fine to ignore
 unsafe fn allow_any_caller() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // CoInitializeSecurity is per-process and once-only: when
+    // init_process_security already ran (defterm registered at launch), the
+    // serve_running thread's call would just fail RPC_E_TOO_LATE and log a
+    // scary-looking line — skip it instead
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let hr = unsafe {
         CoInitializeSecurity(
             None,
