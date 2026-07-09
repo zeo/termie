@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.2 — 2026-07-09
+
 ### Workflow
 - **Duplicate tab** (`Ctrl+Shift+D`, and on the palette): opens a new tab running the focused pane's shell in its current directory — the same chord Windows Terminal uses. "New tab here" keeps opening the *default* shell there; duplicate carries the shell too, so a `cmd` or WSL tab duplicates as itself.
 - **Tab reorder**: drag a tab along the strip to move it (it swaps past its neighbors live, like a browser), or nudge the active tab with `Ctrl+Shift+PgUp` / `Ctrl+Shift+PgDn` ("move tab left/right" on the palette). Tabs now also activate on press rather than release, matching every other tab strip.
