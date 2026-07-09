@@ -1175,6 +1175,11 @@ impl Perform for Terminal {
                                 .get(2)
                                 .and_then(|c| std::str::from_utf8(c).ok())
                                 .and_then(|s| s.parse::<i32>().ok());
+                            // stamp the mark so the scrollbar can flag the
+                            // failed command's spot in history
+                            if !self.using_alt {
+                                self.grid.set_last_prompt_exit(code);
+                            }
                             Some(Osc133::CommandDone(code))
                         }
                         _ => self.last_osc133,

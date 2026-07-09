@@ -2820,12 +2820,20 @@ impl Renderer {
             let tick_h = beam_w.min(cell_h).max(1.0);
             let max_y = t.track_y + t.track_h - tick_h;
             let mut last_y = None;
-            for row in grid.prompt_rows() {
+            for (row, exit) in grid.prompt_rows() {
                 let y = (t.track_y + t.track_h * (row as f32 + 0.5) / total).round().min(max_y);
-                if last_y == Some(y) {
+                // a failed command's tick paints in the theme's red and wins
+                // over a coincident plain tick
+                let failed = exit.is_some_and(|c| c != 0);
+                if last_y == Some(y) && !failed {
                     continue;
                 }
-                Self::push_rect(out, t.track_x, y, t.track_w, tick_h, palette.paper, 0.6);
+                let (color, alpha) = if failed {
+                    (palette.ansi_color(1), 0.95)
+                } else {
+                    (palette.paper, 0.6)
+                };
+                Self::push_rect(out, t.track_x, y, t.track_w, tick_h, color, alpha);
                 last_y = Some(y);
             }
         }

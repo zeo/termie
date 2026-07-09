@@ -164,7 +164,7 @@ pub struct Grid {
     total_scrolled: u64,
     /// absolute line indices of OSC 133 prompt starts, ascending; pruned as
     /// history is evicted
-    prompts: Vec<u64>,
+    prompts: Vec<PromptMark>,
     /// horizontal tab stops, one flag per column (HTS/TBC); defaults every 8
     tab_stops: Vec<bool>,
     /// OSC 8 hyperlink targets; a cell's link id indexes here, 0 = none and
@@ -193,6 +193,15 @@ fn blank_line(cols: usize) -> Line {
 
 fn default_tab_stops(cols: usize) -> Vec<bool> {
     (0..cols).map(|c| c % 8 == 0).collect()
+}
+
+/// an OSC 133 prompt mark: the absolute line of the prompt start plus the
+/// command's exit code once its `D` arrives (None while running, or when the
+/// shell omits the code)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PromptMark {
+    pub line: u64,
+    pub exit: Option<i32>,
 }
 
 /// terminal cell width of a char: 0 (combining/zero-width), 1 (normal), or 2
@@ -654,11 +663,11 @@ impl Grid {
         // translate each retained prompt into its row in the old physical grid
         // reflow turns that row into a logical-line offset, then back into a
         // physical row at the new width
-        let prompt_rows: Vec<usize> = self
+        let prompt_rows: Vec<(usize, Option<i32>)> = self
             .prompts
             .iter()
-            .filter_map(|&mark| mark.checked_sub(prompt_base))
-            .filter_map(|row| (row < physical.len() as u64).then_some(row as usize))
+            .filter_map(|m| m.line.checked_sub(prompt_base).map(|row| (row, m.exit)))
+            .filter_map(|(row, exit)| (row < physical.len() as u64).then_some((row as usize, exit)))
             .collect();
 
         // drop blank lines below the content/cursor so empty screen space can't
@@ -672,7 +681,7 @@ impl Grid {
         // join physical lines into logical lines across soft-wraps; record the
         // cursor's logical line index + character offset within it
         let mut logical: Vec<Vec<Cell>> = Vec::new();
-        let mut prompt_offsets: Vec<(usize, usize)> = Vec::with_capacity(prompt_rows.len());
+        let mut prompt_offsets: Vec<(usize, usize, Option<i32>)> = Vec::with_capacity(prompt_rows.len());
         let mut next_prompt = 0usize;
         let (mut cur_logical, mut cur_offset, mut found) = (0usize, 0usize, false);
         let mut i = 0;
@@ -680,8 +689,11 @@ impl Grid {
             let li = logical.len();
             let mut cells: Vec<Cell> = Vec::new();
             loop {
-                while prompt_rows.get(next_prompt) == Some(&i) {
-                    prompt_offsets.push((li, cells.len()));
+                while let Some(&(row, exit)) = prompt_rows.get(next_prompt) {
+                    if row != i {
+                        break;
+                    }
+                    prompt_offsets.push((li, cells.len(), exit));
                     next_prompt += 1;
                 }
                 if i == cur_abs && !found {
@@ -727,12 +739,15 @@ impl Grid {
                     j = end;
                 }
             }
-            while let Some(&(prompt_li, offset)) = prompt_offsets.get(next_prompt) {
+            while let Some(&(prompt_li, offset, exit)) = prompt_offsets.get(next_prompt) {
                 if prompt_li != li {
                     break;
                 }
                 let segments = np.len() - start;
-                new_prompts.push((start + (offset / new_cols).min(segments - 1)) as u64);
+                new_prompts.push(PromptMark {
+                    line: (start + (offset / new_cols).min(segments - 1)) as u64,
+                    exit,
+                });
                 next_prompt += 1;
             }
             if li == cur_logical {
@@ -763,9 +778,12 @@ impl Grid {
             evicted += 1;
         }
         self.prompts.clear();
-        for mark in new_prompts.into_iter().filter_map(|mark| mark.checked_sub(evicted)) {
-            if self.prompts.last() != Some(&mark) {
-                self.prompts.push(mark);
+        for m in new_prompts
+            .into_iter()
+            .filter_map(|m| m.line.checked_sub(evicted).map(|line| PromptMark { line, ..m }))
+        {
+            if self.prompts.last().map(|p| p.line) != Some(m.line) {
+                self.prompts.push(m);
             }
         }
         // image placements anchor on absolute line indices too; reset them with
@@ -797,8 +815,8 @@ impl Grid {
 
     fn prune_prompts(&mut self) {
         let base = self.prompt_base();
-        if self.prompts.first().is_some_and(|&p| p < base) {
-            self.prompts.retain(|&p| p >= base);
+        if self.prompts.first().is_some_and(|m| m.line < base) {
+            self.prompts.retain(|m| m.line >= base);
         }
     }
 
@@ -807,20 +825,31 @@ impl Grid {
     /// (e.g. a screen clear) has invalidated
     pub fn mark_prompt(&mut self) {
         let abs = self.total_scrolled + self.cursor.row as u64;
-        while self.prompts.last().is_some_and(|&l| l >= abs) {
+        while self.prompts.last().is_some_and(|m| m.line >= abs) {
             self.prompts.pop();
         }
-        self.prompts.push(abs);
+        self.prompts.push(PromptMark { line: abs, exit: None });
+    }
+
+    /// stamp the newest prompt mark with its command's exit code (OSC 133 ;D)
+    pub fn set_last_prompt_exit(&mut self, code: Option<i32>) {
+        if code.is_some()
+            && let Some(m) = self.prompts.last_mut()
+        {
+            m.exit = code;
+        }
     }
 
     /// retained OSC 133 prompt rows as indices into the complete visible history
-    /// (scrollback first, then the live screen), in chronological order
-    pub fn prompt_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    /// (scrollback first, then the live screen) with each command's exit code,
+    /// in chronological order
+    pub fn prompt_rows(&self) -> impl Iterator<Item = (usize, Option<i32>)> + '_ {
         let base = self.prompt_base();
         let total = self.total_lines();
-        self.prompts.iter().filter_map(move |&mark| {
-            mark.checked_sub(base)
-                .and_then(|row| (row < total as u64).then_some(row as usize))
+        self.prompts.iter().filter_map(move |m| {
+            m.line
+                .checked_sub(base)
+                .and_then(|row| (row < total as u64).then_some((row as usize, m.exit)))
         })
     }
 
@@ -837,9 +866,9 @@ impl Grid {
         // prompt — stepping off the top would re-select the same mark
         let cur_abs = base + top_g + (self.rows / 2) as u64;
         let target = if forward {
-            self.prompts.iter().copied().find(|&p| p > cur_abs)
+            self.prompts.iter().map(|m| m.line).find(|&p| p > cur_abs)
         } else {
-            self.prompts.iter().copied().rev().find(|&p| p < cur_abs)
+            self.prompts.iter().map(|m| m.line).rev().find(|&p| p < cur_abs)
         };
         if let Some(abs) = target {
             let g = abs.saturating_sub(base) as usize;
@@ -1870,7 +1899,7 @@ mod tests {
         }
         // generous limit: nothing evicted, every mark within the retained window
         assert_eq!(g.prompts.len(), 5);
-        assert!(g.prompts.iter().all(|&p| p >= g.prompt_base()));
+        assert!(g.prompts.iter().all(|m| m.line >= g.prompt_base()));
         assert_eq!(g.prompt_rows().count(), 5);
         // from the live bottom, jumping back reaches a prompt and scrolls up
         assert!(g.jump_prompt(false));
@@ -1883,6 +1912,32 @@ mod tests {
         // forward brings the view back down toward the live screen
         assert!(g.jump_prompt(true));
         assert!(g.view_offset < v2);
+    }
+
+    // exit codes stamp the newest mark, survive reflow, and come back out of
+    // prompt_rows in order
+    #[test]
+    fn prompt_marks_carry_exit_codes() {
+        let mut g = Grid::new(3, 10);
+        g.set_scrollback_limit(100);
+        for (i, code) in [Some(0), Some(1), None].iter().enumerate() {
+            g.mark_prompt();
+            for ch in format!("prompt-{i}").chars() {
+                g.put_char(ch);
+            }
+            g.set_last_prompt_exit(*code);
+            g.carriage_return();
+            g.linefeed();
+        }
+        let exits: Vec<_> = g.prompt_rows().map(|(_, e)| e).collect();
+        assert_eq!(exits, vec![Some(0), Some(1), None]);
+        // a D with no payload leaves the previous stamp alone
+        g.set_last_prompt_exit(None);
+        assert_eq!(g.prompt_rows().last().unwrap().1, None);
+        // reflow to a narrower width keeps each mark's stamp
+        g.resize(3, 7);
+        let exits: Vec<_> = g.prompt_rows().map(|(_, e)| e).collect();
+        assert_eq!(exits, vec![Some(0), Some(1), None]);
     }
 
     #[test]
@@ -2061,9 +2116,9 @@ mod tests {
 
         g.resize(3, 7);
         assert_eq!(g.prompts.len(), 5);
-        assert!(g.prompts.iter().all(|&mark| mark >= g.prompt_base()));
-        for &mark in &g.prompts {
-            let row = (mark - g.prompt_base()) as usize;
+        assert!(g.prompts.iter().all(|m| m.line >= g.prompt_base()));
+        for mark in &g.prompts {
+            let row = (mark.line - g.prompt_base()) as usize;
             let line = if row < g.scrollback.len() {
                 &g.scrollback[row]
             } else {
@@ -2098,9 +2153,9 @@ mod tests {
 
         g.resize(3, 7);
         assert_eq!(g.prompts.len(), 3);
-        assert!(g.prompts.iter().all(|&mark| mark >= g.prompt_base()));
-        for &mark in &g.prompts {
-            let row = (mark - g.prompt_base()) as usize;
+        assert!(g.prompts.iter().all(|m| m.line >= g.prompt_base()));
+        for mark in &g.prompts {
+            let row = (mark.line - g.prompt_base()) as usize;
             let line = if row < g.scrollback.len() {
                 &g.scrollback[row]
             } else {
