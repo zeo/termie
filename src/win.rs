@@ -139,15 +139,15 @@ pub fn update_jumplist(tasks: &[(String, String)]) {
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::Foundation::PROPERTYKEY;
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
     use windows::Win32::System::Variant::VT_LPWSTR;
     use windows::Win32::UI::Shell::Common::{IObjectArray, IObjectCollection};
     use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::UI::Shell::{
         DestinationList, EnumerableObjectCollection, ICustomDestinationList, IShellLinkW,
-        ShellLink,
+        SHStrDupW, ShellLink,
     };
-    use windows::core::{GUID, Interface, PCWSTR, PWSTR};
+    use windows::core::{GUID, Interface, PCWSTR};
     // System.Title — the string the jump list displays for a task
     const PKEY_TITLE: PROPERTYKEY = PROPERTYKEY {
         fmtid: GUID::from_u128(0xF29F85E0_4FF9_1068_AB91_08002B27B3D9),
@@ -172,15 +172,21 @@ pub fn update_jumplist(tasks: &[(String, String)]) {
             link.SetArguments(PCWSTR(args.as_ptr()))?;
             link.SetIconLocation(PCWSTR(exe.as_ptr()), 0)?;
             let store: IPropertyStore = link.cast()?;
-            // VT_LPWSTR pointing at a live local buffer: SetValue copies the
-            // string, and this PROPVARIANT is plain data (no Drop), so nothing
-            // ever tries to CoTaskMemFree our Vec
-            let mut wtitle: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            // System.Title, or AddUserTasks drops the task. the string must be a
+            // CoTaskMem allocation the propvariant owns: SHStrDupW makes one,
+            // SetValue copies it, and PropVariantClear frees our copy — pointing
+            // the propvariant at a Rust buffer corrupts the heap when the store
+            // clears it
+            let wtitle: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
             let mut pv = PROPVARIANT::default();
-            let inner = &mut *pv.Anonymous.Anonymous;
-            inner.vt = VT_LPWSTR;
-            inner.Anonymous.pwszVal = PWSTR(wtitle.as_mut_ptr());
-            store.SetValue(&PKEY_TITLE, &pv)?;
+            {
+                let inner = &mut *pv.Anonymous.Anonymous;
+                inner.vt = VT_LPWSTR;
+                inner.Anonymous.pwszVal = SHStrDupW(PCWSTR(wtitle.as_ptr()))?;
+            }
+            let set = store.SetValue(&PKEY_TITLE, &pv);
+            let _ = PropVariantClear(&mut pv);
+            set?;
             store.Commit()?;
             coll.AddObject(&link)?;
         }
