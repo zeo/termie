@@ -76,6 +76,7 @@ pub struct Pty {
 impl Pty {
     /// create the pty + child process (the slow part — safe to call off-thread).
     /// the output thread isn't started until start_reader().
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         rows: u16,
         cols: u16,
