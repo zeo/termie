@@ -369,50 +369,26 @@ impl GlyphAtlas {
             });
         }
 
-        let mut attrs = Attrs::new().family(Family::Name(m.family));
-        if key.bold {
-            attrs = attrs.weight(Weight::BOLD);
-        }
-        if key.italic {
-            attrs = attrs.style(Style::Italic);
-        }
-
         self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
         let mut s = [0u8; 4];
         let text = key.c.encode_utf8(&mut s);
-        self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
-        self.buffer.shape_until_scroll(&mut self.font_system, false);
-
-        // the glyph's cache key comes from the first run's first glyph
-        let cache_key = match self
-            .buffer
-            .layout_runs()
-            .next()
-            .and_then(|run| run.glyphs.first().map(|g| g.physical((0.0, 0.0), 1.0).cache_key))
-        {
-            Some(k) => k,
+        let mut shaped = match self.shape_char_image(text, m.family, key.bold, key.italic) {
+            Some(i) => i,
             None => return RasterOutcome::Empty,
         };
-
-        let (w, h, left, top, is_color, pixels) = {
-            let image = self.swash.get_image(&mut self.font_system, cache_key);
-            let Some(image) = image.as_ref() else {
-                return RasterOutcome::Empty;
-            };
-            let w = image.placement.width;
-            let h = image.placement.height;
-            if w == 0 || h == 0 {
-                return RasterOutcome::Empty;
+        // a text-presentation-default symbol (emoji-variation-sequences narrow
+        // base; a VS16 would have made an emoji cluster instead) that font
+        // fallback resolved to a color emoji glyph re-routes through the
+        // monochrome symbol font, so ❤ draws as a one-cell text glyph rather
+        // than a color heart overflowing its cell
+        if shaped.4 && key.font == FontId::Content && crate::grid::emoji_vs_base(key.c) {
+            if let Some(mono) = self.shape_char_image(text, "Segoe UI Symbol", key.bold, key.italic)
+                && !mono.4
+            {
+                shaped = mono;
             }
-            let is_color = matches!(image.content, SwashContent::Color);
-            // color glyphs keep their RGBA; everything else collapses to coverage
-            let pixels = if is_color {
-                image.data.clone()
-            } else {
-                to_alpha(&image.data, w as usize, h as usize, image.content)
-            };
-            (w, h, image.placement.left, image.placement.top, is_color, pixels)
-        };
+        }
+        let (w, h, left, top, is_color, pixels) = shaped;
 
         // a full shelf is not a missing glyph: signal NoSpace so get() can grow
         // or evict and retry (never cache it, or it renders blank forever)
@@ -447,6 +423,48 @@ impl GlyphAtlas {
             top: top as f32,
             color: is_color,
         })
+    }
+
+    /// shape one char through `family` (plus system fallback) and pull its
+    /// swash image as (w, h, left, top, is_color, pixels) — RGBA for color
+    /// glyphs, coverage otherwise. the caller sets buffer metrics first
+    fn shape_char_image(
+        &mut self,
+        text: &str,
+        family: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Option<(u32, u32, i32, i32, bool, Vec<u8>)> {
+        let mut attrs = Attrs::new().family(Family::Name(family));
+        if bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        if italic {
+            attrs = attrs.style(Style::Italic);
+        }
+        self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+        // the glyph's cache key comes from the first run's first glyph
+        let cache_key = self
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first().map(|g| g.physical((0.0, 0.0), 1.0).cache_key))?;
+        let image = self.swash.get_image(&mut self.font_system, cache_key);
+        let image = image.as_ref()?;
+        let w = image.placement.width;
+        let h = image.placement.height;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let is_color = matches!(image.content, SwashContent::Color);
+        // color glyphs keep their RGBA; everything else collapses to coverage
+        let pixels = if is_color {
+            image.data.clone()
+        } else {
+            to_alpha(&image.data, w as usize, h as usize, image.content)
+        };
+        Some((w, h, image.placement.left, image.placement.top, is_color, pixels))
     }
 
     /// fetch (and cache) a composited glyph for a grapheme cluster (base char +

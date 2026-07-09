@@ -254,7 +254,7 @@ fn char_width(c: char) -> usize {
 /// (U+FE0F) after one of these requests emoji presentation, and the cell
 /// promotes to double width. kitty, ghostty, and rio settled on promotion;
 /// alacritty and WT leave the color glyph overflowing its single cell
-fn emoji_vs_base(c: char) -> bool {
+pub(crate) fn emoji_vs_base(c: char) -> bool {
     matches!(c as u32,
         0x23 | 0x2A | 0x30..=0x39 | 0xA9 | 0xAE | 0x203C | 0x2049 | 0x2122
         | 0x2139 | 0x2194..=0x2199 | 0x21A9..=0x21AA | 0x2328 | 0x23CF
