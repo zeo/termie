@@ -57,6 +57,13 @@ Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list
 
 Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with WSL also selectable. PowerShell launches `-NoLogo -NoProfile` (profile loading is opt-in) with telemetry and update checks off for a fast prompt. PowerShell and CMD both emit shell-integration prompt marks and current-directory updates, so prompt navigation, scrollbar marks, tab labels, and "new tab here" work in either shell. Set the default in settings, or open a one-off tab in any shell from the palette.
 
+Any other shell works as a custom profile — add `profile.<name>=<command line>` to `config` (quote paths with spaces):
+
+    profile.git-bash="C:\Program Files\Git\bin\bash.exe" -i -l
+    profile.nu=nu.exe
+
+Each profile shows up on the palette as `new tab: <name>`, can be bound in `keybindings.conf` by that same label, restores with the session, and duplicates like the built-in shells. A profile name also works as the `shell` default.
+
 ## configuration
 
 Drop files in `%APPDATA%\termie\`:

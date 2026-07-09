@@ -276,11 +276,26 @@ fn fuzzy_score(query: &str, label: &str) -> Option<i32> {
 }
 
 /// palette entries matching `query`, best match first (stable by label on ties)
+/// the static actions plus one "new tab: <name>" per custom profile. built on
+/// first use (profiles are installed before the ui exists) and process-wide,
+/// so the leaked labels are a bounded one-time cost
+fn all_palette_actions() -> &'static [(&'static str, PaletteAction)] {
+    static ALL: std::sync::OnceLock<Vec<(&'static str, PaletteAction)>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut actions = PALETTE_ACTIONS.to_vec();
+        for (name, _) in pty::profiles() {
+            let label: &'static str = Box::leak(format!("new tab: {name}").into_boxed_str());
+            actions.push((label, PaletteAction::NewShell(ShellKind::Custom(name.as_str()))));
+        }
+        actions
+    })
+}
+
 fn palette_filter(query: &str) -> Vec<(&'static str, PaletteAction)> {
     if query.trim().is_empty() {
-        return PALETTE_ACTIONS.to_vec();
+        return all_palette_actions().to_vec();
     }
-    let mut scored: Vec<(i32, &'static str, PaletteAction)> = PALETTE_ACTIONS
+    let mut scored: Vec<(i32, &'static str, PaletteAction)> = all_palette_actions()
         .iter()
         .filter_map(|(label, a)| fuzzy_score(query, label).map(|s| (s, *label, *a)))
         .collect();
@@ -732,7 +747,7 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
 /// plus the keybinding-only actions (copy/paste/find/font/select-tab/etc.)
 fn action_from_label(name: &str) -> Option<PaletteAction> {
     let n = name.trim();
-    if let Some((_, a)) = PALETTE_ACTIONS.iter().find(|(l, _)| l.eq_ignore_ascii_case(n)) {
+    if let Some((_, a)) = all_palette_actions().iter().find(|(l, _)| l.eq_ignore_ascii_case(n)) {
         return Some(*a);
     }
     let lower = n.to_ascii_lowercase();
@@ -1506,6 +1521,10 @@ struct Persisted {
     /// win11 mica backdrop behind the window (`acrylic=true`, alias `mica`);
     /// off by default, visible only when opacity is below 100
     acrylic: bool,
+    /// custom shell profiles (`profile.<name>=<command line>`), kept both raw
+    /// (so save_config re-emits the user's exact lines) and parsed as argv
+    profiles_raw: Vec<(String, String)>,
+    profiles: Vec<(String, Vec<String>)>,
     /// paint pty output inline instead of via the request_redraw hop, shaving up
     /// to a frame of input-to-photon latency and staying tear-free under Fifo
     /// vsync; on by default — set `inline_paint=false` to use the redraw hop
@@ -1544,6 +1563,8 @@ impl Default for Persisted {
             wsl_distro: None,
             plugin_sandbox: false,
             acrylic: false,
+            profiles_raw: Vec::new(),
+            profiles: Vec::new(),
             inline_paint: true,
             latency_hud: false,
             update_check: true,
@@ -1639,6 +1660,29 @@ fn is_settings_hot(h: Hot) -> bool {
 fn config_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("APPDATA")?;
     Some(std::path::PathBuf::from(base).join("termie").join("config"))
+}
+
+/// split a config command line into argv: whitespace separates, double quotes
+/// group (`"C:\Program Files\Git\bin\bash.exe" -i -l` is three arguments)
+fn split_cmdline(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// write exported scrollback text into Downloads (or the profile dir when
@@ -1958,8 +2002,20 @@ fn parse_persisted(text: &str) -> Persisted {
                     p.term_program = v.to_string();
                 }
             }
-            // a typo used to be discarded with zero feedback
-            other => log::warn!("config: unknown key `{other}` ignored"),
+            other => {
+                if let Some(name) = other.strip_prefix("profile.") {
+                    let argv = split_cmdline(v);
+                    if !name.is_empty() && !argv.is_empty() {
+                        p.profiles_raw.push((name.to_string(), v.to_string()));
+                        p.profiles.push((name.to_string(), argv));
+                    } else {
+                        log::warn!("config: profile line `{other}` needs a name and a command");
+                    }
+                } else {
+                    // a typo used to be discarded with zero feedback
+                    log::warn!("config: unknown key `{other}` ignored");
+                }
+            }
         }
     }
     p
@@ -2146,6 +2202,9 @@ struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let p = load_persisted();
+        // install profiles before anything derives from them (palette entries,
+        // shell labels in a restored session)
+        pty::set_profiles(p.profiles.clone());
         App {
             proxy,
             cli: parse_args(std::env::args().skip(1)),
@@ -4479,6 +4538,10 @@ impl App {
         }
         if self.persisted.acrylic {
             let _ = writeln!(s, "acrylic=true");
+        }
+        for (name, line) in &self.persisted.profiles_raw {
+            // config-file-only like quake_key: re-emit exactly as written
+            let _ = writeln!(s, "profile.{name}={line}");
         }
         if self.persisted.term_program != "termie" {
             // default is termie; only persist an override so the file stays short
@@ -6978,6 +7041,30 @@ mod tests {
     }
 
     #[test]
+    fn split_cmdline_respects_quotes() {
+        assert_eq!(split_cmdline("nu.exe"), ["nu.exe"]);
+        assert_eq!(
+            split_cmdline(r#""C:\Program Files\Git\bin\bash.exe" -i -l"#),
+            [r"C:\Program Files\Git\bin\bash.exe", "-i", "-l"]
+        );
+        assert_eq!(split_cmdline("  a   b  "), ["a", "b"]);
+        assert!(split_cmdline("   ").is_empty());
+    }
+
+    #[test]
+    fn config_parses_custom_profiles() {
+        let p = parse_persisted(
+            "profile.git-bash=\"C:\\Git\\bin\\bash.exe\" -i -l\nprofile.nu=nu.exe\nprofile.=broken\nprofile.empty=\n",
+        );
+        assert_eq!(p.profiles.len(), 2);
+        assert_eq!(p.profiles[0].0, "git-bash");
+        assert_eq!(p.profiles[0].1, ["C:\\Git\\bin\\bash.exe", "-i", "-l"]);
+        assert_eq!(p.profiles[1], ("nu".to_string(), vec!["nu.exe".to_string()]));
+        // the raw lines round-trip for save_config
+        assert_eq!(p.profiles_raw[1], ("nu".to_string(), "nu.exe".to_string()));
+    }
+
+    #[test]
     fn config_round_trips_the_serialized_flag_lines() {
         // exactly what the settings writer emits for the opt-in features
         let text = "plugin_sandbox=appcontainer\ninline_paint=true\nlatency_hud=true\nwsl_distro=Arch\n";
@@ -7233,7 +7320,7 @@ mod tests {
         let r = palette_filter("split");
         assert!(r.iter().all(|(l, _)| fuzzy_score("split", l).is_some()));
         assert!(r.first().map(|(l, _)| l.starts_with("split")).unwrap_or(false));
-        assert_eq!(palette_filter("").len(), PALETTE_ACTIONS.len());
+        assert_eq!(palette_filter("").len(), all_palette_actions().len());
     }
 
     #[test]

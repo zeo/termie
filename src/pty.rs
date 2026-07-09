@@ -25,6 +25,9 @@ pub enum ShellKind {
     PowerShell,
     Cmd,
     Wsl,
+    /// a config-defined profile (`profile.<name>=<command line>`); the name
+    /// borrows from the process-lifetime registry, keeping the enum Copy
+    Custom(&'static str),
 }
 
 impl ShellKind {
@@ -34,7 +37,7 @@ impl ShellKind {
             ShellKind::Pwsh => ShellKind::PowerShell,
             ShellKind::PowerShell => ShellKind::Cmd,
             ShellKind::Cmd => ShellKind::Wsl,
-            ShellKind::Wsl => ShellKind::Auto,
+            ShellKind::Wsl | ShellKind::Custom(_) => ShellKind::Auto,
         }
     }
 
@@ -45,6 +48,7 @@ impl ShellKind {
             ShellKind::PowerShell => "powershell",
             ShellKind::Cmd => "cmd",
             ShellKind::Wsl => "wsl",
+            ShellKind::Custom(name) => name,
         }
     }
 
@@ -54,9 +58,27 @@ impl ShellKind {
             "powershell" => ShellKind::PowerShell,
             "cmd" => ShellKind::Cmd,
             "wsl" => ShellKind::Wsl,
-            _ => ShellKind::Auto,
+            // a session snapshot or config may name a custom profile; unknown
+            // names (a profile since removed from config) fall back to auto
+            other => match profiles().iter().find(|(name, _)| name == other) {
+                Some((name, _)) => ShellKind::Custom(name.as_str()),
+                None => ShellKind::Auto,
+            },
         }
     }
+}
+
+/// config-defined custom shell profiles as (name, argv), set once at startup
+static PROFILES: std::sync::OnceLock<Vec<(String, Vec<String>)>> = std::sync::OnceLock::new();
+
+/// install the custom profiles parsed from config. only the first call takes
+/// effect — the registry hands out 'static borrows, so it can never mutate
+pub fn set_profiles(profiles: Vec<(String, Vec<String>)>) {
+    let _ = PROFILES.set(profiles);
+}
+
+pub fn profiles() -> &'static [(String, Vec<String>)] {
+    PROFILES.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
 pub enum PtyMsg {
@@ -104,6 +126,14 @@ impl Pty {
             pixel_height: pixel_height.saturating_mul(rows),
         })?;
 
+        // a custom profile is its own argv: route it through the explicit-command
+        // path below so user-written arguments never mix with hook injection
+        let command = match (shell, command) {
+            (ShellKind::Custom(name), None) => {
+                profiles().iter().find(|(n, _)| n == name).map(|(_, argv)| argv.as_slice())
+            }
+            _ => command,
+        };
         // an explicit command (from the cli or a context-menu verb) runs directly
         // instead of a login shell, so none of the shell banner/prompt-hook
         // injection applies; otherwise launch the configured shell
@@ -316,6 +346,9 @@ fn resolve_shell(kind: ShellKind) -> String {
         ShellKind::Wsl => find_in_path("wsl.exe")
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "wsl.exe".to_string()),
+        // only reached when a profile vanished from config or has an empty
+        // command line; fall back like Auto does
+        ShellKind::Custom(_) => auto(),
     }
 }
 
@@ -412,6 +445,33 @@ mod null_pty {
 // live integration tests: spawn a real shell through the pty and exercise the
 // full spawn -> read -> parse -> reply -> render path end-to-end. pty output is
 // fed through a real Terminal so DSR/DA queries (ConPTY's startup `ESC[6n`,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // one test owns every profile-registry assertion: the OnceLock takes only
+    // the first set_profiles of the process, so splitting these across tests
+    // would make them order-dependent
+    #[test]
+    fn custom_profiles_round_trip_labels() {
+        set_profiles(vec![
+            ("git-bash".to_string(), vec!["C:\\Git\\bin\\bash.exe".to_string(), "-i".to_string()]),
+            ("nu".to_string(), vec!["nu.exe".to_string()]),
+        ]);
+        assert_eq!(profiles().len(), 2);
+        let k = ShellKind::from_label("git-bash");
+        assert!(matches!(k, ShellKind::Custom(name) if name == "git-bash"));
+        // a session snapshot stores label(); it must come back as the profile
+        assert_eq!(ShellKind::from_label(k.label()), k);
+        // a profile removed from config degrades to auto, never panics
+        assert_eq!(ShellKind::from_label("gone"), ShellKind::Auto);
+        // built-ins are never shadowed by the profile lookup
+        assert_eq!(ShellKind::from_label("cmd"), ShellKind::Cmd);
+        // cycling out of a custom profile lands on auto
+        assert_eq!(k.next(), ShellKind::Auto);
+    }
+}
+
 // which gates the child's output until it's answered) are replied to, exactly
 // as the app does. spawning real processes is timing-sensitive, so these are
 // #[ignore]d to keep them out of CI (the release plan flagged them as flaky);

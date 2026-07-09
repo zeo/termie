@@ -10,6 +10,7 @@
 - **Old MSI leftovers can't survive a native install.** Removing the previous per-machine MSI now elevates via UAC when a quiet uninstall is not enough, then scrubs `Program Files\termie`, the all-users Start shortcut, and a machine PATH entry so Search never shows two termies side by side.
 
 ### Interface
+- **Custom shell profiles.** `profile.<name>=<command line>` in `config` puts any shell on the palette as `new tab: <name>` — git-bash, nushell, an ssh session, whatever. Profiles restore with the session, duplicate like built-in shells, bind in `keybindings.conf` by label, and a profile name works as the `shell` default too. Quoted paths with spaces are handled.
 - **Export scrollback.** "export scrollback" on the palette writes the focused pane's whole history plus screen to a timestamped `.txt` in Downloads — soft-wrapped lines join back into one logical line, exactly like copy. The status bar shows where it landed. Bindable in `keybindings.conf` like any palette action.
 - **Mica backdrop.** `acrylic=true` (or `mica=true`) in `config` opts the window into the Windows 11 system backdrop, so the desktop glows through a translucent termie the way it does through the built-in apps. Cosmetic and safe everywhere: on Windows 10 the call is ignored and you keep flat opacity. Visible only with `opacity` below 100.
 - **The scrollbar is now a stable dedicated rail.** It stays in the reserved right gutter whenever a pane has history, so a full-screen TUI cannot fight the thumb for the final text cell.
