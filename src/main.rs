@@ -583,6 +583,24 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// find matches are bound to one grid. when the focus identity (active tab and/or
+/// focused pane id) changes while find is open, the overlay must re-run against
+/// the newly focused grid — otherwise highlights and next/prev stick to the
+/// previous pane's hit list
+fn find_must_follow_focus(
+    find_open: bool,
+    before: Option<(usize, usize)>,
+    after: Option<(usize, usize)>,
+) -> bool {
+    find_open && before != after
+}
+
+/// after a focus context change, replace the match list and snap the cursor to
+/// the first hit in the new grid (or stay at 0 when empty)
+fn find_after_grid_change(matches: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, usize) {
+    (matches, 0)
+}
+
 /// the built-in keybindings, seeded before any user overrides. matching at the
 /// gate is exact-modifier (Ctrl+Alt+X is a different chord than Ctrl+X), so the
 /// shift-produced symbols '+' and '_' are seeded with Ctrl+Shift, the modifiers
@@ -2651,11 +2669,29 @@ impl App {
             .map(|g| g.search(&query))
             .unwrap_or_default();
         if let Some(f) = self.find.as_mut() {
-            f.matches = matches;
-            f.current = 0;
+            let (m, cur) = find_after_grid_change(matches);
+            f.matches = m;
+            f.current = cur;
         }
         self.find_scroll_to_current();
         self.redraw();
+    }
+
+    /// focus identity for the find-follow-focus rule: (active_tab, focused pane id)
+    fn focus_identity(&self) -> Option<(usize, usize)> {
+        let tab = self.pw.tabs.get(self.pw.active_tab)?;
+        Some((self.pw.active_tab, tab.focused))
+    }
+
+    /// finish a UI update that may have retargeted the focused tab/pane: re-run
+    /// find when it is open and the identity changed, otherwise plain redraw
+    fn after_focus_context_change(&mut self, before: Option<(usize, usize)>) {
+        let after = self.focus_identity();
+        if find_must_follow_focus(self.find.is_some(), before, after) {
+            self.find_recompute();
+        } else {
+            self.redraw();
+        }
     }
 
     fn find_scroll_to_current(&mut self) {
@@ -3304,6 +3340,7 @@ impl App {
             self.spawn_pane(cols, rows, cwd, shell, None)
         };
         if let Ok(pane) = pane {
+            let before = self.focus_identity();
             let fid = pane.id;
             self.pw.tabs.push(Tab {
                 focused: fid,
@@ -3315,11 +3352,7 @@ impl App {
             self.pw.active_tab = self.pw.tabs.len() - 1;
             self.relayout_all();
             self.sync_tabs();
-            if self.find.is_some() {
-                self.find_recompute();
-            } else {
-                self.redraw();
-            }
+            self.after_focus_context_change(before);
             self.warm_pool();
             timing(&format!(
                 "new tab ({}) in {:.2}ms",
@@ -3857,34 +3890,25 @@ impl App {
             }
             return;
         }
+        let before = self.focus_identity();
         if self.pw.active_tab > idx {
             self.pw.active_tab -= 1;
         }
         self.pw.active_tab = self.pw.active_tab.min(self.pw.tabs.len() - 1);
         self.relayout_all();
         self.sync_tabs();
-        // find matches are per-grid; the active tab just changed
-        if self.find.is_some() {
-            self.find_recompute();
-        } else {
-            self.redraw();
-        }
+        self.after_focus_context_change(before);
     }
 
     fn switch_tab(&mut self, idx: usize) {
         if idx >= self.pw.tabs.len() || idx == self.pw.active_tab {
             return;
         }
+        let before = self.focus_identity();
         self.pw.active_tab = idx;
         self.relayout_all();
         self.sync_tabs();
-        // re-run find against the newly focused pane so highlights don't stick
-        // to the previous tab's match list
-        if self.find.is_some() {
-            self.find_recompute();
-        } else {
-            self.redraw();
-        }
+        self.after_focus_context_change(before);
     }
 
     /// move the tab at `from` so it sits at `to` (drag reorder / keyboard nudge);
@@ -3950,6 +3974,7 @@ impl App {
             p
         };
         let new_id = pane.id;
+        let before = self.focus_identity();
         let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
@@ -3970,11 +3995,12 @@ impl App {
         self.focus_anim = Some(Instant::now());
         self.relayout_all();
         self.sync_tabs();
-        self.redraw();
+        self.after_focus_context_change(before);
         self.warm_pool();
     }
 
     fn close_focused_pane(&mut self, event_loop: &ActiveEventLoop) {
+        let before = self.focus_identity();
         let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
@@ -3989,7 +4015,8 @@ impl App {
                 // ease the surviving pane's accent border in
                 self.focus_anim = Some(Instant::now());
                 self.relayout_all();
-                self.redraw();
+                self.sync_tabs();
+                self.after_focus_context_change(before);
             }
             None => {
                 // last pane in the tab closed → close the tab
@@ -4005,6 +4032,7 @@ impl App {
             .iter()
             .find(|(_, (rx, ry, rw, rh))| x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh)
             .map(|(id, _)| *id);
+        let before = self.focus_identity();
         let changed = if let (Some(id), Some(tab)) = (hit, self.pw.tabs.get_mut(self.pw.active_tab)) {
             if tab.focused != id {
                 tab.focused = id;
@@ -4019,12 +4047,7 @@ impl App {
             // tab label + git track the focused pane; ease the accent border in
             self.focus_anim = Some(Instant::now());
             self.sync_tabs();
-            // find is per focused pane; recompute so highlights follow the click
-            if self.find.is_some() {
-                self.find_recompute();
-            } else {
-                self.redraw();
-            }
+            self.after_focus_context_change(before);
             if let (Some(id), false) = (hit, self.plugins.is_empty()) {
                 self.plugins_broadcast(&plugin::HostEvent::FocusChanged { pane: id as u64 });
             }
@@ -4419,6 +4442,7 @@ impl App {
         if count < 2 {
             return; // don't strip a tab's only pane
         }
+        let before = self.focus_identity();
         let mut popped: Option<Pane> = None;
         if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.take()
@@ -4438,6 +4462,7 @@ impl App {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(_) => {
+                // dock as a new tab (find-follow is inside dock_loose_pane)
                 self.dock_loose_pane(pane);
                 return;
             }
@@ -4490,7 +4515,8 @@ impl App {
         });
         self.relayout_all();
         self.sync_tabs();
-        self.redraw();
+        // surviving pane is now focused; find must leave the torn-off grid
+        self.after_focus_context_change(before);
     }
 
     /// run `f` with satellite `idx` swapped into `self.pw`, so every self.pw-based
@@ -4657,12 +4683,13 @@ impl App {
 
     /// re-attach a loose pane as a new tab (used if a satellite window won't open)
     fn dock_loose_pane(&mut self, pane: Pane) {
+        let before = self.focus_identity();
         let fid = pane.id;
         self.pw.tabs.push(Tab { focused: fid, root: Some(Node::Leaf(pane)), zoom: None, title: None, attention: false });
         self.pw.active_tab = self.pw.tabs.len() - 1;
         self.relayout_all();
         self.sync_tabs();
-        self.redraw();
+        self.after_focus_context_change(before);
     }
 
     /// the index of the satellite owning window `id`, if any
@@ -5414,17 +5441,14 @@ impl App {
             }
         }
         if let Some((id, _)) = best {
+            let before = self.focus_identity();
             if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) {
                 tab.focused = id;
             }
             // ease the accent border in on the newly focused pane
             self.focus_anim = Some(Instant::now());
             self.sync_tabs();
-            if self.find.is_some() {
-                self.find_recompute();
-            } else {
-                self.redraw();
-            }
+            self.after_focus_context_change(before);
         }
     }
 
@@ -6564,6 +6588,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 impl App {
     fn close_focused_pane_by_id(&mut self, id: usize, event_loop: &ActiveEventLoop) {
+        let before = self.focus_identity();
         let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
             return;
         };
@@ -6577,6 +6602,8 @@ impl App {
                 }
                 tab.root = Some(node);
                 self.relayout_all();
+                self.sync_tabs();
+                self.after_focus_context_change(before);
             }
             None => {
                 let idx = self.pw.active_tab;
@@ -6869,6 +6896,35 @@ mod tests {
         // moves entirely on one side leave it alone
         assert_eq!(active_after_move(0, 1, 3), 0);
         assert_eq!(active_after_move(3, 0, 2), 3);
+    }
+
+    #[test]
+    fn find_must_follow_focus_when_tab_or_pane_changes() {
+        // closed find never forces a recompute
+        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((1, 1))));
+        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((0, 2))));
+        // same identity is a no-op even with find open
+        assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 1))));
+        // tab switch while find is open
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((1, 1))));
+        // pane retarget inside the same tab (split / close / focus_dir / click)
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2))));
+        // focus lost entirely (last pane of last tab, etc.)
+        assert!(find_must_follow_focus(true, Some((0, 1)), None));
+        // a newly opened window with no prior identity still counts as a change
+        assert!(find_must_follow_focus(true, None, Some((0, 1))));
+    }
+
+    #[test]
+    fn find_after_grid_change_snaps_to_first_match() {
+        let hits = vec![(3, 0), (5, 2), (9, 1)];
+        let (m, cur) = find_after_grid_change(hits.clone());
+        assert_eq!(m, hits);
+        assert_eq!(cur, 0);
+        // empty result still resets the cursor so next/prev do not wrap a stale index
+        let (m2, cur2) = find_after_grid_change(Vec::new());
+        assert!(m2.is_empty());
+        assert_eq!(cur2, 0);
     }
 
     #[test]
