@@ -13,6 +13,7 @@
 - **Prompt marks now show on the scrollbar.** The prompts Termie tracks through shell integration also appear as small pips on the rail, making the next command easier to spot before you jump to it.
 
 ### Terminal fidelity
+- **Real tab stops.** HTS (`ESC H`) sets a stop, TBC (`CSI g`) clears one or all, and CHT / CBT (`CSI I` / `CSI Z`) hop forward and back over them — so the `tabs` command, `tput hts`, and anything laying out columns with custom stops lands where it aimed instead of on a hardcoded every-8 grid. Stops survive a resize (new columns pick up the default cadence).
 - **CMD now has shell integration.** Its existing prompt is wrapped with OSC 133 marks and OSC 9;9 cwd updates, so prompt jumping, scrollbar ticks, tab labels, and "new tab here" work without changing the user's prompt text.
 - **Prompt navigation survives a resize.** Shell-integration prompt marks now
   reflow with the text, so `Ctrl+Up` / `Ctrl+Down` keeps moving through command

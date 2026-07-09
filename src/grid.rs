@@ -163,6 +163,8 @@ pub struct Grid {
     /// absolute line indices of OSC 133 prompt starts, ascending; pruned as
     /// history is evicted
     prompts: Vec<u64>,
+    /// horizontal tab stops, one flag per column (HTS/TBC); defaults every 8
+    tab_stops: Vec<bool>,
     /// OSC 8 hyperlink targets; a cell's link id indexes here, 0 = none and
     /// links[0] is the empty sentinel
     pub links: Vec<String>,
@@ -185,6 +187,10 @@ fn blank_line(cols: usize) -> Line {
         cells: vec![Cell::default(); cols],
         wrapped: false,
     }
+}
+
+fn default_tab_stops(cols: usize) -> Vec<bool> {
+    (0..cols).map(|c| c % 8 == 0).collect()
 }
 
 /// terminal cell width of a char: 0 (combining/zero-width), 1 (normal), or 2
@@ -247,6 +253,7 @@ impl Grid {
             view_offset: 0,
             total_scrolled: 0,
             prompts: Vec::new(),
+            tab_stops: default_tab_stops(cols),
         }
     }
 
@@ -545,6 +552,14 @@ impl Grid {
 
         self.rows = rows;
         self.cols = cols;
+        // keep custom stops where columns survive; new columns get the default cadence
+        if cols < self.tab_stops.len() {
+            self.tab_stops.truncate(cols);
+        } else {
+            for c in self.tab_stops.len()..cols {
+                self.tab_stops.push(c % 8 == 0);
+            }
+        }
         self.region_top = 0;
         self.region_bottom = rows - 1;
         self.cursor.row = self.cursor.row.min(rows - 1);
@@ -866,9 +881,61 @@ impl Grid {
     }
 
     pub fn tab(&mut self) {
-        let next = ((self.cursor.col / 8) + 1) * 8;
-        self.cursor.col = next.min(self.cols - 1);
+        self.tab_forward(1);
+    }
+
+    /// CHT / HT: advance to the nth next tab stop, pinned at the last column
+    pub fn tab_forward(&mut self, n: usize) {
+        let mut col = self.cursor.col;
+        for _ in 0..n.max(1) {
+            match (col + 1..self.cols).find(|&c| self.tab_stops.get(c).copied().unwrap_or(false)) {
+                Some(c) => col = c,
+                None => {
+                    col = self.cols - 1;
+                    break;
+                }
+            }
+        }
+        self.cursor.col = col;
         self.cursor.wrap_pending = false;
+    }
+
+    /// CBT: move back to the nth previous tab stop, pinned at column 0
+    pub fn tab_backward(&mut self, n: usize) {
+        let mut col = self.cursor.col;
+        for _ in 0..n.max(1) {
+            match (0..col).rev().find(|&c| self.tab_stops.get(c).copied().unwrap_or(false)) {
+                Some(c) => col = c,
+                None => {
+                    col = 0;
+                    break;
+                }
+            }
+        }
+        self.cursor.col = col;
+        self.cursor.wrap_pending = false;
+    }
+
+    /// HTS: set a tab stop at the cursor column
+    pub fn set_tab_stop(&mut self) {
+        let col = self.cursor.col;
+        if col < self.tab_stops.len() {
+            self.tab_stops[col] = true;
+        }
+    }
+
+    /// TBC: 0 clears the stop at the cursor, 3 clears every stop
+    pub fn clear_tab_stops(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let col = self.cursor.col;
+                if col < self.tab_stops.len() {
+                    self.tab_stops[col] = false;
+                }
+            }
+            3 => self.tab_stops.iter_mut().for_each(|s| *s = false),
+            _ => {}
+        }
     }
 
     /// move down one line, scrolling the region if at the bottom (LF/IND)

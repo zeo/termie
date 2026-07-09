@@ -785,6 +785,11 @@ impl Perform for Terminal {
             '@' => self.grid.insert_chars(param_at(params, 0, 1) as usize),
             'P' => self.grid.delete_chars(param_at(params, 0, 1) as usize),
             'X' => self.grid.erase_chars(param_at(params, 0, 1) as usize),
+            // CHT / CBT: forward / backward over tab stops
+            'I' => self.grid.tab_forward(param_at(params, 0, 1) as usize),
+            'Z' => self.grid.tab_backward(param_at(params, 0, 1) as usize),
+            // TBC: clear the stop at the cursor (0) or all stops (3)
+            'g' => self.grid.clear_tab_stops(param_at(params, 0, 0)),
             'b' => {
                 // REP: repeat the last presented glyph N times (already charset-mapped)
                 if let Some(mapped) = self.last_print {
@@ -984,6 +989,8 @@ impl Perform for Terminal {
             }
             b'7' => self.grid.save_cursor(),
             b'8' => self.grid.restore_cursor(),
+            // HTS: set a tab stop at the cursor column
+            b'H' => self.grid.set_tab_stop(),
             b'c' => {
                 // RIS full reset
                 let (rows, cols) = (self.grid.rows, self.grid.cols);
@@ -1691,6 +1698,48 @@ mod tests {
         feed(&mut t, b"\x1b]9;9;C:\\work\x1b\\");
         assert_eq!(t.cwd.as_deref(), Some("C:\\work"));
         assert!(t.cwd_dirty);
+    }
+
+    #[test]
+    fn tab_stops_default_every_eight() {
+        let mut t = Terminal::new(2, 40);
+        feed(&mut t, b"\t");
+        assert_eq!(t.grid.cursor.col, 8);
+        feed(&mut t, b"\x1b[2I"); // CHT 2
+        assert_eq!(t.grid.cursor.col, 24);
+        feed(&mut t, b"\x1b[Z"); // CBT
+        assert_eq!(t.grid.cursor.col, 16);
+        feed(&mut t, b"\x1b[9I"); // past the last stop pins at the right edge
+        assert_eq!(t.grid.cursor.col, 39);
+    }
+
+    #[test]
+    fn hts_and_tbc_manage_custom_stops() {
+        let mut t = Terminal::new(2, 40);
+        // clear all stops, set custom ones at 5 and 11
+        feed(&mut t, b"\x1b[3g\x1b[1;6H\x1bH\x1b[1;12H\x1bH\x1b[1;1H");
+        feed(&mut t, b"\t");
+        assert_eq!(t.grid.cursor.col, 5);
+        feed(&mut t, b"\t");
+        assert_eq!(t.grid.cursor.col, 11);
+        feed(&mut t, b"\t"); // no stop past 11: pin at the last column
+        assert_eq!(t.grid.cursor.col, 39);
+        // TBC 0 clears only the stop under the cursor
+        feed(&mut t, b"\x1b[1;12H\x1b[g\x1b[1;1H\t\t");
+        assert_eq!(t.grid.cursor.col, 39);
+        feed(&mut t, b"\x1b[1;1H\t");
+        assert_eq!(t.grid.cursor.col, 5);
+    }
+
+    #[test]
+    fn tab_stops_survive_resize() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[3g\x1b[1;10H\x1bH\x1b[1;1H");
+        t.grid.resize(4, 40);
+        feed(&mut t, b"\t");
+        assert_eq!(t.grid.cursor.col, 9); // custom stop kept
+        feed(&mut t, b"\t");
+        assert_eq!(t.grid.cursor.col, 24); // new columns carry the default cadence
     }
 
     #[test]
