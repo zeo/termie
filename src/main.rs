@@ -1982,8 +1982,6 @@ struct App {
     selecting: bool,
     /// dragging the scroll thumb: (pane id, pointer-y offset from the thumb top)
     sb_drag: Option<(usize, f32)>,
-    /// pane whose scrollbar zone the pointer is over (so the bar shows to grab)
-    sb_hover: Option<usize>,
     last_click: Option<(Instant, f64, f64)>,
     // consecutive click count in a pane's content for word/line select cycling
     click_seq: u32,
@@ -2144,7 +2142,6 @@ impl App {
             selection: None,
             selecting: false,
             sb_drag: None,
-            sb_hover: None,
             last_click: None,
             click_seq: 0,
             taskbar_sent: (0, 0),
@@ -3214,8 +3211,6 @@ impl App {
             pw,
             selection,
             link,
-            sb_drag,
-            sb_hover,
             ..
         } = self;
         let PaneWindow {
@@ -3252,8 +3247,6 @@ impl App {
                                         })
                                         .unwrap_or(0.0),
                                     link: if *id == tab.focused { *link } else { None },
-                                    sb_active: sb_drag.map(|(p, _)| p) == Some(*id)
-                                        || *sb_hover == Some(*id),
                                 })
                             })
                             .collect()
@@ -5103,13 +5096,6 @@ impl App {
                 if r.set_hovered(hovered) {
                     self.redraw();
                 }
-            }
-            // reveal the scroll thumb while the pointer is over its grab strip so
-            // it can be grabbed even from the live bottom (not only when scrolled)
-            let sbh = self.scrollbar_hit(px, py).map(|(id, _)| id);
-            if sbh != self.sb_hover {
-                self.sb_hover = sbh;
-                self.redraw();
             }
             // ctrl-hover a url: underline it and show a hand (click opens). read
             // the real ctrl key, not tracked mods, so a missed release can't

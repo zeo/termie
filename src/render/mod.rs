@@ -127,9 +127,6 @@ pub struct PaneView<'a> {
     pub flash: f32,
     /// hovered url to underline: (viewport row, col_start, col_end exclusive)
     pub link: Option<(usize, usize, usize)>,
-    /// the scrollbar is being hovered or dragged, so draw it even at the bottom
-    /// and a touch brighter (otherwise it only shows while scrolled into history)
-    pub sb_active: bool,
 }
 
 /// command-palette display state
@@ -1427,7 +1424,10 @@ impl Renderer {
         }
         let track_h = rows as f32 * cell_h;
         let track_w = (2.0 * beam_w).max(2.0);
-        let track_x = ox + cols as f32 * cell_w - track_w;
+        // keep the thumb in the pane's right padding, after the final terminal
+        // cell. TUIs repaint that cell constantly, so an overlaid thumb visibly
+        // fights their bottom-right status and cursor area
+        let track_x = ox + cols as f32 * cell_w;
         let thumb_h = (track_h * rows as f32 / total as f32).max(cell_h);
         let top_line = (total - rows - view_offset) as f32;
         let thumb_y = oy + (track_h - thumb_h) * (top_line / (total - rows) as f32);
@@ -2560,7 +2560,6 @@ impl Renderer {
         link: Option<(usize, usize, usize)>,
         matches: &[(usize, usize, usize, bool)],
         bold_as_bright: bool,
-        sb_active: bool,
     ) {
         let sel_col = palette.sel;
         let m = atlas.metrics(FontId::Content);
@@ -2801,16 +2800,15 @@ impl Renderer {
         }
 
         // scroll thumb on the pane's right edge, sized + positioned to the
-        // viewport's slice of total (scrollback + screen) lines. shown while
-        // scrolled into history, or while the user is hovering/dragging it so it
-        // can be grabbed from the live bottom too
-        if (scrolled || sb_active)
+        // viewport's slice of total (scrollback + screen) lines. keep this rail
+        // stable whenever history exists, rather than making it appear only on
+        // hover at the live bottom
+        if !grid.scrollback.is_empty()
             && let Some(t) =
                 Self::scrollbar_geom(ox, oy, grid.cols, grid.rows, cell_w, cell_h, beam_w, grid.scrollback.len(), grid.view_offset)
         {
-            let thumb_a = if sb_active { 0.95 } else { 0.8 };
             Self::push_rect(out, t.track_x, t.track_y, t.track_w, t.track_h, palette.mute, 0.18);
-            Self::push_rect(out, t.track_x, t.thumb_y, t.track_w, t.thumb_h, palette.mute, thumb_a);
+            Self::push_rect(out, t.track_x, t.thumb_y, t.track_w, t.thumb_h, palette.mute, 0.8);
         }
     }
 
@@ -2940,7 +2938,6 @@ impl Renderer {
                     pv.link,
                     fmatches,
                     bold_as_bright,
-                    pv.sb_active,
                 );
             }
         }
@@ -4675,7 +4672,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::clip_image_v;
+    use super::{clip_image_v, CursorShape, GlyphAtlas, Palette, Renderer, Terminal, ThemeId};
 
     #[test]
     fn image_clip_fully_visible() {
@@ -4705,6 +4702,48 @@ mod tests {
         assert!(clip_image_v(-60.0, 50.0, 200.0).is_none()); // wholly above
         assert!(clip_image_v(250.0, 50.0, 200.0).is_none()); // wholly below
         assert!(clip_image_v(10.0, 0.0, 200.0).is_none()); // degenerate height
+    }
+
+    #[test]
+    fn live_bottom_keeps_a_stable_scrollbar() {
+        let mut term = Terminal::new(2, 4);
+        term.grid.linefeed();
+        term.grid.linefeed();
+        assert_eq!(term.grid.view_offset, 0);
+        assert_eq!(term.grid.scrollback.len(), 1);
+
+        let mut atlas = GlyphAtlas::new(14.0, 12.5, 1.0, None, 1.32);
+        let palette = Palette::from_theme(ThemeId::Instrument);
+        let mut draw = |term: &Terminal| {
+            let mut out = Vec::new();
+            Renderer::draw_grid(
+                &mut atlas,
+                &palette,
+                &mut out,
+                term,
+                0.0,
+                0.0,
+                true,
+                true,
+                true,
+                2.0,
+                CursorShape::Block,
+                None,
+                None,
+                &[],
+                true,
+            );
+            out.len()
+        };
+
+        let empty = Terminal::new(2, 4);
+        assert_eq!(draw(&term), draw(&empty) + 2);
+    }
+
+    #[test]
+    fn scrollbar_uses_the_right_padding_gutter() {
+        let thumb = Renderer::scrollbar_geom(10.0, 20.0, 4, 2, 8.0, 16.0, 2.0, 10, 0).unwrap();
+        assert!(thumb.track_x >= 10.0 + 4.0 * 8.0);
     }
 
     #[test]

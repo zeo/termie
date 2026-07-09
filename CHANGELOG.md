@@ -8,6 +8,9 @@
 ### Installer
 - **Old MSI leftovers can't survive a native install.** Removing the previous per-machine MSI now elevates via UAC when a quiet uninstall is not enough, then scrubs `Program Files\termie`, the all-users Start shortcut, and a machine PATH entry so Search never shows two termies side by side.
 
+### Interface
+- **The scrollbar is now a stable dedicated rail.** It stays in the reserved right gutter whenever a pane has history, so a full-screen TUI cannot fight the thumb for the final text cell.
+
 ### Terminal fidelity
 - **Prompt navigation survives a resize.** Shell-integration prompt marks now
   reflow with the text, so `Ctrl+Up` / `Ctrl+Down` keeps moving through command
