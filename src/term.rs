@@ -1085,6 +1085,13 @@ impl Perform for Terminal {
                         3 => Some((3, 0)),
                         _ => self.progress,
                     };
+                } else if params.get(1).copied() == Some(b"9") {
+                    // cmd's shell integration reports its current directory as
+                    // OSC 9;9;$P, which has a plain Windows path instead of OSC 7's URI
+                    if let Some(path) = params.get(2).filter(|path| !path.is_empty()) {
+                        self.cwd = Some(String::from_utf8_lossy(path).into_owned());
+                        self.cwd_dirty = true;
+                    }
                 } else if params.get(1).is_some_and(|p| !p.is_empty() && !p.iter().all(u8::is_ascii_digit)) {
                     // OSC 9 ; message — an iTerm2-style notification; ring it
                     // through the bell so it dots the tab and flashes the
@@ -1676,6 +1683,14 @@ mod tests {
         // though the old `windows(3) == ESC ] 7` scan matched its prefix
         p.advance(&mut t, b"\x1b]70;ignored\x07");
         assert!(!t.cwd_dirty);
+    }
+
+    #[test]
+    fn osc9_9_sets_cmd_cwd() {
+        let mut t = Terminal::new(2, 40);
+        feed(&mut t, b"\x1b]9;9;C:\\work\x1b\\");
+        assert_eq!(t.cwd.as_deref(), Some("C:\\work"));
+        assert!(t.cwd_dirty);
     }
 
     #[test]

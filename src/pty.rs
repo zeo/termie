@@ -13,6 +13,9 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 // string concatenation so the command line carries no double quotes
 const PWSH_PROMPT_HOOK: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $p=$PWD.ProviderPath; [char]27+']133;A'+[char]27+'\'+[char]27+']7;file:///'+($p -replace '\\','/')+[char]27+'\'+(& $global:__termie_prompt) }"#;
 
+// cmd expands $e to ESC and %PROMPT% before it installs the new prompt
+const CMD_PROMPT_HOOK: &str = r#"$e]133;D$e\$e]133;A$e\$e]9;9;$P$e\%PROMPT%$e]133;B$e\"#;
+
 /// which shell a new pane should launch
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ShellKind {
@@ -126,6 +129,10 @@ impl Pty {
                     c.arg("-NoExit");
                     c.arg("-Command");
                     c.arg(PWSH_PROMPT_HOOK);
+                }
+                if lower.ends_with("cmd.exe") {
+                    c.arg("/K");
+                    c.arg(format!("prompt {CMD_PROMPT_HOOK}"));
                 }
                 if lower.ends_with("wsl.exe") {
                     // launch a specific distro when one is configured (else the
@@ -509,5 +516,41 @@ mod live_tests {
         let grid = pump_until(&mut pty, &rx, 40, 120, "termie-resize-OK", Duration::from_secs(15));
         pty.kill();
         assert!(grid.contains("termie-resize-OK"), "no output rendered after resize; grid: {grid:?}");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn cmd_prompt_emits_shell_integration() {
+        let mut pty =
+            Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None, "termie", 0, 0)
+                .expect("spawn pty");
+        let rx = reader_channel(&mut pty);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut term = Terminal::new(24, 80);
+        let mut parser = Parser::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(PtyMsg::Output(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    parser.advance(&mut term, &bytes);
+                    if !term.responses.is_empty() {
+                        pty.write(&std::mem::take(&mut term.responses));
+                    }
+                    if output.windows(b"\x1b]133;A\x1b\\".len()).any(|s| s == b"\x1b]133;A\x1b\\") {
+                        break;
+                    }
+                }
+                Ok(PtyMsg::Exited) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        pty.kill();
+        assert!(
+            output.windows(b"\x1b]133;A\x1b\\".len()).any(|s| s == b"\x1b]133;A\x1b\\"),
+            "cmd never emitted a prompt mark: {output:?}"
+        );
+        assert!(output.windows(b"\x1b]9;9;".len()).any(|s| s == b"\x1b]9;9;"));
     }
 }

@@ -13,6 +13,7 @@
 - **Prompt marks now show on the scrollbar.** The prompts Termie tracks through shell integration also appear as small pips on the rail, making the next command easier to spot before you jump to it.
 
 ### Terminal fidelity
+- **CMD now has shell integration.** Its existing prompt is wrapped with OSC 133 marks and OSC 9;9 cwd updates, so prompt jumping, scrollbar ticks, tab labels, and "new tab here" work without changing the user's prompt text.
 - **Prompt navigation survives a resize.** Shell-integration prompt marks now
   reflow with the text, so `Ctrl+Up` / `Ctrl+Down` keeps moving through command
   history after changing the window width instead of silently losing every mark.

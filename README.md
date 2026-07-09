@@ -55,7 +55,7 @@ Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list
 
 ## shells
 
-Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with WSL also selectable. PowerShell launches `-NoLogo -NoProfile` (profile loading is opt-in) with telemetry and update checks off for a fast prompt. Set the default in settings, or open a one-off tab in any shell from the palette.
+Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with WSL also selectable. PowerShell launches `-NoLogo -NoProfile` (profile loading is opt-in) with telemetry and update checks off for a fast prompt. PowerShell and CMD both emit shell-integration prompt marks and current-directory updates, so prompt navigation, scrollbar marks, tab labels, and "new tab here" work in either shell. Set the default in settings, or open a one-off tab in any shell from the palette.
 
 ## configuration
 
