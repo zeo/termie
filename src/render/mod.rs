@@ -4668,7 +4668,7 @@ impl Renderer {
         let run = |atlas: &mut GlyphAtlas, out: &mut Vec<Instance>| {
             out.clear();
             Self::draw_grid(
-                atlas, &palette, out, term, 0.0, 0.0, true, true, 2.0, CursorShape::Block, None, None, &[], true,
+                atlas, &palette, out, term, 0.0, 0.0, true, true, true, 2.0, CursorShape::Block, None, None, &[], true,
             );
         };
         for _ in 0..(iters / 8).max(1) {
