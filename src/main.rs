@@ -586,19 +586,47 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
 /// find matches are bound to one grid. when the focus identity (active tab and/or
 /// focused pane id) changes while find is open, the overlay must re-run against
 /// the newly focused grid — otherwise highlights and next/prev stick to the
-/// previous pane's hit list
+/// previous pane's hit list. `hold` suppresses recompute during a temporary
+/// active_tab switch (background pane exit) so the match list is not poisoned
+/// against a tab the user is not viewing
 fn find_must_follow_focus(
     find_open: bool,
     before: Option<(usize, usize)>,
     after: Option<(usize, usize)>,
+    hold: bool,
 ) -> bool {
-    find_open && before != after
+    find_open && !hold && before != after
 }
 
 /// after a focus context change, replace the match list and snap the cursor to
 /// the first hit in the new grid (or stay at 0 when empty)
 fn find_after_grid_change(matches: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, usize) {
     (matches, 0)
+}
+
+/// after closing a pane that may have lived in a non-viewer tab, the active_tab
+/// index to restore. `None` means leave whatever close already set (viewer was
+/// the owner). when the owner tab was removed, indices after it shift left
+fn restore_viewer_tab(
+    prev_active: usize,
+    owner: usize,
+    tabs_after: usize,
+    tab_removed: bool,
+) -> Option<usize> {
+    if tabs_after == 0 {
+        return None;
+    }
+    if prev_active == owner {
+        // viewer was the owner: close_tab / pane-retarget already left active
+        // on the right tab
+        return None;
+    }
+    let idx = if tab_removed && prev_active > owner {
+        prev_active - 1
+    } else {
+        prev_active
+    };
+    Some(idx.min(tabs_after - 1))
 }
 
 /// the built-in keybindings, seeded before any user overrides. matching at the
@@ -1904,6 +1932,10 @@ struct App {
     /// a tab being drag-reordered along the strip: its current index, updated
     /// live as it swaps past neighbors; cleared on release or focus loss
     tab_drag: Option<usize>,
+    /// hold find-follow during a temporary active_tab switch (background pane
+    /// exit): close_focused_pane_by_id still runs, but match lists stay on the
+    /// viewer's grid until the final after_focus_context_change
+    find_follow_hold: bool,
     last_title: String,
     config: Config,
     /// user keybindings (combo -> palette action) loaded from disk; checked
@@ -2050,6 +2082,7 @@ impl App {
             market: None,
             pressed: None,
             tab_drag: None,
+            find_follow_hold: false,
             last_title: String::new(),
             config: Config {
                 scrollback: p.scrollback,
@@ -2684,14 +2717,48 @@ impl App {
     }
 
     /// finish a UI update that may have retargeted the focused tab/pane: re-run
-    /// find when it is open and the identity changed, otherwise plain redraw
+    /// find when it is open and the identity changed, otherwise plain redraw.
+    /// when `find_follow_hold` is set (temporary owner-tab switch for a
+    /// background exit), only redraw so the viewer's match list stays intact
     fn after_focus_context_change(&mut self, before: Option<(usize, usize)>) {
         let after = self.focus_identity();
-        if find_must_follow_focus(self.find.is_some(), before, after) {
+        if find_must_follow_focus(self.find.is_some(), before, after, self.find_follow_hold) {
             self.find_recompute();
         } else {
             self.redraw();
         }
+    }
+
+    /// close a pane that may live in a non-active tab without yanking find onto
+    /// that tab: hold find-follow across the temporary switch, restore the
+    /// viewer's tab, then recompute once against the final identity
+    fn close_pane_keeping_viewer(&mut self, id: usize, event_loop: &ActiveEventLoop) {
+        let owner = self.pw.tabs.iter().position(|t| {
+            t.root.as_ref().map(|r| find_pane(r, id).is_some()).unwrap_or(false)
+        });
+        let Some(ti) = owner else {
+            return;
+        };
+        let viewer_before = self.focus_identity();
+        let prev_active = self.pw.active_tab;
+        let tabs_before = self.pw.tabs.len();
+        self.find_follow_hold = true;
+        self.pw.active_tab = ti;
+        self.close_focused_pane_by_id(id, event_loop);
+        self.find_follow_hold = false;
+        if self.pw.tabs.is_empty() {
+            return;
+        }
+        let tabs_after = self.pw.tabs.len();
+        let tab_removed = tabs_after < tabs_before;
+        if let Some(restored) = restore_viewer_tab(prev_active, ti, tabs_after, tab_removed)
+            && restored != self.pw.active_tab
+        {
+            self.pw.active_tab = restored;
+            self.relayout_all();
+        }
+        self.sync_tabs();
+        self.after_focus_context_change(viewer_before);
     }
 
     fn find_scroll_to_current(&mut self) {
@@ -5997,25 +6064,10 @@ impl ApplicationHandler<UserEvent> for App {
                     // when it ends up empty
                     self.cur_sat = Some(idx);
                     std::mem::swap(&mut self.pw, &mut self.satellites[idx]);
-                    // close_focused_pane_by_id only inspects the active tab, so
-                    // focus the tab that actually owns the exited pane first (a
-                    // torn-off window can hold several tabs); mirror the main
-                    // window: restore the previously-viewed tab + relabel afterward
-                    // so a background-tab pane exit doesn't yank the visible tab
-                    if let Some(ti) = self.pw.tabs.iter().position(|t| {
-                        t.root.as_ref().map(|r| find_pane(r, id).is_some()).unwrap_or(false)
-                    }) {
-                        let prev_active = self.pw.active_tab;
-                        self.pw.active_tab = ti;
-                        self.close_focused_pane_by_id(id, event_loop);
-                        if ti != prev_active && prev_active < self.pw.tabs.len() {
-                            self.pw.active_tab =
-                                prev_active.min(self.pw.tabs.len().saturating_sub(1));
-                            self.relayout_all();
-                        }
-                        self.sync_tabs();
-                        self.redraw();
-                    }
+                    // restore the previously-viewed tab after close so a
+                    // background-tab exit doesn't yank the visible tab or
+                    // poison find against the temporary owner
+                    self.close_pane_keeping_viewer(id, event_loop);
                     std::mem::swap(&mut self.pw, &mut self.satellites[idx]);
                     self.cur_sat = None;
                     if self.satellites.get(idx).is_some_and(|s| s.tabs.is_empty()) {
@@ -6023,21 +6075,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                // find which tab holds this pane, close that pane
-                let owner = self.pw.tabs.iter().position(|t| {
-                    t.root.as_ref().map(|r| find_pane(r, id).is_some()).unwrap_or(false)
-                });
-                if let Some(ti) = owner {
-                    let prev_active = self.pw.active_tab;
-                    self.pw.active_tab = ti;
-                    self.close_focused_pane_by_id(id, event_loop);
-                    if ti != prev_active && prev_active < self.pw.tabs.len() {
-                        self.pw.active_tab = prev_active.min(self.pw.tabs.len().saturating_sub(1));
-                        self.relayout_all();
-                    }
-                    self.sync_tabs();
-                    self.redraw();
-                }
+                // main window: same keep-viewer path so find stays on the
+                // tab the user is looking at while a background shell dies
+                self.close_pane_keeping_viewer(id, event_loop);
             }
             UserEvent::PaneReady(pane) => {
                 self.pending_warm = self.pending_warm.saturating_sub(1);
@@ -6901,18 +6941,37 @@ mod tests {
     #[test]
     fn find_must_follow_focus_when_tab_or_pane_changes() {
         // closed find never forces a recompute
-        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((1, 1))));
-        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((0, 2))));
+        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((1, 1)), false));
+        assert!(!find_must_follow_focus(false, Some((0, 1)), Some((0, 2)), false));
         // same identity is a no-op even with find open
-        assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 1))));
+        assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 1)), false));
         // tab switch while find is open
-        assert!(find_must_follow_focus(true, Some((0, 1)), Some((1, 1))));
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((1, 1)), false));
         // pane retarget inside the same tab (split / close / focus_dir / click)
-        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2))));
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), false));
         // focus lost entirely (last pane of last tab, etc.)
-        assert!(find_must_follow_focus(true, Some((0, 1)), None));
+        assert!(find_must_follow_focus(true, Some((0, 1)), None, false));
         // a newly opened window with no prior identity still counts as a change
-        assert!(find_must_follow_focus(true, None, Some((0, 1))));
+        assert!(find_must_follow_focus(true, None, Some((0, 1)), false));
+        // hold (background pane exit temp switch) never recomputes mid-flight
+        assert!(!find_must_follow_focus(true, Some((0, 1)), Some((1, 9)), true));
+        assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), true));
+        // after hold clears, a real identity change still recomputes
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), false));
+    }
+
+    #[test]
+    fn background_close_restores_viewer_active_tab() {
+        // viewer left of owner, owner tab removed: index unchanged
+        assert_eq!(restore_viewer_tab(0, 2, 2, true), Some(0));
+        // viewer right of owner, owner tab removed: shift left
+        assert_eq!(restore_viewer_tab(2, 0, 2, true), Some(1));
+        // viewer right of owner, only a pane closed (tab stays): no shift
+        assert_eq!(restore_viewer_tab(2, 0, 3, false), Some(2));
+        // viewer was the owner: leave close's active alone
+        assert_eq!(restore_viewer_tab(1, 1, 2, true), None);
+        // empty window
+        assert_eq!(restore_viewer_tab(0, 0, 0, true), None);
     }
 
     #[test]

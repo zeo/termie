@@ -5,7 +5,7 @@
 ### Workflow
 - **Duplicate tab** (`Ctrl+Shift+D`, and on the palette): opens a new tab running the focused pane's shell in its current directory — the same chord Windows Terminal uses. "New tab here" keeps opening the *default* shell there; duplicate carries the shell too, so a `cmd` or WSL tab duplicates as itself.
 - **Tab reorder**: drag a tab along the strip to move it (it swaps past its neighbors live, like a browser), or nudge the active tab with `Ctrl+Shift+PgUp` / `Ctrl+Shift+PgDn` ("move tab left/right" on the palette). Tabs now also activate on press rather than release, matching every other tab strip.
-- **Find follows the focused pane.** Switching tabs or panes — including after a split, pane close, tear-off, or focus move — while find is open re-runs the query against the newly focused grid, so highlights and next/prev no longer stick to the previous pane's match list.
+- **Find follows the focused pane.** Switching tabs or panes — including after a split, pane close, tear-off, or focus move — while find is open re-runs the query against the newly focused grid, so highlights and next/prev no longer stick to the previous pane's match list. A shell dying in a *background* tab no longer poisons the open find against that tab either: the temporary owner switch is held, the viewer tab is restored, and find recomputes once against what you are still looking at.
 - **Find spans soft-wrapped lines.** A long URL or command that the terminal wrapped mid-line is still one logical string for search (same rule as copy), so `Ctrl+Shift+F` hits it; wide-glyph continuation cells no longer break a match.
 
 ### Terminal fidelity
