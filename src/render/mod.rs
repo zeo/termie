@@ -1541,8 +1541,10 @@ impl Renderer {
     pub fn set_color_overrides(&mut self, overrides: Vec<(String, Rgb)>) {
         self.color_overrides = overrides;
         self.palette = self.themed_palette();
-        // overrides can arrive live (conf watcher), not just at boot
+        // overrides can arrive live (conf watcher), not just at boot: drop the
+        // cached bg wash too — its (size, theme) key can't see a bg override
         self.atlas.dirty = true;
+        self.gradient_cache.clear();
     }
 
     pub fn set_theme(&mut self, id: ThemeId) {
