@@ -476,11 +476,160 @@ pub fn find_machine_msi() -> Option<String> {
 }
 
 fn remove_msi(product: &str) {
-    // msiexec prompts for elevation itself; /qb keeps its ui to a small bar.
-    // failure is non-fatal — the per-user install still lands, we just warn
+    // try quietly first (works when this process is already elevated or the
+    // MSI was per-user). if the product is still registered, re-run with a
+    // UAC prompt via ShellExecute "runas" so the dual-Start-menu case can't
+    // survive a successful native install
     let _ = std::process::Command::new("msiexec")
-        .args(["/x", product, "/qb", "/norestart"])
+        .args(["/x", product, "/qn", "/norestart"])
         .status();
+    if find_machine_msi().as_deref() == Some(product) {
+        elevated_msiexec_uninstall(product);
+    }
+    // msiexec can leave the tree or the all-users shortcut when a prior
+    // uninstall was interrupted; scrub whatever remains so Search only
+    // shows the per-user copy
+    scrub_machine_msi_leftovers();
+}
+
+fn elevated_msiexec_uninstall(product: &str) {
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows::Win32::Foundation::CloseHandle;
+
+    let file = wide("msiexec.exe");
+    let params = wide(&format!("/x {product} /qn /norestart"));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: windows::core::w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: 0, // SW_HIDE
+        ..Default::default()
+    };
+    unsafe {
+        if ShellExecuteExW(&mut info).is_ok() && !info.hProcess.is_invalid() {
+            let _ = WaitForSingleObject(info.hProcess, INFINITE);
+            let _ = CloseHandle(info.hProcess);
+        }
+    }
+}
+
+/// drop Program Files tree, all-users Start shortcut, and a machine PATH
+/// entry left by the WiX MSI after its product key is gone
+fn scrub_machine_msi_leftovers() {
+    // best-effort: these paths need admin; when the elevated msiexec path
+    // already removed them this is a no-op, and when it didn't we still
+    // try so a partial cleanup doesn't leave Search with two entries
+    let pf = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    let tree = pf.join("termie");
+    if tree.is_dir() {
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+    if let Some(pd) = std::env::var_os("ProgramData") {
+        let lnk = PathBuf::from(pd)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("termie.lnk");
+        let _ = std::fs::remove_file(lnk);
+    }
+    scrub_machine_path_termie();
+}
+
+fn scrub_machine_path_termie() {
+    unsafe {
+        let mut key = HKEY::default();
+        let sub = wide("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub.as_ptr()),
+            Some(0),
+            KEY_READ | KEY_SET_VALUE,
+            &mut key,
+        ) != ERROR_SUCCESS
+        {
+            return;
+        }
+        let name = wide("Path");
+        let mut ty = REG_EXPAND_SZ;
+        let mut bytes = 0u32;
+        let q = RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut ty),
+            None,
+            Some(&mut bytes),
+        );
+        if q != ERROR_SUCCESS || bytes == 0 {
+            let _ = RegCloseKey(key);
+            return;
+        }
+        let mut buf = vec![0u16; (bytes as usize / 2) + 1];
+        let mut bytes2 = bytes;
+        if RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(buf.as_mut_ptr() as *mut u8),
+            Some(&mut bytes2),
+        ) != ERROR_SUCCESS
+        {
+            let _ = RegCloseKey(key);
+            return;
+        }
+        let chars = (bytes2 as usize / 2).min(buf.len());
+        let raw = String::from_utf16_lossy(&buf[..chars]);
+        let path = raw.trim_end_matches('\0');
+        let lower = path.to_ascii_lowercase();
+        if !lower.contains("\\termie") && !lower.contains("/termie") {
+            let _ = RegCloseKey(key);
+            return;
+        }
+        let kept: Vec<&str> = path
+            .split(';')
+            .filter(|p| {
+                let t = p.trim();
+                if t.is_empty() {
+                    return false;
+                }
+                let l = t.to_ascii_lowercase();
+                // drop "…\termie" and "…\termie\" only — not unrelated paths
+                // that merely contain the substring elsewhere
+                !(l.ends_with("\\termie") || l.ends_with("/termie") || l.ends_with("\\termie\\") || l.ends_with("/termie/"))
+            })
+            .collect();
+        let new_path = kept.join(";");
+        let w = wide(&new_path);
+        let _ = RegSetValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            Some(0),
+            ty,
+            Some(std::slice::from_raw_parts(
+                w.as_ptr() as *const u8,
+                (w.len() - 1) * 2,
+            )),
+        );
+        let _ = RegCloseKey(key);
+        // tell explorers to reload PATH
+        let env = wide("Environment");
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(env.as_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            1000,
+            None,
+        );
+    }
 }
 
 // ---- self-removal --------------------------------------------------------------
