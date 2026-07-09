@@ -583,19 +583,32 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// find matches are bound to one grid. when the focus identity (active tab and/or
-/// focused pane id) changes while find is open, the overlay must re-run against
-/// the newly focused grid — otherwise highlights and next/prev stick to the
-/// previous pane's hit list. `hold` suppresses recompute during a temporary
-/// active_tab switch (background pane exit) so the match list is not poisoned
-/// against a tab the user is not viewing
+/// true when the focused *view* (the pane's grid) changed. identity is the
+/// globally unique pane id; tab index is unstable under insert/remove/reorder
+/// and must not count as a view change — same pane at a left-shifted tab index
+/// is still the same scrollback for find
+fn focus_view_changed(
+    before: Option<(usize, usize)>,
+    after: Option<(usize, usize)>,
+) -> bool {
+    match (before, after) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        // compare pane ids only; discard tab indices
+        (Some((_, bp)), Some((_, ap))) => bp != ap,
+    }
+}
+
+/// find matches are bound to one pane grid. recompute only when find is open,
+/// not held (mid-flight temporary owner switch), and the focused pane id
+/// actually changed — tab reindex alone is not a view change
 fn find_must_follow_focus(
     find_open: bool,
     before: Option<(usize, usize)>,
     after: Option<(usize, usize)>,
     hold: bool,
 ) -> bool {
-    find_open && !hold && before != after
+    find_open && !hold && focus_view_changed(before, after)
 }
 
 /// after a focus context change, replace the match list and snap the cursor to
@@ -2710,14 +2723,16 @@ impl App {
         self.redraw();
     }
 
-    /// focus identity for the find-follow-focus rule: (active_tab, focused pane id)
+    /// focus identity for the find-follow-focus rule: (active_tab, focused pane id).
+    /// only the pane id is stable for the view-change predicate; tab index is
+    /// carried so callers can restore viewer slots after background closes
     fn focus_identity(&self) -> Option<(usize, usize)> {
         let tab = self.pw.tabs.get(self.pw.active_tab)?;
         Some((self.pw.active_tab, tab.focused))
     }
 
-    /// finish a UI update that may have retargeted the focused tab/pane: re-run
-    /// find when it is open and the identity changed, otherwise plain redraw.
+    /// finish a UI update that may have retargeted the focused pane: re-run find
+    /// when it is open and the focused *pane id* changed, otherwise plain redraw.
     /// when `find_follow_hold` is set (temporary owner-tab switch for a
     /// background exit), only redraw so the viewer's match list stays intact
     fn after_focus_context_change(&mut self, before: Option<(usize, usize)>) {
@@ -6939,24 +6954,46 @@ mod tests {
     }
 
     #[test]
-    fn find_must_follow_focus_when_tab_or_pane_changes() {
-        // closed find never forces a recompute
+    fn focus_view_changed_keys_on_pane_id_not_tab_index() {
+        // same pane after leftward tab removal: tab 2→1, pane unchanged
+        assert!(!focus_view_changed(Some((2, 5)), Some((1, 5))));
+        // same pane, same tab
+        assert!(!focus_view_changed(Some((0, 7)), Some((0, 7))));
+        // both absent
+        assert!(!focus_view_changed(None, None));
+        // pane retarget inside one tab (split / close / focus_dir / click)
+        assert!(focus_view_changed(Some((0, 1)), Some((0, 2))));
+        // different tab AND different pane (real tab switch)
+        assert!(focus_view_changed(Some((0, 1)), Some((1, 3))));
+        // same tab index but different pane after reorder of other tabs still counts
+        assert!(focus_view_changed(Some((1, 4)), Some((1, 9))));
+        // focus gained / lost
+        assert!(focus_view_changed(None, Some((0, 1))));
+        assert!(focus_view_changed(Some((0, 1)), None));
+        // tab switch that lands on a different pane id (usual case: each tab's leaf)
+        // even when the numbers look like a reindex of the same slot
+        assert!(focus_view_changed(Some((0, 10)), Some((1, 11))));
+    }
+
+    #[test]
+    fn find_must_follow_focus_matrix() {
+        // closed find never recomputes
         assert!(!find_must_follow_focus(false, Some((0, 1)), Some((1, 1)), false));
         assert!(!find_must_follow_focus(false, Some((0, 1)), Some((0, 2)), false));
-        // same identity is a no-op even with find open
+        // same pane id at same or shifted tab index: no recompute
         assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 1)), false));
-        // tab switch while find is open
-        assert!(find_must_follow_focus(true, Some((0, 1)), Some((1, 1)), false));
-        // pane retarget inside the same tab (split / close / focus_dir / click)
-        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), false));
-        // focus lost entirely (last pane of last tab, etc.)
-        assert!(find_must_follow_focus(true, Some((0, 1)), None, false));
-        // a newly opened window with no prior identity still counts as a change
-        assert!(find_must_follow_focus(true, None, Some((0, 1)), false));
-        // hold (background pane exit temp switch) never recomputes mid-flight
+        // skeptic: leftward owner-tab removal leaves the same pane at a lower index
+        assert!(!find_must_follow_focus(true, Some((2, 5)), Some((1, 5)), false));
+        assert!(!find_must_follow_focus(true, Some((3, 9)), Some((0, 9)), false));
+        // real pane retarget → recompute
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), false)); // split/close/focus_dir
+        assert!(find_must_follow_focus(true, Some((0, 1)), Some((1, 3)), false)); // tab switch
+        assert!(find_must_follow_focus(true, Some((0, 1)), None, false));         // focus lost
+        assert!(find_must_follow_focus(true, None, Some((0, 1)), false));         // focus gained
+        // hold suppresses even a real pane change mid-flight
         assert!(!find_must_follow_focus(true, Some((0, 1)), Some((1, 9)), true));
         assert!(!find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), true));
-        // after hold clears, a real identity change still recomputes
+        // after hold clears, a real pane change still recomputes
         assert!(find_must_follow_focus(true, Some((0, 1)), Some((0, 2)), false));
     }
 
