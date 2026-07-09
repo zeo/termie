@@ -14,8 +14,9 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 const PWSH_PROMPT_HOOK: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $p=$PWD.ProviderPath; [char]27+']133;A'+[char]27+'\'+[char]27+']7;file:///'+($p -replace '\\','/')+[char]27+'\'+(& $global:__termie_prompt) }"#;
 
 /// which shell a new pane should launch
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ShellKind {
+    #[default]
     Auto,
     Pwsh,
     PowerShell,
@@ -83,13 +84,20 @@ impl Pty {
         cwd: Option<&str>,
         command: Option<&[String]>,
         wsl_distro: Option<&str>,
+        term_program: &str,
+        pixel_width: u16,
+        pixel_height: u16,
     ) -> Result<Pty> {
         let pty_system = native_pty_system();
+        // pass real cell geometry when known so ConPTY (and anything that asks
+        // the console for pixel size) sees a honest window, not 0×0
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let pair = pty_system.openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
+            rows,
+            cols,
+            pixel_width: pixel_width.saturating_mul(cols),
+            pixel_height: pixel_height.saturating_mul(rows),
         })?;
 
         // an explicit command (from the cli or a context-menu verb) runs directly
@@ -121,12 +129,15 @@ impl Pty {
                 if lower.ends_with("wsl.exe") {
                     // launch a specific distro when one is configured (else the
                     // wsl default), and forward the terminal env in so colors and
-                    // the kitty-keyboard hint reach programs running inside wsl
+                    // identity reach programs running inside wsl
                     if let Some(d) = wsl_distro {
                         c.arg("-d");
                         c.arg(d);
                     }
-                    c.env("WSLENV", "TERM/u:COLORTERM/u:TERM_PROGRAM/u");
+                    c.env(
+                        "WSLENV",
+                        "TERM/u:COLORTERM/u:TERM_PROGRAM/u:TERM_PROGRAM_VERSION/u:TERMIE/u",
+                    );
                 }
                 c
             }
@@ -141,12 +152,20 @@ impl Pty {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERMIE", "1");
-        // some TUIs only enable the kitty keyboard protocol (the thing that makes
-        // shift+enter a newline) when TERM_PROGRAM names a terminal on their
-        // static allowlist; they never query the terminal. ghostty is the
-        // narrowest-capability match and shares the kitty keyboard family termie
-        // genuinely implements
-        cmd.env("TERM_PROGRAM", "ghostty");
+        // identify as termie by default. spoofing another host (e.g. ghostty)
+        // makes allowlist-only apps enable every progressive feature that host
+        // advertises — including ones that misbehave through ConPTY and then
+        // dump raw mouse/keyboard sequences into TUI input buffers. real
+        // capability is negotiated (kitty keyboard CSI, XTVERSION, DA, tcap);
+        // set term_program=ghostty in config only when an allowlist-only app
+        // needs the name and you accept the tradeoff
+        let tp = if term_program.is_empty() {
+            "termie"
+        } else {
+            term_program
+        };
+        cmd.env("TERM_PROGRAM", tp);
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         // trim pwsh/.NET startup work: skip the background update check + telemetry
         cmd.env("POWERSHELL_UPDATECHECK", "Off");
         cmd.env("POWERSHELL_TELEMETRY_OPTOUT", "1");
@@ -220,12 +239,14 @@ impl Pty {
         let _ = self.writer_tx.send(bytes.to_vec());
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    pub fn resize(&mut self, rows: u16, cols: u16, cell_w: u16, cell_h: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         let _ = self.master.resize(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
+            rows,
+            cols,
+            pixel_width: cell_w.saturating_mul(cols),
+            pixel_height: cell_h.saturating_mul(rows),
         });
     }
 
@@ -451,7 +472,8 @@ mod live_tests {
     fn pty_runs_a_command_and_renders_output() {
         let argv = ["cmd.exe", "/c", "echo termie-itest-OK"].map(String::from);
         let mut pty =
-            Pty::spawn(24, 80, ShellKind::Cmd, false, None, Some(&argv[..]), None).expect("spawn pty");
+            Pty::spawn(24, 80, ShellKind::Cmd, false, None, Some(&argv[..]), None, "termie", 0, 0)
+                .expect("spawn pty");
         let rx = reader_channel(&mut pty);
         let grid = pump_until(&mut pty, &rx, 24, 80, "termie-itest-OK", Duration::from_secs(15));
         pty.kill();
@@ -461,7 +483,9 @@ mod live_tests {
     #[test]
     #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
     fn pty_echoes_typed_input() {
-        let mut pty = Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None).expect("spawn pty");
+        let mut pty =
+            Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None, "termie", 0, 0)
+                .expect("spawn pty");
         let rx = reader_channel(&mut pty);
         // let the shell come up (answering its startup queries), then type a command
         std::thread::sleep(Duration::from_millis(700));
@@ -474,10 +498,12 @@ mod live_tests {
     #[test]
     #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
     fn pty_keeps_working_after_resize() {
-        let mut pty = Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None).expect("spawn pty");
+        let mut pty =
+            Pty::spawn(24, 80, ShellKind::Cmd, false, None, None, None, "termie", 0, 0)
+                .expect("spawn pty");
         let rx = reader_channel(&mut pty);
         std::thread::sleep(Duration::from_millis(500));
-        pty.resize(40, 120);
+        pty.resize(40, 120, 0, 0);
         pty.write(b"echo termie-resize-OK\r\n");
         let grid = pump_until(&mut pty, &rx, 40, 120, "termie-resize-OK", Duration::from_secs(15));
         pty.kill();

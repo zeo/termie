@@ -155,6 +155,11 @@ impl Terminal {
         self.cell_px = (w, h);
     }
 
+    /// current cell size in physical pixels; (0, 0) until the renderer feeds it
+    pub fn cell_px(&self) -> (u16, u16) {
+        self.cell_px
+    }
+
     fn map_charset(&self, c: char) -> char {
         let active = if self.gl == 0 { self.g0 } else { self.g1 };
         if active == Charset::DecGraphics {
@@ -172,6 +177,13 @@ impl Terminal {
         self.gl = 0;
         self.app_cursor_keys = false;
         self.bracketed_paste = false;
+        // drop mouse / focus / sync / kitty keys so a soft-resetting TUI can't
+        // leave the stream in a state that floods the next prompt with reports
+        self.mouse_proto = MouseProto::Off;
+        self.mouse_sgr = false;
+        self.focus_events = false;
+        self.sync_output = false;
+        self.kbd_stack = vec![0];
         self.apply_sgr(&[&[0u16][..]]);
         self.grid.set_scroll_region(0, self.grid.rows - 1);
         self.grid.origin_mode = false;
@@ -316,14 +328,19 @@ impl Terminal {
         }
         let (c, r) = (col + 1, row + 1);
         let md = modifiers as u32;
-        if self.mouse_sgr {
+        // SGR when the app asked for it, or when X10 would clamp (coords > 223
+        // become 255 and then corrupt any TUI that treats the byte as UTF-8).
+        // falling back to SGR on overflow is what modern hosts do so a wide
+        // pane never poisons the input stream with high-bit X10 bytes
+        let use_sgr = self.mouse_sgr || c > 223 || r > 223;
+        if use_sgr {
             let cb = btn as u32 + md + if motion { 32 } else { 0 };
             let m = if pressed { 'M' } else { 'm' };
             Some(format!("\x1b[<{cb};{c};{r}{m}").into_bytes())
         } else {
-            // legacy X10: release is button 3; values offset by 32, clamped
+            // legacy X10: release is button 3; values offset by 32
             let cb = if pressed { btn as u32 + md + if motion { 32 } else { 0 } } else { 3 + md };
-            let enc = |v: u32| -> u8 { (v + 32).min(255) as u8 };
+            let enc = |v: u32| -> u8 { (v + 32) as u8 };
             Some(vec![0x1b, b'[', b'M', enc(cb), enc(c as u32), enc(r as u32)])
         }
     }
@@ -357,12 +374,17 @@ impl Terminal {
         self.using_alt = false;
         // a fullscreen app just exited; drop the interaction modes it may have
         // set but the shell never wants, so they can't bleed into the prompt
-        // (stray mouse reports, kitty-encoded keys, application arrow keys).
-        // bracketed paste and focus reporting are left alone since shells use them
+        // (stray mouse reports, kitty-encoded keys, application arrow keys,
+        // a stuck DEC 2026 frame). bracketed paste is left alone — shells use it
         self.mouse_proto = MouseProto::Off;
         self.mouse_sgr = false;
         self.app_cursor_keys = false;
         self.kbd_stack = vec![0];
+        self.sync_output = false;
+        // focus reporting is rarely wanted at a bare prompt; a TUI that needs
+        // it re-enables on the next entry, and leaving it on makes some hosts
+        // emit CSI I/O that land as garbage in line editors
+        self.focus_events = false;
     }
 
     fn set_mode(&mut self, private: bool, mode: u16, enable: bool) {
@@ -809,8 +831,27 @@ impl Perform for Terminal {
                 let bottom = param_at(params, 1, self.grid.rows as u16) as usize - 1;
                 self.grid.set_scroll_region(top, bottom);
             }
-            'h' => self.set_mode(private, param_at(params, 0, 0), true),
-            'l' => self.set_mode(private, param_at(params, 0, 0), false),
+            // SM/RM: every Ps in CSI ? Ps ; Ps ; ... h/l must apply. real TUIs
+            // enable mouse as a single combined sequence
+            // (`CSI ? 1000;1002;1003;1006 h`); only taking the first left sgr
+            // and any-motion off, so reports went out as clamped X10 bytes
+            'h' | 'l' => {
+                let enable = action == 'h';
+                let mut saw = false;
+                for p in params.iter() {
+                    let mode = p.first().copied().unwrap_or(0);
+                    // a zero param is xterm's "default" and is not a real mode
+                    // number we track — skip rather than calling set_mode(0)
+                    if mode == 0 {
+                        continue;
+                    }
+                    self.set_mode(private, mode, enable);
+                    saw = true;
+                }
+                if !saw {
+                    self.set_mode(private, 0, enable);
+                }
+            }
             'n' => {
                 let what = param_at(params, 0, 0);
                 if what == 6 {
@@ -1470,17 +1511,66 @@ mod tests {
     fn leaving_alt_screen_resets_interaction_modes() {
         let mut t = Terminal::new(4, 20);
         // a tui enters the alt screen and turns on mouse tracking + kitty keys
-        feed(&mut t, b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[>1u");
+        feed(&mut t, b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?1h\x1b[>1u\x1b[?2026h");
         assert_eq!(t.mouse_proto, MouseProto::Normal);
         assert!(t.mouse_sgr);
+        assert!(t.focus_events);
         assert!(t.app_cursor_keys);
+        assert!(t.sync_output);
         assert_eq!(t.kbd_flags(), 1);
         // leaving the alt screen must drop them so a stray click can't print a
         // mouse report and keys aren't kitty-encoded once the shell is back
         feed(&mut t, b"\x1b[?1049l");
         assert_eq!(t.mouse_proto, MouseProto::Off);
         assert!(!t.mouse_sgr);
+        assert!(!t.focus_events);
         assert!(!t.app_cursor_keys);
+        assert!(!t.sync_output);
+        assert_eq!(t.kbd_flags(), 0);
+    }
+
+    #[test]
+    fn combined_mouse_modes_all_apply() {
+        // CSI ? 1000;1002;1003;1006 h is how real TUIs enable mouse — every
+        // Ps must land, not only the first
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[?1000;1002;1003;1006h");
+        assert_eq!(t.mouse_proto, MouseProto::Any);
+        assert!(t.mouse_sgr);
+        // SGR report for a mid-pane cell
+        let b = t.encode_mouse(0, true, false, 10, 5, 0).unwrap();
+        assert_eq!(b, b"\x1b[<0;11;6M");
+        // disable the bundle
+        feed(&mut t, b"\x1b[?1000;1002;1003;1006l");
+        assert_eq!(t.mouse_proto, MouseProto::Off);
+        assert!(!t.mouse_sgr);
+    }
+
+    #[test]
+    fn x10_overflow_falls_back_to_sgr() {
+        // without 1006, a cell past the X10 223 limit must not emit a clamped
+        // high byte that poisons a UTF-8 input parser
+        let mut t = Terminal::new(4, 300);
+        feed(&mut t, b"\x1b[?1000h");
+        assert!(!t.mouse_sgr);
+        let b = t.encode_mouse(0, true, false, 250, 0, 0).unwrap();
+        assert_eq!(b, b"\x1b[<0;251;1M");
+        // still inside the X10 range: legacy encoding
+        let b2 = t.encode_mouse(0, true, false, 10, 5, 0).unwrap();
+        assert_eq!(b2, vec![0x1b, b'[', b'M', 32, 10 + 32 + 1, 5 + 32 + 1]);
+    }
+
+    #[test]
+    fn soft_reset_clears_mouse_and_sync() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b[?1003;1006h\x1b[?2026h\x1b[?1004h\x1b[>1u");
+        assert_eq!(t.mouse_proto, MouseProto::Any);
+        assert!(t.sync_output);
+        feed(&mut t, b"\x1b[!p");
+        assert_eq!(t.mouse_proto, MouseProto::Off);
+        assert!(!t.mouse_sgr);
+        assert!(!t.sync_output);
+        assert!(!t.focus_events);
         assert_eq!(t.kbd_flags(), 0);
     }
 
@@ -1528,8 +1618,8 @@ mod tests {
 
     #[test]
     fn apc_graphics_payload_is_swallowed() {
-        // advertising ghostty invites kitty-graphics (APC G) payloads; the
-        // parser must consume them, not leak base64 into the grid
+        // kitty-graphics APC payloads must be consumed, not leaked as base64
+        // into the grid (apps send them after probing DA1 / XTVERSION)
         let mut t = Terminal::new(4, 20);
         feed(&mut t, b"\x1b_Gf=100,a=T,m=0;iVBORw0KGgo=\x1b\\hi");
         assert_eq!(t.grid.lines[0][0].c, 'h');

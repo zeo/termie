@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Terminal fidelity
+- **Combined DECSET/DECRST applies every mode.** Sequences like `CSI ? 1000;1002;1003;1006 h` (how most full-screen apps enable mouse) used to take only the first parameter, so SGR mouse and any-event tracking never turned on together. Every `Ps` is applied now.
+- **X10 mouse never emits high-bit bytes.** When an app enables mouse without SGR (`1006`) and the cell is past column/row 223, the report falls back to SGR instead of clamping to `0xFF` — those clamped bytes were poisoning UTF-8 input parsers and filling TUI composers with garbage.
+- **Mouse motion is one report per cell.** Any-event tracking no longer re-emits the same CSI on every OS pointer sample while the cursor sits in one cell, which used to flood the child's input pipe under a moving mouse.
+- **Leaving the alt screen (and DECSTR) resets more interaction state.** Focus reporting and synchronized-output frames join mouse, app-cursor, and kitty keyboard on the cleanup list, so a crashed or poorly-exiting full-screen app can't leave CSI `I`/`O` or a stuck DEC 2026 frame bleeding into the next prompt.
+- **Honest `$TERM_PROGRAM`.** Children now see `TERM_PROGRAM=termie` and `TERM_PROGRAM_VERSION=<version>` instead of a spoofed host name. Capability is still negotiated the proper way (kitty keyboard CSI, XTVERSION, DA, XTGETTCAP). Apps that only enable features for a hard-coded allowlist can set `term_program=ghostty` (or another name) in `%APPDATA%\termie\config`.
+- **ConPTY gets real pixel geometry** on open and resize when the renderer knows the cell size, so tools that ask the console for a window size in pixels stop seeing 0×0.
+
 ## 0.3.2 — 2026-07-09
 
 ### Workflow

@@ -102,10 +102,12 @@ struct Pane {
 
 impl Pane {
     // resize the screen and the pty together so the two can never diverge or be
-    // transposed; both take (rows, cols)
+    // transposed; both take (rows, cols). cell pixel size goes to ConPTY so
+    // apps that ask the console for a window size in pixels get a real answer
     fn resize(&mut self, rows: usize, cols: usize) {
         self.term.resize(rows, cols);
-        self.pty.resize(rows as u16, cols as u16);
+        let (cw, ch) = self.term.cell_px();
+        self.pty.resize(rows as u16, cols as u16, cw, ch);
     }
 }
 
@@ -1356,10 +1358,8 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
                 term.grid.remove_placements(cmd.id);
             }
         }
-        b'q' => {
-            if cmd.quiet == 0 {
-                kitty_ok(term, cmd.id);
-            }
+        b'q' if cmd.quiet == 0 => {
+            kitty_ok(term, cmd.id);
         }
         _ => {}
     }
@@ -1384,10 +1384,25 @@ fn build_pane(
     cwd: Option<&str>,
     command: Option<&[String]>,
     wsl_distro: Option<&str>,
+    term_program: &str,
+    cell_w: u16,
+    cell_h: u16,
 ) -> Result<Pane> {
-    let pty = Pty::spawn(rows as u16, cols as u16, shell, load_profile, cwd, command, wsl_distro)?;
+    let pty = Pty::spawn(
+        rows as u16,
+        cols as u16,
+        shell,
+        load_profile,
+        cwd,
+        command,
+        wsl_distro,
+        term_program,
+        cell_w,
+        cell_h,
+    )?;
     let mut term = Terminal::new(rows, cols);
     term.grid.set_scrollback_limit(scrollback);
+    term.set_cell_px(cell_w, cell_h);
     Ok(Pane {
         id,
         term,
@@ -1493,6 +1508,10 @@ struct Persisted {
     latency_hud: bool,
     /// daily update check against GitHub releases; `update_check=false` opts out
     update_check: bool,
+    /// value of $TERM_PROGRAM for child processes. default "termie". set to a
+    /// known host name (e.g. ghostty) only for apps that refuse the kitty
+    /// keyboard protocol unless the name is on their allowlist
+    term_program: String,
 }
 
 impl Default for Persisted {
@@ -1521,6 +1540,7 @@ impl Default for Persisted {
             inline_paint: true,
             latency_hud: false,
             update_check: true,
+            term_program: String::from("termie"),
         }
     }
 }
@@ -1894,6 +1914,12 @@ fn parse_persisted(text: &str) -> Persisted {
             "inline_paint" => p.inline_paint = v == "true" || v == "on",
             "latency_hud" => p.latency_hud = v == "true" || v == "on",
             "update_check" => p.update_check = v != "false" && v != "off",
+            "term_program" => {
+                // empty falls back to the default at spawn time
+                if !v.is_empty() {
+                    p.term_program = v.to_string();
+                }
+            }
             // a typo used to be discarded with zero feedback
             other => log::warn!("config: unknown key `{other}` ignored"),
         }
@@ -2011,6 +2037,10 @@ struct App {
     /// button + pane that received a forwarded press; drag motion and release
     /// stay locked to this pane even if the cursor leaves it
     mouse_down: Option<(u8, usize)>,
+    /// last mouse report sent (pane, btn, pressed, motion, col, row, mods).
+    /// motion is suppressed when the cell hasn't changed so any-event tracking
+    /// can't flood a TUI's input buffer with identical CSI reports
+    last_mouse_report: Option<(usize, u8, bool, bool, usize, usize, u8)>,
     /// last OS pointer icon set, to avoid redundant set_cursor calls
     cursor_icon: CursorIcon,
     /// url under the cursor while ctrl is held, to underline + open on click:
@@ -2139,6 +2169,7 @@ impl App {
             persisted: p,
             broadcast: false,
             mouse_down: None,
+            last_mouse_report: None,
             cursor_icon: CursorIcon::Default,
             link: None,
             system_fonts_pending: true,
@@ -2323,6 +2354,12 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let shell = shell.unwrap_or(self.config.shell);
+        let (cw, ch) = self
+            .pw
+            .renderer
+            .as_ref()
+            .map(|r| r.cell_px())
+            .unwrap_or((0, 0));
         let mut pane = build_pane(
             id,
             cols,
@@ -2333,6 +2370,9 @@ impl App {
             cwd.as_deref(),
             command,
             self.persisted.wsl_distro.as_deref(),
+            &self.persisted.term_program,
+            cw,
+            ch,
         )?;
         self.start_reader(&mut pane);
         Ok(pane)
@@ -2455,9 +2495,31 @@ impl App {
         let (shell, profile, sb) = (self.config.shell, self.config.load_profile, self.config.scrollback);
         let proxy = self.proxy.clone();
         let wsl = self.persisted.wsl_distro.clone();
+        let term_program = self.persisted.term_program.clone();
+        let (cw, ch) = self
+            .pw
+            .renderer
+            .as_ref()
+            .map(|r| r.cell_px())
+            .unwrap_or((0, 0));
         self.pending_warm += 1;
         std::thread::spawn(move || {
-            let pane = build_pane(id, cols, rows, shell, profile, sb, None, None, wsl.as_deref()).ok().map(Box::new);
+            let pane = build_pane(
+                id,
+                cols,
+                rows,
+                shell,
+                profile,
+                sb,
+                None,
+                None,
+                wsl.as_deref(),
+                &term_program,
+                cw,
+                ch,
+            )
+            .ok()
+            .map(Box::new);
             let _ = proxy.send_event(UserEvent::PaneReady(pane));
         });
     }
@@ -4371,6 +4433,10 @@ impl App {
         if self.persisted.plugin_sandbox {
             let _ = writeln!(s, "plugin_sandbox=appcontainer");
         }
+        if self.persisted.term_program != "termie" {
+            // default is termie; only persist an override so the file stays short
+            let _ = writeln!(s, "term_program={}", self.persisted.term_program);
+        }
         if !self.persisted.inline_paint {
             // on by default; persist only the opt-out
             let _ = writeln!(s, "inline_paint=false");
@@ -4894,6 +4960,14 @@ impl App {
         let mmods = (if self.mods.shift_key() { 4u8 } else { 0 })
             | (if self.mods.alt_key() { 8 } else { 0 })
             | (if self.mods.control_key() { 16 } else { 0 });
+        // drop identical motion reports: winit fires CursorMoved at the OS
+        // sample rate, often many times per cell. flooding any-event mode
+        // fills a TUI's input buffer with the same CSI and the leftover bytes
+        // show up as garbage in the composer when the parser falls behind
+        let key = (id, btn, pressed, motion, col, row, mmods);
+        if motion && self.last_mouse_report == Some(key) {
+            return true;
+        }
         let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) else {
             return false;
         };
@@ -4902,6 +4976,7 @@ impl App {
         };
         if let Some(bytes) = p.term.encode_mouse(btn, pressed, motion, col, row, mmods) {
             p.pty.write(&bytes);
+            self.last_mouse_report = Some(key);
             true
         } else {
             false
