@@ -239,6 +239,8 @@ enum PaletteAction {
     /// new tab with the focused pane's shell and cwd (Windows Terminal's Ctrl+Shift+D)
     DuplicateTab,
     NewShell(ShellKind),
+    /// open one fresh window carrying the focused pane's shell and cwd
+    NewWindow,
     /// relaunch elevated via UAC: a new admin termie window with the focused
     /// pane's shell and cwd (an unelevated process can't host an elevated pty)
     AdminWindow,
@@ -309,6 +311,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("new tab: pwsh", PaletteAction::NewShell(ShellKind::Pwsh)),
     ("new tab: cmd", PaletteAction::NewShell(ShellKind::Cmd)),
     ("new tab: wsl", PaletteAction::NewShell(ShellKind::Wsl)),
+    ("new window", PaletteAction::NewWindow),
     ("new admin window", PaletteAction::AdminWindow),
     ("split vertical", PaletteAction::SplitV),
     ("split horizontal", PaletteAction::SplitH),
@@ -1022,6 +1025,7 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         (ctrl, chr("p"), A::OpenPalette),
         (ctrl, chr("t"), A::NewTab),
         (cs, chr("t"), A::ReopenTab),
+        (cs, chr("n"), A::NewWindow),
         (cs, chr("d"), A::DuplicateTab),
         (cs, chr("c"), A::Copy),
         (cs, chr("v"), A::Paste),
@@ -1066,6 +1070,21 @@ fn jumplist_entries() -> Vec<(String, String)> {
         }
     }
     v
+}
+
+/// argv for a one-pane child window; separate arguments keep custom profile
+/// names and directories with spaces out of Windows command-line quoting
+fn window_launch_args(shell: Option<ShellKind>, cwd: Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(shell) = shell {
+        args.push("--shell".to_string());
+        args.push(shell.label().to_string());
+    }
+    if let Some(cwd) = cwd {
+        args.push("--cwd".to_string());
+        args.push(cwd);
+    }
+    args
 }
 
 /// keybinding-only action labels — the ones not in the command palette. several
@@ -4916,6 +4935,16 @@ impl App {
             PaletteAction::NewShell(s) => {
                 let cwd = self.focused_cwd();
                 self.new_tab_cwd(cwd, Some(s));
+            }
+            PaletteAction::NewWindow => {
+                let args = window_launch_args(self.focused_shell(), self.focused_cwd());
+                let launched = std::env::current_exe()
+                    .and_then(|exe| std::process::Command::new(exe).args(args).spawn())
+                    .is_ok();
+                if !launched {
+                    self.show_notice("couldn't open a new window");
+                }
+                self.redraw();
             }
             PaletteAction::AdminWindow => {
                 let mut args = String::new();
@@ -9446,6 +9475,7 @@ mod tests {
         // Ctrl+Shift+T reopens the last closed tab (chrome/vscode muscle memory);
         // Ctrl+T stays new-tab for WT switchers
         assert!(has(cs, "t", PaletteAction::ReopenTab));
+        assert!(has(cs, "n", PaletteAction::NewWindow));
         assert!(has(cs, "d", PaletteAction::DuplicateTab));
         assert!(has(cs, "e", PaletteAction::SplitV));
         assert!(has(ctrl, "1", PaletteAction::SelectTab(0)));
@@ -9473,10 +9503,22 @@ mod tests {
         assert!(has(ctrl | ModifiersState::ALT, "a", PaletteAction::JumpAttention));
         // label resolution covers palette + keybinding-only + select-tab
         assert_eq!(action_from_label("new tab"), Some(PaletteAction::NewTab));
+        assert_eq!(action_from_label("new window"), Some(PaletteAction::NewWindow));
         assert_eq!(action_from_label("reopen closed tab"), Some(PaletteAction::ReopenTab));
         assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));
         assert_eq!(action_from_label("select tab 3"), Some(PaletteAction::SelectTab(2)));
         assert_eq!(action_from_label("bogus action"), None);
+    }
+
+    #[test]
+    fn new_window_carries_shell_and_cwd_as_separate_args() {
+        assert_eq!(
+            window_launch_args(
+                Some(ShellKind::Custom("git bash")),
+                Some(r"C:\work tree\termie".to_string())
+            ),
+            ["--shell", "git bash", "--cwd", r"C:\work tree\termie"]
+        );
     }
 
     #[test]

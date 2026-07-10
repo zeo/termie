@@ -38,6 +38,7 @@ termie checks for a newer release once a day and shows a small `UPDATE` chip on 
 |---|---|
 | `Ctrl+T` / `Ctrl+W` | new / close tab |
 | `Ctrl+Shift+D` | duplicate tab (same shell and directory) |
+| `Ctrl+Shift+N` | new window (same shell and directory) |
 | `Ctrl+Tab` / `Ctrl+1`..`9` | next / nth tab |
 | `Ctrl+Shift+PgUp` / `Ctrl+Shift+PgDn` | move tab left / right (tabs also drag to reorder) |
 | `Ctrl+Shift+E` / `Ctrl+Shift+O` | split vertical / horizontal |
