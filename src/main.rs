@@ -6679,7 +6679,10 @@ impl App {
                 // window's swallow; expressed without `return` so the pw
                 // swap-back below always runs)
                 let ime_owns = self.pw.ime_composing && ke.state == ElementState::Pressed;
-                if !ime_owns && !self.handle_shortcut(&ke, event_loop) && ke.state == ElementState::Pressed {
+                // releases flow through too: key_to_bytes reports them when the
+                // pane's kitty flags ask for event types, exactly like the main
+                // window's path
+                if !ime_owns && !self.handle_shortcut(&ke, event_loop) {
                     let id = self.active_focused_id();
                     let (app_cursor, kbd) = id
                         .and_then(|id| {
@@ -6728,6 +6731,14 @@ impl App {
                 if f && self.pw.tabs.get(self.pw.active_tab).is_some_and(|t| t.attention) {
                     self.sync_tabs();
                 }
+                // report focus in/out to a pane that enabled mode 1004, the
+                // same as the main window does
+                if let Some(id) = self.active_focused_id()
+                    && let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut())
+                        && let Some(p) = find_pane_mut(root, id)
+                            && p.term.focus_events {
+                                p.pty.write(if f { b"\x1b[I" } else { b"\x1b[O" });
+                            }
                 self.paint();
             }
             WindowEvent::Ime(ime) => self.on_ime(ime),
