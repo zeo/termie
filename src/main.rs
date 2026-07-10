@@ -6439,7 +6439,7 @@ impl App {
 
     /// one key in mark mode: arrows move the cursor (scrolling into history at
     /// the edges), shift extends, enter/ctrl+c copy and exit, esc exits
-    fn mark_key(&mut self, event: &winit::event::KeyEvent) {
+    fn mark_key(&mut self, logical: &Key) {
         use NamedKey as N;
         let shift = self.mods.shift_key();
         let ctrl = self.mods.control_key();
@@ -6458,7 +6458,7 @@ impl App {
         let before_abs = self
             .focused_grid()
             .map(|g| (g.viewport_to_abs(cur.0), cur.1));
-        match &event.logical_key {
+        match logical {
             Key::Named(N::Escape) => {
                 self.set_mark_mode(false);
                 return;
@@ -6482,7 +6482,7 @@ impl App {
                     return;
                 };
                 if let Some(g) = self.focused_grid_mut() {
-                    let target = g.word_boundary(start, event.logical_key == Key::Named(N::ArrowRight));
+                    let target = g.word_boundary(start, *logical == Key::Named(N::ArrowRight));
                     let top = g.viewport_to_abs(0);
                     let bottom = g.viewport_to_abs(rows.saturating_sub(1));
                     if target.0 < top {
@@ -6914,7 +6914,7 @@ impl App {
                 // releases flow through too: key_to_bytes reports them when the
                 // pane's kitty flags ask for event types, exactly like the main
                 // window's path
-                if !ime_owns && !self.handle_shortcut(&ke, event_loop) {
+                if !ime_owns && !self.handle_shortcut(&ke.logical_key, ke.text.as_deref(), ke.state, event_loop) {
                     let id = self.active_focused_id();
                     let (app_cursor, kbd) = id
                         .and_then(|id| {
@@ -7928,12 +7928,14 @@ impl App {
     }
 
     /// intercept chrome shortcuts; returns true if consumed
-    fn handle_shortcut(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) -> bool {
-        if event.state != ElementState::Pressed {
+    // takes the key event's fields rather than winit's KeyEvent (which can't
+    // be constructed) so synthetic --drive keys walk the identical path
+    fn handle_shortcut(&mut self, logical: &Key, text: Option<&str>, state: ElementState, event_loop: &ActiveEventLoop) -> bool {
+        if state != ElementState::Pressed {
             return false;
         }
         // Esc closes an open pane context menu before anything else sees it
-        if self.pw.pane_menu.is_some() && event.logical_key == Key::Named(NamedKey::Escape) {
+        if self.pw.pane_menu.is_some() && *logical == Key::Named(NamedKey::Escape) {
             self.pw.pane_menu = None;
             self.redraw();
             return true;
@@ -7942,7 +7944,7 @@ impl App {
         // held action, esc cancels, anything else is swallowed (no accidental
         // dismissal and no leakage to the pane underneath)
         if self.pw.confirm.is_some() {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Enter) => {
                     if let Some(c) = self.pw.confirm.take() {
                         self.run_confirm(c.action, event_loop);
@@ -7957,7 +7959,7 @@ impl App {
         // tab rename text field: enter commits (an empty name clears back to the
         // cwd label), esc cancels, the rest edits the buffer
         if self.pw.rename.is_some() {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Enter) => {
                     if let Some(rs) = self.pw.rename.take() {
                         let name = rs.buf.trim().to_string();
@@ -7975,7 +7977,7 @@ impl App {
                 }
                 _ => {
                     if !self.mods.control_key()
-                        && let Some(t) = event.text.as_ref()
+                        && let Some(t) = text
                         && !t.is_empty()
                         && !t.chars().any(|c| c.is_control())
                     {
@@ -8004,7 +8006,7 @@ impl App {
             let act = self
                 .keybindings
                 .iter()
-                .find(|(m, k, _)| *m == mods && key_matches(&event.logical_key, k))
+                .find(|(m, k, _)| *m == mods && key_matches(logical, k))
                 .map(|(_, _, a)| *a);
             if let Some(a) = act {
                 // run_action returns false only for prompt-jump with no marks, so
@@ -8027,7 +8029,7 @@ impl App {
             && !self.mods.shift_key()
             && !self.mods.alt_key()
             && self.selection.is_some()
-            && key_matches(&event.logical_key, &Key::Character("c".into()))
+            && key_matches(logical, &Key::Character("c".into()))
         {
             self.copy_selection();
             self.selection = None;
@@ -8035,12 +8037,12 @@ impl App {
             return true;
         }
         // the plugins marketplace overlay captures keys while open
-        if self.market.is_some() && self.market_input(&event.logical_key) {
+        if self.market.is_some() && self.market_input(logical) {
             return true;
         }
         // find-in-scrollback overlay captures every key while open
         if self.find.is_some() {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Escape) => {
                     self.find = None;
                     self.redraw();
@@ -8064,7 +8066,7 @@ impl App {
                 _ => {
                     if !self.mods.control_key()
                         && !self.mods.alt_key()
-                        && let Some(t) = event.text.as_ref()
+                        && let Some(t) = text
                             && !t.is_empty() && !t.chars().any(|c| c.is_control()) {
                                 let t = t.to_string();
                                 if let Some(f) = self.find.as_mut() {
@@ -8079,11 +8081,11 @@ impl App {
         // the font picker captures every key while open (preview live, commit
         // on Enter, cancel on Esc — reuses the palette overlay box)
         if self.font_pick.is_some() {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Escape) => self.close_font_picker(false),
                 Key::Named(NamedKey::Enter) => self.close_font_picker(true),
                 Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
-                    let down = matches!(&event.logical_key, Key::Named(NamedKey::ArrowDown));
+                    let down = matches!(logical, Key::Named(NamedKey::ArrowDown));
                     let len = self
                         .font_pick
                         .as_ref()
@@ -8110,7 +8112,7 @@ impl App {
                 _ => {
                     if !self.mods.control_key()
                         && !self.mods.alt_key()
-                        && let Some(t) = event.text.as_ref()
+                        && let Some(t) = text
                         && !t.is_empty()
                         && !t.chars().any(|c| c.is_control())
                     {
@@ -8127,7 +8129,7 @@ impl App {
         }
         // command palette captures every key while open
         if self.palette.is_some() {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Escape) => {
                     self.palette = None;
                     self.redraw();
@@ -8177,7 +8179,7 @@ impl App {
                 }
                 _ => {
                     if !self.mods.control_key()
-                        && let Some(t) = event.text.as_ref()
+                        && let Some(t) = text
                             && !t.is_empty() && !t.chars().any(|c| c.is_control()) {
                                 let t = t.to_string();
                                 if let Some(p) = self.palette.as_mut() {
@@ -8195,14 +8197,14 @@ impl App {
         if self.mods.control_key()
             && self.mods.shift_key()
             && self.mark.is_none()
-            && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("p"))
+            && matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("p"))
         {
             self.set_pane_mode(!self.pw.pane_mode);
             return true;
         }
         // pane control mode captures every key until exited
         if self.pw.pane_mode {
-            match &event.logical_key {
+            match logical {
                 Key::Named(NamedKey::Escape) => self.set_pane_mode(false),
                 // shift+arrows resize the focused pane; plain arrows move focus
                 Key::Named(NamedKey::ArrowLeft) if self.mods.shift_key() => self.resize_focused(Dir::Vertical, false),
@@ -8234,15 +8236,15 @@ impl App {
         // mark mode captures every key until exited: keyboard selection over
         // screen + scrollback without touching the mouse
         if self.mark.is_some() {
-            self.mark_key(event);
+            self.mark_key(logical);
             return true;
         }
 
         // the settings panel captures keys while open (Esc or Ctrl+, closes it)
         if self.pw.settings_open {
-            let esc = event.logical_key == Key::Named(NamedKey::Escape);
+            let esc = *logical == Key::Named(NamedKey::Escape);
             let ctrl_comma = self.mods.control_key()
-                && matches!(&event.logical_key, Key::Character(c) if c.as_str() == ",");
+                && matches!(logical, Key::Character(c) if c.as_str() == ",");
             if esc || ctrl_comma {
                 self.close_settings();
             }
@@ -8883,7 +8885,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.pw.ime_composing && event.state == ElementState::Pressed {
                     return;
                 }
-                if self.handle_shortcut(&event, event_loop) {
+                if self.handle_shortcut(&event.logical_key, event.text.as_deref(), event.state, event_loop) {
                     return;
                 }
                 let id = match self.active_focused_id() {
