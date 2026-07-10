@@ -2668,8 +2668,14 @@ fn parse_persisted(text: &str) -> Persisted {
         }
     }
     // a .cwd / .env line for a profile with no command line leaves an argv-less
-    // entry — drop it so it never reaches the spawn path
-    p.profiles.retain(|pr| !pr.argv.is_empty());
+    // entry — drop it (it must never reach the spawn path) and say so, like the
+    // other malformed-config warns
+    p.profiles.retain(|pr| {
+        if pr.argv.is_empty() {
+            log::warn!("config: profile `{}` has .cwd/.env lines but no profile.{}=<command>; ignored", pr.name, pr.name);
+        }
+        !pr.argv.is_empty()
+    });
     p
 }
 
