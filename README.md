@@ -44,9 +44,11 @@ termie checks for a newer release once a day and shows a small `UPDATE` chip on 
 | `Ctrl+P` | command palette |
 | `Ctrl+Shift+P` | pane mode (move / resize / zoom / close) |
 | `Ctrl+Shift+M` | mark mode (keyboard selection: arrows move, shift extends, enter copies) |
+| `Ctrl+Shift+A` | select all text in the focused pane |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste (also `Ctrl+Insert` / `Shift+Insert`) |
 | `Ctrl+Shift+F` | find in scrollback |
 | `Ctrl+Shift+B` | broadcast input to every pane |
+| `Ctrl+Alt+A` | jump to the next pane that failed, rang, or finished |
 | `Ctrl+Shift+W` | close pane |
 | `Ctrl+Up` / `Ctrl+Down` | jump to previous / next prompt (marked on the scrollbar) |
 | `Shift+PgUp` / `Shift+PgDn` | scroll a page of history |

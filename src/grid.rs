@@ -626,40 +626,24 @@ impl Grid {
         out
     }
 
+    /// inclusive bounds of all retained text, excluding blank screen rows after
+    /// the last printed cell
+    pub fn full_span(&self) -> Option<((u64, usize), (u64, usize))> {
+        let base = self.abs_base();
+        (0..self.total_lines()).rev().find_map(|i| {
+            let line = self.line_at_abs(base + i as u64)?;
+            let col = line
+                .iter()
+                .rposition(|cell| cell.cluster != 0 || !matches!(cell.c, ' ' | '\0'))?;
+            Some(((base, 0), (base + i as u64, col)))
+        })
+    }
+
     /// all of history plus the live screen as plain text: soft-wrapped runs
     /// join into one logical line (same rule as copy), hard lines keep their
     /// breaks, trailing blank screen rows are dropped
     pub fn full_text(&self) -> String {
-        let mut out = String::new();
-        let total = self.scrollback.len() + self.lines.len();
-        for i in 0..total {
-            let line = if i < self.scrollback.len() {
-                &self.scrollback[i]
-            } else {
-                &self.lines[i - self.scrollback.len()]
-            };
-            let mut s = String::new();
-            for cell in line.iter() {
-                if cell.cluster != 0 {
-                    s.push_str(self.cluster_str(cell.cluster));
-                } else if cell.c != '\0' {
-                    s.push(cell.c);
-                }
-            }
-            if !line.wrapped {
-                while s.ends_with(' ') {
-                    s.pop();
-                }
-            }
-            out.push_str(&s);
-            if !line.wrapped && i + 1 != total {
-                out.push('\n');
-            }
-        }
-        while out.ends_with('\n') {
-            out.pop();
-        }
-        out
+        self.full_span().map_or_else(String::new, |(start, end)| self.selected_text(start, end, false))
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
@@ -2017,6 +2001,22 @@ mod tests {
         }
         g.linefeed();
         assert_eq!(g.selected_text(sel.0, sel.1, false), "bb");
+    }
+
+    #[test]
+    fn full_span_covers_history_and_skips_trailing_blank_rows() {
+        let mut g = Grid::new(2, 4);
+        assert_eq!(g.full_span(), None);
+        for line in ["aa", "bb", "cc", "dd"] {
+            for c in line.chars() {
+                g.put_char(c);
+            }
+            g.linefeed();
+            g.carriage_return();
+        }
+        let (start, end) = g.full_span().expect("printed text has a span");
+        assert_eq!(g.selected_text(start, end, false), "aa\nbb\ncc\ndd");
+        assert_eq!(g.full_text(), "aa\nbb\ncc\ndd");
     }
 
     #[test]

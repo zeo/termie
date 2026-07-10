@@ -253,6 +253,8 @@ enum PaletteAction {
     PaneMode,
     /// keyboard selection: move a cursor through screen + scrollback and copy
     MarkMode,
+    /// select the focused pane's retained history and live screen
+    SelectAll,
     /// toggle termie as the windows default terminal (console-app handoff)
     DefaultTerminal,
     Quake,
@@ -315,6 +317,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("settings", PaletteAction::Settings),
     ("pane mode", PaletteAction::PaneMode),
     ("mark mode", PaletteAction::MarkMode),
+    ("select all", PaletteAction::SelectAll),
     ("jump to attention", PaletteAction::JumpAttention),
     ("always on top", PaletteAction::ToggleOnTop),
     ("choose font", PaletteAction::FontPicker),
@@ -1035,8 +1038,9 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         (cs, chr("o"), A::SplitH),
         // keyboard selection, the windows terminal chord
         (cs, chr("m"), A::MarkMode),
+        (cs, chr("a"), A::SelectAll),
         // cockpit: hop to the pane that needs eyes
-        (cs, chr("a"), A::JumpAttention),
+        (ctrl | ModifiersState::ALT, chr("a"), A::JumpAttention),
     ];
     for n in 1u8..=9 {
         v.push((ctrl, chr(&n.to_string()), A::SelectTab(n - 1)));
@@ -4060,6 +4064,17 @@ impl App {
         }
     }
 
+    fn select_all(&mut self) {
+        let Some(pane) = self.active_focused_id() else {
+            return;
+        };
+        self.selection = self.focused_grid().and_then(|g| {
+            let (start, end) = g.full_span()?;
+            Some(Sel { pane, start, end, block: false, reflow_gen: g.reflow_gen })
+        });
+        self.redraw();
+    }
+
     fn paste(&mut self) {
         let text = win::clipboard_get();
         if text.is_empty() {
@@ -4868,6 +4883,7 @@ impl App {
             PaletteAction::Plugins => self.open_market(),
             PaletteAction::PaneMode => self.set_pane_mode(true),
             PaletteAction::MarkMode => self.set_mark_mode(true),
+            PaletteAction::SelectAll => self.select_all(),
             PaletteAction::JumpAttention => self.jump_attention(),
             PaletteAction::FontPicker => self.open_font_picker(),
             PaletteAction::ToggleOnTop => {
@@ -9353,6 +9369,9 @@ mod tests {
         // mark mode ships on the windows terminal chord and resolves by label
         assert!(has(cs, "m", PaletteAction::MarkMode));
         assert_eq!(action_from_label("mark mode"), Some(PaletteAction::MarkMode));
+        assert!(has(cs, "a", PaletteAction::SelectAll));
+        assert_eq!(action_from_label("select all"), Some(PaletteAction::SelectAll));
+        assert!(has(ctrl | ModifiersState::ALT, "a", PaletteAction::JumpAttention));
         // label resolution covers palette + keybinding-only + select-tab
         assert_eq!(action_from_label("new tab"), Some(PaletteAction::NewTab));
         assert_eq!(action_from_label("reopen closed tab"), Some(PaletteAction::ReopenTab));
