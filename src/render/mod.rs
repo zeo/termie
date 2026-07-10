@@ -2790,8 +2790,12 @@ impl Renderer {
         let mut run_buf = String::new();
         for r in 0..grid.rows {
             let line = grid.line_at(r);
-            // cells whose glyph a ligature strip already covers this row
+            // cells whose glyph a ligature strip already covers this row; the
+            // strip instance itself is held back until the run's LAST cell so
+            // it lands after every covered cell's bg/selection rects (pushed
+            // per cell, later in the vec, and thus painted over it otherwise)
             let mut liga_until = 0usize;
+            let mut liga_strip: Option<Instance> = None;
             for c in 0..grid.cols {
                 let cell = line.get(c).copied().unwrap_or_default();
                 if cell.attrs.hidden {
@@ -2903,9 +2907,14 @@ impl Renderer {
                     // box-drawing / block glyphs are drawn procedurally so they
                     // tile seamlessly (font glyphs leave gaps at cell edges)
                     if c < liga_until {
-                        // this cell's glyph is inside the run strip pushed at
-                        // the run's first cell; bg/cursor/decorations above
-                        // and below stay per-cell
+                        // inside a run: the strip flushes at the last covered
+                        // cell, after its bg/selection; per-cell decorations
+                        // still draw in their own iterations
+                        if c + 1 == liga_until
+                            && let Some(strip) = liga_strip.take()
+                        {
+                            out.push(strip);
+                        }
                     } else if Self::draw_box(out, x, y, cell_w, cell_h, cell.c, fg) {
                         // handled
                     } else {
@@ -2939,7 +2948,7 @@ impl Renderer {
                             run_buf.extend(line[c..c + run_len].iter().map(|n| n.c));
                             if let Some(g) = atlas.get_run(&run_buf, cell.attrs.bold, cell.attrs.italic) {
                                 let lin = fg.to_linear_f32();
-                                out.push(Instance {
+                                liga_strip = Some(Instance {
                                     pos: [x + g.left, y + ascent - g.top],
                                     size: [g.width, g.height],
                                     uv_min: g.uv_min,
@@ -5456,6 +5465,53 @@ mod tests {
         let per_cell = draw(false, &mut atlas);
         let ligated = draw(true, &mut atlas);
         assert_eq!(ligated, per_cell - 2, "three run cells collapse into one strip");
+    }
+
+    // a run over colored backgrounds must flush its strip AFTER every covered
+    // cell's bg rect, or the later rects wash the ligature's tail (instances
+    // paint in vec order); regression for the adversarial-review P1
+    #[test]
+    fn ligature_strip_paints_over_covered_cell_backgrounds() {
+        let mut term = Terminal::new(2, 8);
+        let mut p = vte::Parser::new();
+        p.advance(&mut term, b"\x1b[41m==>\x1b[0m");
+        let mut atlas = GlyphAtlas::new(14.0, 12.5, 1.0, None, 1.32);
+        let palette = Palette::from_theme(ThemeId::Instrument);
+        let mut out = Vec::new();
+        Renderer::draw_grid(
+            &mut atlas,
+            &palette,
+            &mut out,
+            &term,
+            0.0,
+            0.0,
+            true,
+            true,
+            true,
+            2.0,
+            CursorShape::Block,
+            None,
+            None,
+            &[],
+            true,
+            1.0,
+            true,
+        );
+        let cell_w = atlas.metrics(super::FontId::Content).cell_w;
+        let cell_h = atlas.metrics(super::FontId::Content).cell_h;
+        let strip = out
+            .iter()
+            .position(|i| i.kind == 1 && i.size[0] > cell_w * 2.5)
+            .expect("the ==> run renders as one strip");
+        // the red bg rects of all three covered cells precede the strip
+        let last_run_bg = out
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.kind == 0 && i.pos[1] < cell_h * 0.5 && i.pos[0] < cell_w * 2.5)
+            .map(|(j, _)| j)
+            .max()
+            .expect("bg rects present");
+        assert!(last_run_bg < strip, "bg {last_run_bg} must precede strip {strip}");
     }
 
     #[test]
