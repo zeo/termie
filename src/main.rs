@@ -2786,6 +2786,9 @@ struct App {
     /// keybindings.conf lines ignored at load; surfaced once as a status notice
     /// after the first frame (the renderer doesn't exist yet at load time)
     kb_ignored: usize,
+    /// last known-good window bounds, refreshed whenever the session is marked
+    /// dirty; the fallback when a save fires while the window is minimized
+    last_window_bounds: Option<session::WindowBounds>,
     settings_anim: Option<Instant>,
     /// set when the focused pane changes, so its accent border eases in instead
     /// of snapping; cleared once the ease settles
@@ -2931,6 +2934,7 @@ impl App {
             mods: ModifiersState::empty(),
             keybindings,
             kb_ignored,
+            last_window_bounds: None,
             shown: false,
             pool: Vec::new(),
             selection: None,
@@ -5824,23 +5828,29 @@ impl App {
             let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
             tabs.push(session::TabSnap { focused_leaf, root, title: tab.title.clone() });
         }
-        // capture the window's outer position + inner size for next launch; skip a
-        // minimized/degenerate window so its zero size can't clobber good bounds
-        let window = main.window.as_ref().and_then(|w| {
-            let size = w.inner_size();
-            if size.width == 0 || size.height == 0 {
-                return None;
-            }
-            let pos = w.outer_position().ok()?;
-            Some(session::WindowBounds {
-                x: pos.x,
-                y: pos.y,
-                width: size.width,
-                height: size.height,
-                maximized: w.is_maximized(),
-            })
-        });
+        // capture the window's outer position + inner size for next launch; a
+        // minimized window reports zero size, so fall back to the last good
+        // bounds instead of writing a session with no window key (which would
+        // silently reset placement after a quit-while-minimized)
+        let window = self.live_window_bounds().or_else(|| self.last_window_bounds.clone());
         session::SessionFile { active_tab: main.active_tab, tabs, window }
+    }
+
+    /// the main window's current bounds, or None while minimized/degenerate
+    fn live_window_bounds(&self) -> Option<session::WindowBounds> {
+        let w = self.main_pw().window.as_ref()?;
+        let size = w.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let pos = w.outer_position().ok()?;
+        Some(session::WindowBounds {
+            x: pos.x,
+            y: pos.y,
+            width: size.width,
+            height: size.height,
+            maximized: w.is_maximized(),
+        })
     }
 
     /// mark the layout changed and (re)arm the debounced session write so a burst
@@ -5850,6 +5860,11 @@ impl App {
         // debounce timer for it
         if self.session_ephemeral {
             return;
+        }
+        // remember the bounds while they're real, so a save that fires while
+        // minimized still has something good to persist
+        if let Some(b) = self.live_window_bounds() {
+            self.last_window_bounds = Some(b);
         }
         self.session_dirty = true;
         self.session_flush_at = Some(Instant::now() + Duration::from_millis(750));

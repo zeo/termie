@@ -18,6 +18,7 @@ pub struct SessionFile {
 
 /// saved outer position + inner size of the window (physical pixels), plus
 /// whether it was maximized
+#[derive(Clone)]
 pub struct WindowBounds {
     pub x: i32,
     pub y: i32,
