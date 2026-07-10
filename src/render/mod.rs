@@ -3860,6 +3860,7 @@ impl Renderer {
         let RULE_2 = self.palette.rule2;
         let TEXT_2 = self.palette.text2;
         let MUTE = self.palette.mute;
+        let PAPER = self.palette.paper;
         let s = self.scale;
         let hair = s.max(1.0);
         let w = self.config.width as f32;
@@ -3874,8 +3875,6 @@ impl Renderer {
         Self::stroke_rect(out, (bx, by, bw, bh), hair, RULE_2);
         let pad = 16.0 * s;
         let iy = (by + 4.0 * s + (row_h - chrome_h) / 2.0).round();
-        let prompt = format!("\u{f002}  {}", query);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, iy, &prompt, TEXT_2, 1.0, track);
         let info = if count == 0 {
             if query.is_empty() {
                 String::new()
@@ -3885,8 +3884,28 @@ impl Renderer {
         } else {
             format!("{}/{}", current + 1, count)
         };
+        let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Chrome, &info, track) };
+        // elide the head of an overlong query so the tail being typed stays
+        // visible and never collides with the match counter
+        let avail = bw - 2.0 * pad - iw - 16.0 * s;
+        let mut prompt = format!("\u{f002}  {}", query);
+        if self.text_w(FontId::Chrome, &prompt, track) > avail {
+            let mut tail = query.as_str();
+            loop {
+                let mut it = tail.chars();
+                it.next();
+                tail = it.as_str();
+                prompt = format!("\u{f002}  \u{2026}{}", tail);
+                if tail.is_empty() || self.text_w(FontId::Chrome, &prompt, track) <= avail {
+                    break;
+                }
+            }
+        }
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, iy, &prompt, TEXT_2, 1.0, track);
+        // caret block after the query, same as the palette input
+        let cwid = self.text_w(FontId::Chrome, &prompt, track);
+        Self::push_rect(out, bx + pad + cwid + 2.0 * s, iy, 2.0 * s, chrome_h, PAPER, 1.0);
         if !info.is_empty() {
-            let iw = self.text_w(FontId::Chrome, &info, track);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + bw - pad - iw, iy, &info, MUTE, 1.0, track);
         }
     }

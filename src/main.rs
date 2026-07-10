@@ -3091,11 +3091,30 @@ impl App {
     }
 
     fn open_find(&mut self) {
+        // a single-line selection on the focused pane seeds the query, the
+        // way editors prefill find; multi-line selections don't make sense
+        // as a substring search so they leave the box empty
+        let seed = self
+            .selection
+            .filter(|s| Some(s.pane) == self.active_focused_id())
+            .and_then(|s| {
+                self.pw.tabs
+                    .get(self.pw.active_tab)
+                    .and_then(|t| t.root.as_ref())
+                    .and_then(|r| find_pane(r, s.pane))
+                    .map(|p| p.term.grid.selected_text(s.start, s.end, s.block))
+            })
+            .filter(|t| !t.is_empty() && !t.contains('\n') && t.chars().count() <= 128)
+            .unwrap_or_default();
+        let seeded = !seed.is_empty();
         self.find = Some(FindState {
-            query: String::new(),
+            query: seed,
             matches: Vec::new(),
             current: 0,
         });
+        if seeded {
+            self.find_recompute();
+        }
         self.redraw();
     }
 
