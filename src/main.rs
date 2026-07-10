@@ -4565,6 +4565,34 @@ impl App {
         }
     }
 
+    /// IME lifecycle for whichever window is swapped into self.pw: the preedit
+    /// draws inline until the composition commits or cancels
+    fn on_ime(&mut self, ime: Ime) {
+        match ime {
+            Ime::Enabled => {}
+            Ime::Preedit(text, cursor) => {
+                self.pw.ime_composing = !text.is_empty();
+                self.pw.ime_preedit = text;
+                self.pw.ime_preedit_caret = cursor;
+                self.apply_ime_area();
+                self.redraw();
+            }
+            Ime::Commit(text) => {
+                self.pw.ime_composing = false;
+                self.pw.ime_preedit.clear();
+                self.pw.ime_preedit_caret = None;
+                self.write_to_focused(text.as_bytes());
+                self.redraw();
+            }
+            Ime::Disabled => {
+                self.pw.ime_composing = false;
+                self.pw.ime_preedit.clear();
+                self.pw.ime_preedit_caret = None;
+                self.redraw();
+            }
+        }
+    }
+
     /// park the OS IME candidate window at the focused pane's cursor cell,
     /// advanced to the caret within an in-flight composition so the candidate
     /// list tracks the character being converted
@@ -6343,6 +6371,9 @@ impl App {
                 return;
             }
         };
+        // without this a torn-off window silently drops CJK input: the OS IME
+        // never engages, so no composition or commit ever reaches the pane
+        window.set_ime_allowed(true);
         let renderer = match render::Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend) {
             Ok(mut r) => {
                 r.set_theme(self.resolved_theme());
@@ -6500,7 +6531,11 @@ impl App {
                 if ke.state == ElementState::Pressed && self.input_at.is_none() {
                     self.input_at = Some(Instant::now());
                 }
-                if !self.handle_shortcut(&ke, event_loop) && ke.state == ElementState::Pressed {
+                // while composing, the IME owns text input (mirrors the main
+                // window's swallow; expressed without `return` so the pw
+                // swap-back below always runs)
+                let ime_owns = self.pw.ime_composing && ke.state == ElementState::Pressed;
+                if !ime_owns && !self.handle_shortcut(&ke, event_loop) && ke.state == ElementState::Pressed {
                     let id = self.active_focused_id();
                     let (app_cursor, kbd) = id
                         .and_then(|id| {
@@ -6550,6 +6585,7 @@ impl App {
                 }
                 self.paint();
             }
+            WindowEvent::Ime(ime) => self.on_ime(ime),
             // torn-off windows get the same mouse handling as the main window —
             // hover/selection/scroll/context-menu/title-bar — via the swapped-in
             // self.pw (close button + close-tab stay window-scoped through cur_sat)
@@ -8440,29 +8476,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.relayout_all();
                 self.redraw();
             }
-            WindowEvent::Ime(ime) => match ime {
-                Ime::Enabled => {}
-                Ime::Preedit(text, cursor) => {
-                    self.pw.ime_composing = !text.is_empty();
-                    self.pw.ime_preedit = text;
-                    self.pw.ime_preedit_caret = cursor;
-                    self.apply_ime_area();
-                    self.redraw();
-                }
-                Ime::Commit(text) => {
-                    self.pw.ime_composing = false;
-                    self.pw.ime_preedit.clear();
-                    self.pw.ime_preedit_caret = None;
-                    self.write_to_focused(text.as_bytes());
-                    self.redraw();
-                }
-                Ime::Disabled => {
-                    self.pw.ime_composing = false;
-                    self.pw.ime_preedit.clear();
-                    self.pw.ime_preedit_caret = None;
-                    self.redraw();
-                }
-            },
+            WindowEvent::Ime(ime) => self.on_ime(ime),
             WindowEvent::KeyboardInput { event, .. } => {
                 // while composing, the IME owns text input; swallow only key
                 // presses (releases must pass so kitty release-reporting + held
