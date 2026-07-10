@@ -279,6 +279,6 @@ fn image_benches(filter: &Option<String>) {
     bench("image_decode_rgb_256", filter, Some(data.len()), 2000, || {
         let mut store = ImageStore::default();
         id = id.wrapping_add(1).max(1);
-        black_box(store.transmit(id, 24, w, h, false, black_box(&data)));
+        black_box(store.transmit(id, 24, w, h, false, None, black_box(&data)));
     });
 }

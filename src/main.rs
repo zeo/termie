@@ -2067,21 +2067,26 @@ fn pump_bytes(pane: &mut Pane, bytes: &[u8]) {
 }
 
 /// apply a kitty graphics command to a pane's terminal: store/decode images,
-/// anchor placements at the cursor, delete, and queue the APC ack
+/// anchor placements at the cursor and step the cursor past the box (the
+/// spec's default movement policy; C=1 leaves it), delete, and queue the ack
 fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
     match cmd.action {
         b't' | b'T' => {
-            // the display intent (and its c=/r= box) belongs to the a=T chunk;
-            // the store carries it across a chunked transfer, whose completing
-            // chunk parses with the default action
+            // the display intent (its c=/r= box and cursor policy) belongs to
+            // the a=T chunk; the store carries it across a chunked transfer,
+            // whose completing chunk parses with the default action
             let display = (cmd.action == b'T')
-                .then(|| (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16));
+                .then(|| (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16, !cmd.no_cursor_move));
             if let Some((id, disp)) = term
                 .images
                 .transmit(cmd.id, cmd.format, cmd.width, cmd.height, cmd.more, display, &cmd.payload)
             {
-                if let Some((c, r)) = disp {
+                if let Some((c, r, step)) = disp {
                     term.grid.place_image(id, c, r);
+                    let dims = term.images.get(id).map(|i| (i.width, i.height));
+                    if step && let Some((w, h)) = dims {
+                        term.advance_cursor_past_image(w, h, c, r);
+                    }
                 }
                 // ack with the resolved id (an i=0 transmit gets an auto id)
                 if cmd.quiet == 0 {
@@ -2090,8 +2095,13 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
             }
         }
         b'p' => {
-            if term.images.get(cmd.id).is_some() {
-                term.grid.place_image(cmd.id, cmd.cols.min(500) as u16, cmd.rows.min(500) as u16);
+            let dims = term.images.get(cmd.id).map(|i| (i.width, i.height));
+            if let Some((w, h)) = dims {
+                let (c, r) = (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16);
+                term.grid.place_image(cmd.id, c, r);
+                if !cmd.no_cursor_move {
+                    term.advance_cursor_past_image(w, h, c, r);
+                }
                 if cmd.quiet == 0 {
                     kitty_ok(term, cmd.id);
                 }
@@ -10464,12 +10474,15 @@ mod tests {
             cols: 3,
             rows: 2,
             more: false,
+            no_cursor_move: false,
             quiet: 0,
             payload: vec![1, 2, 3, 4],
         };
         handle_kitty(&mut term, &cmd);
         assert_eq!(term.grid.placements().len(), 1);
         assert_eq!((term.grid.placements()[0].cols, term.grid.placements()[0].rows), (3, 2));
+        // the cursor steps past the box like text: right 3, down onto row 2's last line
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 3));
         assert!(!term.responses.is_empty(), "OK ack should be queued");
         // bare a=d (no id) deletes all placements
         let del = apc::KittyCmd {
@@ -10481,10 +10494,98 @@ mod tests {
             cols: 0,
             rows: 0,
             more: false,
+            no_cursor_move: false,
             quiet: 0,
             payload: vec![],
         };
         handle_kitty(&mut term, &del);
         assert!(term.grid.placements().is_empty());
+    }
+
+    fn kitty_display(id: u32, cols: u32, rows: u32, no_move: bool) -> apc::KittyCmd {
+        apc::KittyCmd {
+            action: b'T',
+            format: 32,
+            width: 1,
+            height: 1,
+            id,
+            cols,
+            rows,
+            more: false,
+            no_cursor_move: no_move,
+            quiet: 2,
+            payload: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn kitty_cursor_policy_c1_scroll_and_wrap() {
+        // C=1: the cursor must not move at all
+        let mut term = term::Terminal::new(4, 8);
+        handle_kitty(&mut term, &kitty_display(1, 3, 2, true));
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (0, 0));
+
+        // a 3-row box placed on the bottom row scrolls two lines, exactly like
+        // printing three lines of text there would
+        let mut term = term::Terminal::new(4, 8);
+        term.grid.cursor.row = 3;
+        handle_kitty(&mut term, &kitty_display(2, 2, 3, false));
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (3, 2));
+        assert_eq!(term.grid.scrollback.len(), 2, "the advance scrolled");
+        // the placement anchor scrolled up with its surrounding text
+        assert_eq!(term.grid.placements()[0].abs_line, 3);
+
+        // a box crossing the right edge wraps to column 0 one row further down
+        let mut term = term::Terminal::new(4, 8);
+        term.grid.cursor.col = 6;
+        handle_kitty(&mut term, &kitty_display(3, 3, 1, false));
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 0));
+    }
+
+    #[test]
+    fn kitty_chunked_transfer_advances_once_on_completion() {
+        let mut term = term::Terminal::new(6, 20);
+        // first chunk carries a=T + the box; more=1 so nothing shows yet
+        let mut first = kitty_display(9, 4, 2, false);
+        first.more = true;
+        first.payload = vec![1, 2];
+        handle_kitty(&mut term, &first);
+        assert!(term.grid.placements().is_empty());
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (0, 0));
+        // the completing chunk parses with default action 't' and no box; the
+        // stored display intent must still place AND step the cursor
+        let done = apc::KittyCmd {
+            action: b't',
+            format: 0,
+            width: 0,
+            height: 0,
+            id: 9,
+            cols: 0,
+            rows: 0,
+            more: false,
+            no_cursor_move: false,
+            quiet: 2,
+            payload: vec![3, 4],
+        };
+        handle_kitty(&mut term, &done);
+        assert_eq!(term.grid.placements().len(), 1);
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 4));
+    }
+
+    #[test]
+    fn kitty_put_advances_and_falls_back_to_pixel_size() {
+        let mut term = term::Terminal::new(6, 20);
+        // store without displaying (a=t), then a=p with no c=/r= box: the
+        // advance derives 1 cell from the 1x1 px image over the assumed cell
+        let mut store = kitty_display(5, 0, 0, false);
+        store.action = b't';
+        handle_kitty(&mut term, &store);
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (0, 0));
+        let mut put = kitty_display(5, 0, 0, false);
+        put.action = b'p';
+        put.payload = vec![];
+        handle_kitty(&mut term, &put);
+        assert_eq!(term.grid.placements().len(), 1);
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (0, 1));
     }
 }

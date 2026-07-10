@@ -227,6 +227,30 @@ impl Terminal {
         self.cell_px
     }
 
+    /// kitty cursor-movement policy after a placement: right by the box's
+    /// columns and down onto its LAST row (not past it), wrapping at the right
+    /// edge and scrolling past the bottom margin exactly like printed text.
+    /// cols/rows of 0 fall back to the image's pixel size over the cell size
+    /// (assumed 10x20 until the renderer attaches, like the sixel path)
+    pub fn advance_cursor_past_image(&mut self, px_w: u32, px_h: u32, cols: u16, rows: u16) {
+        let cw = if self.cell_px.0 > 0 { self.cell_px.0 as usize } else { 10 };
+        let ch = if self.cell_px.1 > 0 { self.cell_px.1 as usize } else { 20 };
+        let cols_eff = if cols > 0 { cols as usize } else { (px_w as usize).div_ceil(cw) };
+        let rows_eff = if rows > 0 { rows as usize } else { (px_h as usize).div_ceil(ch) };
+        let mut down = rows_eff.saturating_sub(1);
+        let col = self.grid.cursor.col + cols_eff;
+        if col >= self.grid.cols {
+            self.grid.cursor.col = 0;
+            down += 1;
+        } else {
+            self.grid.cursor.col = col;
+        }
+        for _ in 0..down {
+            self.grid.linefeed();
+        }
+        self.grid.cursor.wrap_pending = false;
+    }
+
     fn map_charset(&self, c: char) -> char {
         let active = if self.gl == 0 { self.g0 } else { self.g1 };
         if active == Charset::DecGraphics {

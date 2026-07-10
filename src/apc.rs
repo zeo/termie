@@ -126,6 +126,8 @@ pub struct KittyCmd {
     pub rows: u32,
     /// m=1: more chunks of this image follow
     pub more: bool,
+    /// C=1: leave the cursor where it is instead of stepping past the placement
+    pub no_cursor_move: bool,
     /// q: 0 = all responses, 1 = errors only, 2 = silent
     pub quiet: u8,
     /// the base64-decoded image bytes for this chunk
@@ -154,6 +156,7 @@ impl KittyCmd {
             cols: 0,
             rows: 0,
             more: false,
+            no_cursor_move: false,
             quiet: 0,
             payload: Vec::new(),
         };
@@ -174,6 +177,7 @@ impl KittyCmd {
                 b"c" => cmd.cols = vs.parse().ok()?,
                 b"r" => cmd.rows = vs.parse().ok()?,
                 b"m" => cmd.more = vs == "1",
+                b"C" => cmd.no_cursor_move = vs == "1",
                 b"q" => cmd.quiet = vs.parse().unwrap_or(0),
                 _ => {}
             }
@@ -324,8 +328,11 @@ mod tests {
         // the RGBA default)
         let d = KittyCmd::parse(b"G").expect("bare G");
         assert_eq!((d.action, d.format, d.width, d.id, d.more, d.quiet), (b't', 0, 0, 0, false, 0));
+        assert!(!d.no_cursor_move); // cursor movement is the default policy
         let q = KittyCmd::parse(b"Ga=q,q=2;").expect("query");
         assert_eq!((q.action, q.quiet), (b'q', 2));
+        let still = KittyCmd::parse(b"Ga=T,C=1;AAAA").expect("C=1");
+        assert!(still.no_cursor_move);
         assert!(KittyCmd::parse(b"Gf=notanumber;AAAA").is_none()); // bad int -> None
         assert!(KittyCmd::parse(b"Zfoo").is_none()); // not a G payload
     }

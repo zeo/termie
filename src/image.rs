@@ -67,14 +67,18 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// a display request from an a=T chunk: the c=/r= cell box plus whether the
+/// cursor steps past the placement (the kitty C= movement policy)
+pub type DisplayReq = (u16, u16, bool);
+
 struct Pending {
     format: u32,
     width: u32,
     height: u32,
-    /// display request (c=, r= cell box) captured from the chunk that carried
-    /// a=T — continuation chunks parse with the default action, so the intent
-    /// must survive until the transfer completes
-    display: Option<(u16, u16)>,
+    /// display request captured from the chunk that carried a=T — continuation
+    /// chunks parse with the default action, so the intent must survive until
+    /// the transfer completes
+    display: Option<DisplayReq>,
     data: Vec<u8>,
 }
 
@@ -106,9 +110,9 @@ impl ImageStore {
         width: u32,
         height: u32,
         more: bool,
-        display: Option<(u16, u16)>,
+        display: Option<DisplayReq>,
         chunk: &[u8],
-    ) -> Option<(u32, Option<(u16, u16)>)> {
+    ) -> Option<(u32, Option<DisplayReq>)> {
         let anonymous = id == 0;
         let id = if anonymous {
             match self.anon {
