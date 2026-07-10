@@ -279,6 +279,8 @@ enum PaletteAction {
     JumpAttention,
     /// keep this window above every other (toggles; quake uses its own level)
     ToggleOnTop,
+    /// open the searchable font picker over installed monospace families
+    FontPicker,
     /// keyboard scrollback: a page (or straight to an end) of history
     ScrollPageUp,
     ScrollPageDown,
@@ -312,6 +314,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("mark mode", PaletteAction::MarkMode),
     ("jump to attention", PaletteAction::JumpAttention),
     ("always on top", PaletteAction::ToggleOnTop),
+    ("choose font", PaletteAction::FontPicker),
     ("zoom pane", PaletteAction::ToggleZoom),
     ("toggle fullscreen", PaletteAction::ToggleFullscreen),
     ("rename tab", PaletteAction::RenameTab),
@@ -2397,6 +2400,12 @@ struct App {
     /// happens when a pane's OSC 9;4 progress actually changes
     taskbar_sent: (u8, u8),
     palette: Option<PaletteState>,
+    /// searchable font-picker overlay (reuses the palette box); Some while open
+    font_pick: Option<PaletteState>,
+    /// installed monospace families, loaded lazily on first open
+    font_families: Vec<String>,
+    /// the font in use when the picker opened, restored if the pick is cancelled
+    font_pick_orig: Option<String>,
     find: Option<FindState>,
     /// regex mode for the find bar; remembered across open/close (toggled by
     /// the .* button or Alt+R while find is open)
@@ -2570,6 +2579,9 @@ impl App {
             click_seq: 0,
             taskbar_sent: (0, 0),
             palette: None,
+            font_pick: None,
+            font_families: Vec::new(),
+            font_pick_orig: None,
             find: None,
             find_regex: false,
             a11y: None,
@@ -3311,6 +3323,94 @@ impl App {
         find_pane_mut(root, id).map(|p| &mut p.term.grid)
     }
 
+    /// open the font picker: a searchable list of every installed monospace
+    /// family, previewed live as you move through it, committed on Enter and
+    /// reverted on Esc. reuses the command-palette overlay box
+    fn open_font_picker(&mut self) {
+        if self.font_families.is_empty() {
+            // the system-font scan is deferred to about_to_wait; force it now
+            // so the very first open still has the full list
+            if let Some(r) = self.pw.renderer.as_mut() {
+                r.ensure_system_fonts();
+                self.font_families = r.monospace_families();
+            }
+        }
+        if self.font_families.is_empty() {
+            self.show_notice("no monospace fonts found");
+            return;
+        }
+        self.font_pick_orig =
+            self.pw.renderer.as_ref().map(|r| r.font_name().to_string());
+        self.font_pick = Some(PaletteState { query: String::new(), selected: 0 });
+        // start the highlight on the current font if it's in the list
+        if let Some(cur) = self.font_pick_orig.as_deref() {
+            let list = self.font_pick_filter("");
+            if let Some(i) = list.iter().position(|f| f.eq_ignore_ascii_case(cur))
+                && let Some(p) = self.font_pick.as_mut()
+            {
+                p.selected = i;
+            }
+        }
+        self.redraw();
+    }
+
+    /// monospace families matching the picker query (fuzzy, best-first);
+    /// empty query returns the full list
+    fn font_pick_filter(&self, query: &str) -> Vec<String> {
+        let q = query.trim();
+        if q.is_empty() {
+            return self.font_families.clone();
+        }
+        let mut scored: Vec<(i32, &String)> = self
+            .font_families
+            .iter()
+            .filter_map(|f| fuzzy_score(q, &f.to_ascii_lowercase()).map(|s| (s, f)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored.into_iter().map(|(_, f)| f.clone()).collect()
+    }
+
+    /// preview the highlighted font without committing (live as you navigate)
+    fn font_pick_preview(&mut self) {
+        let Some(p) = self.font_pick.as_ref() else {
+            return;
+        };
+        let list = self.font_pick_filter(&p.query);
+        let Some(name) = list.get(p.selected).cloned() else {
+            return;
+        };
+        if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_font_by_name(&name);
+        }
+        self.relayout_all();
+        self.redraw();
+    }
+
+    /// commit (Some) or cancel (None, restoring the original) the font pick
+    fn close_font_picker(&mut self, commit: bool) {
+        let orig = self.font_pick_orig.take();
+        let picked = self.font_pick.take();
+        let chosen = if commit {
+            picked.and_then(|p| self.font_pick_filter(&p.query).get(p.selected).cloned())
+        } else {
+            None
+        };
+        if let Some(name) = chosen {
+            if let Some(r) = self.pw.renderer.as_mut() {
+                r.set_font_by_name(&name);
+            }
+            self.persisted.font = Some(name);
+            self.relayout_all();
+            self.save_config();
+        } else if let (Some(name), Some(r)) = (orig, self.pw.renderer.as_mut()) {
+            // cancel, or enter with nothing under the highlight: revert the
+            // live preview to the font that was active when the picker opened
+            r.set_font_by_name(&name);
+            self.relayout_all();
+        }
+        self.redraw();
+    }
+
     fn open_find(&mut self) {
         // a single-line selection on the focused pane seeds the query, the
         // way editors prefill find; multi-line selections don't make sense
@@ -3702,14 +3802,24 @@ impl App {
         let focus_ease = self.focus_ease();
         let git = self.pw.git.clone();
         let sessions = self.pw.tabs.len();
-        let palette_view = self.palette.as_ref().map(|p| render::PaletteView {
+        // the font picker reuses the palette overlay box: when it's open, feed
+        // build_palette the filtered font list instead of the action list
+        let palette_view = if let Some(fp) = self.font_pick.as_ref() {
+            Some(render::PaletteView {
+                query: fp.query.clone(),
+                items: self.font_pick_filter(&fp.query),
+                selected: fp.selected,
+            })
+        } else {
+            self.palette.as_ref().map(|p| render::PaletteView {
             query: p.query.clone(),
             items: palette_filter(&p.query)
                 .into_iter()
                 .map(|(l, _)| l.to_string())
                 .collect(),
             selected: p.selected,
-        });
+            })
+        };
         let find_view = self.build_find_view();
         let market_view = self.market.as_ref().map(|m| render::MarketView {
             rows: m
@@ -4348,6 +4458,7 @@ impl App {
             PaletteAction::PaneMode => self.set_pane_mode(true),
             PaletteAction::MarkMode => self.set_mark_mode(true),
             PaletteAction::JumpAttention => self.jump_attention(),
+            PaletteAction::FontPicker => self.open_font_picker(),
             PaletteAction::ToggleOnTop => {
                 self.pw.on_top = !self.pw.on_top;
                 if let Some(w) = self.pw.window.as_ref() {
@@ -4964,11 +5075,9 @@ impl App {
                 self.redraw();
             }
             Hot::FontCycle => {
-                if let Some(r) = self.pw.renderer.as_mut() {
-                    r.cycle_font();
-                }
-                self.relayout_all();
-                self.redraw();
+                // the settings FONT control opens the searchable picker over
+                // every installed monospace family (was: cycle a hardcoded few)
+                self.open_font_picker();
             }
             Hot::PadDec | Hot::PadInc => {
                 let d = if hot == Hot::PadInc { 2.0 } else { -2.0 };
@@ -5982,6 +6091,18 @@ impl App {
             }
             return;
         }
+        // hovering the font picker previews the font under the pointer
+        if self.font_pick.is_some() {
+            if let Some(i) = self.pw.renderer.as_ref().and_then(|r| r.palette_row_at(px, py))
+                && self.font_pick.as_ref().map(|p| p.selected) != Some(i)
+            {
+                if let Some(p) = self.font_pick.as_mut() {
+                    p.selected = i;
+                }
+                self.font_pick_preview();
+            }
+            return;
+        }
         // while the pane menu is open, only track which item is hovered
         if self.pw.pane_menu.is_some() {
             let h = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
@@ -6220,6 +6341,24 @@ impl App {
                 if self.market.is_some() {
                     if state == ElementState::Pressed {
                         self.market_click(cx, cy);
+                    }
+                    return;
+                }
+                // the font picker owns every click: a row commits that font,
+                // anywhere else cancels back to the original
+                if self.font_pick.is_some() {
+                    if state == ElementState::Pressed {
+                        let row = self.pw.renderer.as_ref().and_then(|r| r.palette_row_at(cx, cy));
+                        let inside =
+                            self.pw.renderer.as_ref().is_some_and(|r| r.palette_contains(cx, cy));
+                        if let Some(i) = row {
+                            if let Some(p) = self.font_pick.as_mut() {
+                                p.selected = i;
+                            }
+                            self.close_font_picker(true);
+                        } else if !inside {
+                            self.close_font_picker(false);
+                        }
                     }
                     return;
                 }
@@ -6813,6 +6952,55 @@ impl App {
                                 }
                                 self.find_recompute();
                             }
+                }
+            }
+            return true;
+        }
+        // the font picker captures every key while open (preview live, commit
+        // on Enter, cancel on Esc — reuses the palette overlay box)
+        if self.font_pick.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => self.close_font_picker(false),
+                Key::Named(NamedKey::Enter) => self.close_font_picker(true),
+                Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
+                    let down = matches!(&event.logical_key, Key::Named(NamedKey::ArrowDown));
+                    let len = self
+                        .font_pick
+                        .as_ref()
+                        .map(|p| self.font_pick_filter(&p.query).len())
+                        .unwrap_or(0);
+                    if let Some(p) = self.font_pick.as_mut()
+                        && len > 0
+                    {
+                        p.selected = if down {
+                            (p.selected + 1) % len
+                        } else {
+                            (p.selected + len - 1) % len
+                        };
+                    }
+                    self.font_pick_preview();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(p) = self.font_pick.as_mut() {
+                        p.query.pop();
+                        p.selected = 0;
+                    }
+                    self.font_pick_preview();
+                }
+                _ => {
+                    if !self.mods.control_key()
+                        && !self.mods.alt_key()
+                        && let Some(t) = event.text.as_ref()
+                        && !t.is_empty()
+                        && !t.chars().any(|c| c.is_control())
+                    {
+                        let t = t.to_string();
+                        if let Some(p) = self.font_pick.as_mut() {
+                            p.query.push_str(&t);
+                            p.selected = 0;
+                        }
+                        self.font_pick_preview();
+                    }
                 }
             }
             return true;
@@ -8066,6 +8254,38 @@ mod tests {
         // a stale reflow generation hides the selection instead of lying
         let stale = Sel { reflow_gen: sel.reflow_gen.wrapping_add(1), ..sel };
         assert!(sel_view_span(&g, &stale).is_none());
+    }
+
+    #[test]
+    fn font_pick_filter_ranks_and_matches() {
+        let mut app_families =
+            vec!["Cascadia Code".to_string(), "Cascadia Mono".to_string(), "Consolas".to_string(), "JetBrains Mono".to_string()];
+        app_families.sort();
+        // empty query returns the whole list; a query fuzzy-filters + ranks
+        let full = filter_fonts(&app_families, "");
+        assert_eq!(full.len(), 4);
+        // fuzzy (subsequence) matching, so every result must contain the query
+        // chars in order; the two Cascadia families both prefix-match "casc"
+        let casc = filter_fonts(&app_families, "casc");
+        assert_eq!(casc.len(), 2);
+        assert!(casc.iter().all(|f| f.starts_with("Cascadia")));
+        // "jbm" scattered-matches "JetBrains Mono" only
+        assert_eq!(filter_fonts(&app_families, "jbm"), vec!["JetBrains Mono".to_string()]);
+        assert!(filter_fonts(&app_families, "zzz").is_empty());
+    }
+
+    // mirror of App::font_pick_filter without the renderer, for the unit test
+    fn filter_fonts(families: &[String], query: &str) -> Vec<String> {
+        let q = query.trim();
+        if q.is_empty() {
+            return families.to_vec();
+        }
+        let mut scored: Vec<(i32, &String)> = families
+            .iter()
+            .filter_map(|f| fuzzy_score(q, &f.to_ascii_lowercase()).map(|s| (s, f)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored.into_iter().map(|(_, f)| f.clone()).collect()
     }
 
     #[test]

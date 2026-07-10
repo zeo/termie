@@ -1750,6 +1750,12 @@ impl Renderer {
         self.fonts[self.font_idx]
     }
 
+    /// every installed monospace family, for the font picker (empty until the
+    /// system-font scan has run)
+    pub fn monospace_families(&self) -> Vec<String> {
+        self.atlas.monospace_families()
+    }
+
     /// the bundled default plus any common monospace families present in the db
     fn detect_fonts(atlas: &GlyphAtlas) -> Vec<&'static str> {
         let mut fonts: Vec<&'static str> = vec![atlas.content_family()];
@@ -1813,18 +1819,6 @@ impl Renderer {
                 self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, self.content_line_height);
                 self.recompute_grid_size();
             }
-        (self.cols, self.rows)
-    }
-
-    /// switch to the next available content font; returns new (cols, rows)
-    pub fn cycle_font(&mut self) -> (usize, usize) {
-        if self.fonts.len() > 1 {
-            self.font_idx = (self.font_idx + 1) % self.fonts.len();
-            // index 0 is the bundled default (use None so the atlas picks it)
-            self.content_font = if self.font_idx == 0 { None } else { Some(self.fonts[self.font_idx]) };
-            self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, self.content_line_height);
-            self.recompute_grid_size();
-        }
         (self.cols, self.rows)
     }
 

@@ -172,6 +172,23 @@ impl GlyphAtlas {
         family_present(&self.font_system, name)
     }
 
+    /// every installed monospace family name, sorted and de-duplicated —
+    /// what the font picker offers. only meaningful after load_system_fonts
+    pub fn monospace_families(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .font_system
+            .db()
+            .faces()
+            .filter(|f| f.monospaced)
+            .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+            // fontdb exposes @-prefixed vertical CJK variants; not pickable
+            .filter(|n| !n.starts_with('@'))
+            .collect();
+        names.sort_by_key(|n| n.to_ascii_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        names
+    }
+
     /// scan system fonts into the db on first call (deferred off the startup
     /// path). returns true only on the call that actually did the scan, so the
     /// caller can refresh anything derived from the font list
