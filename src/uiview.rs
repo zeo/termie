@@ -131,6 +131,11 @@ pub fn maybe_run() -> bool {
             r.set_plugins(vec![("tamagotchi".into(), true), ("relay".into(), false)]);
             r.scroll_settings(400.0);
         }
+        "preedit" => {
+            // the composition is cjk; headless captures skip the lazy system
+            // font scan the windowed app does, so tofu without this
+            r.ensure_system_fonts();
+        }
         _ => {}
     }
 
@@ -167,6 +172,11 @@ pub fn maybe_run() -> bool {
         let mut t = Terminal::new(rows.max(1), cols.max(1));
         let mut p = Parser::new();
         p.advance(&mut t, samples[i % samples.len()]);
+        if scene == "preedit" && i == 0 {
+            // park the cursor mid-line so the composition draws from a real
+            // prompt position, not col 0
+            p.advance(&mut t, b"\x1b[1;32m$\x1b[0m echo ");
+        }
         terms.push(t);
     }
 
@@ -184,7 +194,12 @@ pub fn maybe_run() -> bool {
             theme: None,
             // the attention scene also shows a pane's running badge
             status: if scene == "attention" && i == 1 { 1 } else { 0 },
-            preedit: None,
+            // a mid-conversion japanese composition: converted kanji head,
+            // active clause (thick line) on the trailing kana
+            preedit: (scene == "preedit" && i == 0).then_some(render::PreeditView {
+                text: "日本語にゅうりょく",
+                caret: Some((9, 27)),
+            }),
         })
         .collect();
 
