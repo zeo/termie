@@ -2965,6 +2965,7 @@ impl Renderer {
     /// and a caret bar marks the composition cursor. a run that would overflow
     /// the right edge slides left; wider than the pane, it keeps its tail —
     /// that end is where the caret almost always is
+    #[allow(clippy::too_many_arguments)] // pane geometry + composition state
     fn draw_preedit(
         atlas: &mut GlyphAtlas,
         palette: &Palette,
