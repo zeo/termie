@@ -392,14 +392,15 @@ fn all_palette_actions() -> &'static [(&'static str, PaletteAction)] {
 }
 
 /// fold the installed wsl distros into the profile list as synthetic
-/// "WSL: <name>" entries (wsl.exe -d <name>), skipping any that would collide
-/// with a user-defined profile of the same name
+/// "wsl: <name>" entries (wsl.exe -d <name>), one per distro. every distro gets
+/// its named entry (like windows terminal) so it's findable even when it's the
+/// default; a name a user profile already defines is left untouched
 fn with_wsl_profiles(
     mut profiles: Vec<(String, Vec<String>)>,
     distros: Vec<String>,
 ) -> Vec<(String, Vec<String>)> {
     for distro in distros {
-        let name = format!("WSL: {distro}");
+        let name = format!("wsl: {distro}");
         if !profiles.iter().any(|(n, _)| n == &name) {
             profiles.push((name, vec!["wsl.exe".to_string(), "-d".to_string(), distro]));
         }
@@ -2603,7 +2604,7 @@ impl App {
         let p = load_persisted();
         // install profiles before anything derives from them (palette entries,
         // shell labels in a restored session). each installed wsl distro joins
-        // the config profiles as a synthetic "WSL: <name>" so it appears in the
+        // the config profiles as a synthetic "wsl: <name>" so it appears in the
         // palette, jump list, and '+' dropdown; the global wsl_distro still sets
         // the default distro for the plain wsl shell
         pty::set_profiles(with_wsl_profiles(p.profiles.clone(), win::wsl_distros()));
@@ -8704,21 +8705,27 @@ mod tests {
     #[test]
     fn wsl_distros_become_synthetic_profiles() {
         let base = vec![("nu".to_string(), vec!["nu.exe".to_string()])];
-        let merged = with_wsl_profiles(base, vec!["Ubuntu".to_string(), "Arch".to_string()]);
-        // config profiles keep their slot; each distro appends as wsl.exe -d <name>
-        assert_eq!(merged.len(), 3);
+        let merged = with_wsl_profiles(
+            base,
+            vec!["Ubuntu".to_string(), "Arch".to_string(), "Ubuntu 22.04 LTS".to_string()],
+        );
+        // config profiles keep their slot; every distro appends unconditionally
+        // as wsl.exe -d <name>, and a name with spaces round-trips as one argv
+        assert_eq!(merged.len(), 4);
         assert_eq!(merged[0].0, "nu");
-        assert_eq!(merged[1].0, "WSL: Ubuntu");
+        assert_eq!(merged[1].0, "wsl: Ubuntu");
         assert_eq!(merged[1].1, ["wsl.exe", "-d", "Ubuntu"]);
         assert_eq!(
             merged[2],
-            ("WSL: Arch".to_string(), vec!["wsl.exe".to_string(), "-d".to_string(), "Arch".to_string()])
+            ("wsl: Arch".to_string(), vec!["wsl.exe".to_string(), "-d".to_string(), "Arch".to_string()])
         );
+        assert_eq!(merged[3].0, "wsl: Ubuntu 22.04 LTS");
+        assert_eq!(merged[3].1, ["wsl.exe", "-d", "Ubuntu 22.04 LTS"]);
     }
 
     #[test]
     fn wsl_synthetic_profile_yields_to_a_user_profile_of_the_same_name() {
-        let base = vec![("WSL: Ubuntu".to_string(), vec!["custom.exe".to_string()])];
+        let base = vec![("wsl: Ubuntu".to_string(), vec!["custom.exe".to_string()])];
         let merged = with_wsl_profiles(base, vec!["Ubuntu".to_string()]);
         // the user's own definition wins; no duplicate synthetic entry is added
         assert_eq!(merged.len(), 1);
