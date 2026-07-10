@@ -11,6 +11,17 @@ const VERSION: u32 = 1;
 pub struct SessionFile {
     pub active_tab: usize,
     pub tabs: Vec<TabSnap>,
+    /// the window's last outer position + inner size, restored on next launch;
+    /// None in older files or when the window was minimized at save time
+    pub window: Option<WindowBounds>,
+}
+
+/// saved outer position + inner size of the window, in physical pixels
+pub struct WindowBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct TabSnap {
@@ -37,12 +48,15 @@ pub enum NodeSnap {
 
 impl SessionFile {
     pub fn to_json_string(&self) -> String {
-        Json::obj([
-            ("version", Json::Num(VERSION as f64)),
-            ("active_tab", Json::Num(self.active_tab as f64)),
-            ("tabs", Json::Arr(self.tabs.iter().map(TabSnap::to_json).collect())),
-        ])
-        .to_string()
+        let mut pairs = vec![
+            ("version".to_string(), Json::Num(VERSION as f64)),
+            ("active_tab".to_string(), Json::Num(self.active_tab as f64)),
+            ("tabs".to_string(), Json::Arr(self.tabs.iter().map(TabSnap::to_json).collect())),
+        ];
+        if let Some(w) = &self.window {
+            pairs.push(("window".to_string(), w.to_json()));
+        }
+        Json::Obj(pairs.into_iter().collect()).to_string()
     }
 
     /// parse a saved session; None on absent/corrupt/empty so the caller falls
@@ -59,7 +73,28 @@ impl SessionFile {
             return None;
         }
         let active_tab = v.get("active_tab").and_then(Json::as_f64).unwrap_or(0.0) as usize;
-        Some(SessionFile { active_tab, tabs })
+        let window = v.get("window").and_then(WindowBounds::from_json);
+        Some(SessionFile { active_tab, tabs, window })
+    }
+}
+
+impl WindowBounds {
+    fn to_json(&self) -> Json {
+        Json::obj([
+            ("x", Json::Num(self.x as f64)),
+            ("y", Json::Num(self.y as f64)),
+            ("w", Json::Num(self.width as f64)),
+            ("h", Json::Num(self.height as f64)),
+        ])
+    }
+
+    fn from_json(v: &Json) -> Option<WindowBounds> {
+        Some(WindowBounds {
+            x: v.get("x").and_then(Json::as_f64)? as i32,
+            y: v.get("y").and_then(Json::as_f64)? as i32,
+            width: v.get("w").and_then(Json::as_f64)? as u32,
+            height: v.get("h").and_then(Json::as_f64)? as u32,
+        })
     }
 }
 
@@ -149,10 +184,13 @@ mod tests {
                     title: Some("build".into()),
                 },
             ],
+            window: Some(WindowBounds { x: -12, y: 40, width: 1200, height: 800 }),
         };
         let back = SessionFile::parse(&sf.to_json_string()).expect("parse");
         assert_eq!(back.active_tab, 1);
         assert_eq!(back.tabs.len(), 2);
+        let w = back.window.expect("window bounds round-trip");
+        assert_eq!((w.x, w.y, w.width, w.height), (-12, 40, 1200, 800));
         match &back.tabs[0].root {
             NodeSnap::Leaf { cwd, shell } => {
                 assert_eq!(cwd.as_deref(), Some("C:/a"));

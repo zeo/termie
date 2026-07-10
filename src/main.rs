@@ -1622,6 +1622,53 @@ fn node_to_snap(node: &Node, leaf_ids: &mut Vec<usize>) -> session::NodeSnap {
     }
 }
 
+/// available monitor rects (x, y, w, h) in physical pixels, primary first so it
+/// is the fallback when a saved window overlaps none of them
+fn monitor_rects(event_loop: &ActiveEventLoop) -> Vec<(i32, i32, u32, u32)> {
+    let primary = event_loop.primary_monitor();
+    let rect = |m: &winit::monitor::MonitorHandle| {
+        let (p, s) = (m.position(), m.size());
+        (p.x, p.y, s.width, s.height)
+    };
+    let mut rects: Vec<(i32, i32, u32, u32)> = primary.iter().map(rect).collect();
+    for m in event_loop.available_monitors() {
+        if Some(&m) != primary.as_ref() {
+            rects.push(rect(&m));
+        }
+    }
+    rects
+}
+
+/// overlap area of two (x, y, w, h) rects in physical pixels
+fn rect_overlap(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> i64 {
+    let w = ((a.0 + a.2 as i32).min(b.0 + b.2 as i32) - a.0.max(b.0)).max(0) as i64;
+    let h = ((a.1 + a.3 as i32).min(b.1 + b.3 as i32) - a.1.max(b.1)).max(0) as i64;
+    w * h
+}
+
+/// keep a saved window rect on-screen: fit it to the monitor it most overlaps
+/// (or the first monitor when it overlaps none, e.g. its display is gone) so it
+/// never opens larger than or off the edge of a visible monitor
+fn clamp_window_bounds(
+    monitors: &[(i32, i32, u32, u32)],
+    b: (i32, i32, u32, u32),
+) -> (i32, i32, u32, u32) {
+    let target = monitors
+        .iter()
+        .copied()
+        .filter(|&m| rect_overlap(m, b) > 0)
+        .max_by_key(|&m| rect_overlap(m, b))
+        .or_else(|| monitors.first().copied());
+    let Some((mx, my, mw, mh)) = target else {
+        return b; // no monitors known: leave the saved rect as-is
+    };
+    let w = b.2.min(mw);
+    let h = b.3.min(mh);
+    let x = b.0.clamp(mx, mx + mw as i32 - w as i32);
+    let y = b.1.clamp(my, my + mh as i32 - h as i32);
+    (x, y, w, h)
+}
+
 /// feed pty output through the kitty-graphics scanner, then the vte parser. the
 /// scanner pulls kitty APC image sequences out of the stream (vte has no APC
 /// callback) and the remaining bytes flow to the terminal unchanged
@@ -2725,16 +2772,52 @@ impl App {
         // start hidden; reveal after the first painted frame to avoid a white flash
         let (irgba, iw, ih) = win::app_icon();
         let icon = winit::window::Icon::from_rgba(irgba, iw, ih).ok();
+        // load the saved session up front: its bounds size the window at creation
+        // (so the renderer builds at the right size, no post-show resize) and its
+        // tab tree is restored below
+        let restored = if self.config.restore_on_launch {
+            session_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|t| session::SessionFile::parse(&t))
+        } else {
+            None
+        };
+        // launch mode decides tab one and whether the saved window bounds apply:
+        // only a plain bare launch from the home dir restores the session; an
+        // explicit cwd/command/shell, a folder launch, or a defterm handoff is
+        // ad-hoc and opens fresh, so those windows don't all stack on the saved rect
+        let first_cwd = if self.cli.is_bare() { launch_cwd(self.launch_fg) } else { self.cli.cwd.clone() };
+        let command = self.cli.command.clone();
+        let first_shell = self.cli.shell.as_deref().map(ShellKind::from_label);
+        #[cfg(windows)]
+        let has_handoff = self.handoff.is_some();
+        #[cfg(not(windows))]
+        let has_handoff = false;
+        let restore_bounds = (!has_handoff
+            && command.is_none()
+            && first_cwd.is_none()
+            && first_shell.is_none())
+        .then(|| restored.as_ref().and_then(|s| s.window.as_ref()))
+        .flatten();
         let attrs = Window::default_attributes()
             .with_title("termie")
             .with_window_icon(icon)
             .with_decorations(false)
             .with_visible(false)
-            .with_inner_size(LogicalSize::new(1000.0, 640.0))
             // below this the title-bar controls + tabs and the status-bar clusters
             // would overlap (no room for all the chrome); clamp so the window is
             // always usable
             .with_min_inner_size(LogicalSize::new(560.0, 380.0));
+        let attrs = match restore_bounds {
+            Some(b) => {
+                // clamp to a currently-visible monitor so a window saved on a
+                // now-disconnected display doesn't open off-screen
+                let (x, y, w, h) =
+                    clamp_window_bounds(&monitor_rects(event_loop), (b.x, b.y, b.width, b.height));
+                attrs.with_position(PhysicalPosition::new(x, y)).with_inner_size(PhysicalSize::new(w, h))
+            }
+            None => attrs.with_inner_size(LogicalSize::new(1000.0, 640.0)),
+        };
         let window = Arc::new(event_loop.create_window(attrs)?);
         timing("window created");
 
@@ -2807,14 +2890,6 @@ impl App {
             self.conf_watch_spawned = true;
             spawn_conf_watcher(self.proxy.clone());
         }
-        // an explicit --cwd/command, or a bare launch from a specific folder
-        // (e.g. `termie` typed in the explorer address bar), opens the first tab
-        // there instead of restoring. such a window is ad-hoc and must not
-        // overwrite the saved session. a plain bare launch from the home dir
-        // falls through to restore + the warm-pool path below
-        let first_cwd = if self.cli.is_bare() { launch_cwd(self.launch_fg) } else { self.cli.cwd.clone() };
-        let command = self.cli.command.clone();
-        let first_shell = self.cli.shell.as_deref().map(ShellKind::from_label);
         // an inbound default-terminal session becomes tab one — ephemeral like
         // an explicit cli launch, so it never overwrites the saved session
         #[cfg(windows)]
@@ -2845,11 +2920,7 @@ impl App {
                 Ok(pane) => self.install_first_tab(pane),
                 Err(e) => log::error!("failed to spawn the requested command: {e}"),
             }
-        } else if self.config.restore_on_launch
-            && let Some(sf) = session_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|t| session::SessionFile::parse(&t))
-        {
+        } else if let Some(sf) = restored {
             // bare launch: rebuild the saved tab/split layout with fresh shells in
             // the saved dirs. if nothing restores, the warm pool below installs a
             // single shell as the fallback
@@ -5492,7 +5563,17 @@ impl App {
             let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
             tabs.push(session::TabSnap { focused_leaf, root, title: tab.title.clone() });
         }
-        session::SessionFile { active_tab: main.active_tab, tabs }
+        // capture the window's outer position + inner size for next launch; skip a
+        // minimized/degenerate window so its zero size can't clobber good bounds
+        let window = main.window.as_ref().and_then(|w| {
+            let size = w.inner_size();
+            if size.width == 0 || size.height == 0 {
+                return None;
+            }
+            let pos = w.outer_position().ok()?;
+            Some(session::WindowBounds { x: pos.x, y: pos.y, width: size.width, height: size.height })
+        });
+        session::SessionFile { active_tab: main.active_tab, tabs, window }
     }
 
     /// mark the layout changed and (re)arm the debounced session write so a burst
@@ -7958,8 +8039,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // the drag settles so a live resize doesn't rebuild all scrollback
                 // per pixel-step; about_to_wait fires relayout once it stops
                 self.resize_settle = Some(Instant::now());
+                // persist the new size for next launch (debounced like the layout)
+                self.mark_session_dirty();
                 self.redraw();
             }
+            // moving the window persists its new position on the same debounce
+            WindowEvent::Moved(_) => self.mark_session_dirty(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // monitor/dpi change: re-raster the atlas at the new scale so text
                 // stays crisp. winit applies the os-suggested size and a Resized
@@ -8671,6 +8756,21 @@ mod tests {
         assert!(parse_persisted("mica=on").acrylic);
         assert!(!parse_persisted("acrylic=false").acrylic);
         assert!(!Persisted::default().acrylic);
+    }
+
+    #[test]
+    fn window_bounds_clamp_to_a_visible_monitor() {
+        let one = [(0, 0, 1920u32, 1080u32)];
+        // fully inside: untouched
+        assert_eq!(clamp_window_bounds(&one, (100, 100, 800, 600)), (100, 100, 800, 600));
+        // hanging off the right/bottom edges slides back to fit
+        assert_eq!(clamp_window_bounds(&one, (1600, 900, 800, 600)), (1120, 480, 800, 600));
+        // larger than the monitor is capped to it and pinned to the origin
+        assert_eq!(clamp_window_bounds(&one, (-50, -50, 5000, 5000)), (0, 0, 1920, 1080));
+        // a window whose monitor is gone lands on the first (primary) monitor
+        let two = [(0, 0, 1920u32, 1080u32), (1920, 0, 1280, 1024)];
+        let (x, y, ..) = clamp_window_bounds(&two, (-4000, -4000, 1000, 700));
+        assert_eq!((x, y), (0, 0));
     }
 
     #[test]
