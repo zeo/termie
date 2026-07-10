@@ -460,6 +460,70 @@ pub fn refresh_defterm_server_path() {
     }
 }
 
+/// true when this process holds an elevated (admin) token; cached — the
+/// answer can't change for the life of a process
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).is_err() {
+            return false;
+        }
+        let mut info = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            tok,
+            TokenElevation,
+            Some(&mut info as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(tok);
+        ok && info.TokenIsElevated != 0
+    })
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
+}
+
+/// relaunch termie elevated through the UAC prompt with `args` as its command
+/// line; false when the user declined or the launch failed
+#[cfg(windows)]
+pub fn launch_elevated(args: &str) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{PCWSTR, w};
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe_w = reg::wide(&exe.display().to_string());
+    let args_w = reg::wide(args);
+    let h = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            PCWSTR(exe_w.as_ptr()),
+            PCWSTR(args_w.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // shellapi contract: values above 32 are success
+    h.0 as usize > 32
+}
+
+#[cfg(not(windows))]
+pub fn launch_elevated(_args: &str) -> bool {
+    false
+}
+
 // the CLSID appears twice — as a GUID for COM and as registry-path text — and
 // the two must never drift apart
 #[cfg(all(test, windows))]

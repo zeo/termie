@@ -239,6 +239,9 @@ enum PaletteAction {
     /// new tab with the focused pane's shell and cwd (Windows Terminal's Ctrl+Shift+D)
     DuplicateTab,
     NewShell(ShellKind),
+    /// relaunch elevated via UAC: a new admin termie window with the focused
+    /// pane's shell and cwd (an unelevated process can't host an elevated pty)
+    AdminWindow,
     SplitV,
     SplitH,
     NextTab,
@@ -306,6 +309,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("new tab: pwsh", PaletteAction::NewShell(ShellKind::Pwsh)),
     ("new tab: cmd", PaletteAction::NewShell(ShellKind::Cmd)),
     ("new tab: wsl", PaletteAction::NewShell(ShellKind::Wsl)),
+    ("new admin window", PaletteAction::AdminWindow),
     ("split vertical", PaletteAction::SplitV),
     ("split horizontal", PaletteAction::SplitH),
     ("next tab", PaletteAction::NextTab),
@@ -3121,6 +3125,7 @@ impl App {
             let p = &self.persisted;
             if let Some(r) = self.pw.renderer.as_mut() {
                 r.set_theme(boot_theme);
+                r.set_elevated(win::is_elevated());
                 r.set_color_overrides(load_color_overrides());
                 r.set_cursor_style(p.cursor);
                 r.set_cursor_blink(p.cursor_blink);
@@ -4317,6 +4322,8 @@ impl App {
             })
             .map(|t| format!("{} — termie", tab_label(t)))
             .unwrap_or_else(|| "termie".to_string());
+        // an elevated window must say so everywhere it's named
+        let title = if win::is_elevated() { format!("{title} [admin]") } else { title };
         if self.last_title != title {
             if let Some(w) = &self.pw.window {
                 w.set_title(&title);
@@ -4909,6 +4916,28 @@ impl App {
             PaletteAction::NewShell(s) => {
                 let cwd = self.focused_cwd();
                 self.new_tab_cwd(cwd, Some(s));
+            }
+            PaletteAction::AdminWindow => {
+                let mut args = String::new();
+                // a label with a quote would mangle the relaunch argv; fall
+                // back to the default shell rather than risk it
+                if let Some(s) = self.focused_shell().map(|s| s.label().to_string())
+                    && !s.contains('"')
+                {
+                    args.push_str(&format!("--shell \"{s}\""));
+                }
+                if let Some(d) = self.focused_cwd()
+                    && !d.contains('"')
+                {
+                    // a trailing backslash (drive roots) would escape the
+                    // closing quote under argv rules; double it
+                    let d = if d.ends_with('\\') { format!("{d}\\") } else { d };
+                    args.push_str(&format!(" --cwd \"{d}\""));
+                }
+                if !win::launch_elevated(args.trim()) {
+                    self.show_notice("admin window cancelled");
+                }
+                self.redraw();
             }
             PaletteAction::SplitV => self.split_focused(Dir::Vertical),
             PaletteAction::SplitH => self.split_focused(Dir::Horizontal),
@@ -6381,6 +6410,7 @@ impl App {
         let renderer = match render::Renderer::new(window.clone(), CONTENT_PT, CHROME_PT, self.config.backend) {
             Ok(mut r) => {
                 r.set_theme(self.resolved_theme());
+                r.set_elevated(win::is_elevated());
                 r
             }
             Err(_) => {

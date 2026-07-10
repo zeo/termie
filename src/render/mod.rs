@@ -632,6 +632,9 @@ pub struct Renderer {
     gradient_key: (u32, u32, ThemeId),
     pane_mode: bool,
     mark_mode: bool,
+    /// this process holds an admin token: a persistent shield chip on the
+    /// status bar so an elevated window is never mistaken for a normal one
+    elevated: bool,
     tabs: Vec<String>,
     /// parallel to `tabs`: badge severity — 0 none, 1 running, 2 done,
     /// 3 bell, 4 failed (the tab dot colors by it)
@@ -1307,6 +1310,7 @@ impl Renderer {
             settings_view: SettingsView::default(),
             pane_mode: false,
             mark_mode: false,
+            elevated: false,
             tabs: Vec::new(),
             tab_status: Vec::new(),
             active_tab: 0,
@@ -1572,6 +1576,10 @@ impl Renderer {
 
     pub fn set_pane_mode(&mut self, on: bool) {
         self.pane_mode = on;
+    }
+
+    pub fn set_elevated(&mut self, on: bool) {
+        self.elevated = on;
     }
 
     pub fn set_mark_mode(&mut self, on: bool) {
@@ -3518,6 +3526,10 @@ impl Renderer {
             };
             sx += gap;
             sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "\u{f126}", b, track, wide, scale, RULE_2, TEXT_2);
+        }
+        if self.elevated {
+            sx += gap;
+            sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "\u{f132}", "admin", track, wide, scale, PAPER, PAPER);
         }
         sx += gap;
         let left_end = Self::seg(&mut self.atlas, &mut out, sx, st_top, "TABS", &self.status_tabs.1, track, wide, scale, RULE_2, MUTE);
