@@ -1682,6 +1682,11 @@ struct CliArgs {
     /// wt-style layout built from `new-tab` / `split-pane` verbs; non-empty
     /// makes the launch ephemeral and installs these tabs instead of tab one
     tabs: Vec<session::TabSnap>,
+    /// `--drive <file>`: a timed key script injected through the normal input
+    /// path once the first shell produces output — scripting, demos, and
+    /// automation without synthesized OS input. the window opens non-activating
+    /// so a drive run never touches whatever the user is doing
+    drive: Option<String>,
     /// inject a kitty-graphics gradient into the first pane once it's up:
     /// ConPTY strips APC, so no shell can deliver one — this is the way to
     /// see the decoder + image pipeline work on a live window
@@ -1728,6 +1733,60 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> CliArgs {
             out.shell = Some(name.to_string());
         } else if a == "--kitty-demo" {
             out.kitty_demo = true;
+        } else if a == "--drive" {
+            if let Some(path) = it.next() {
+                out.drive = Some(path);
+            }
+        } else if let Some(path) = a.strip_prefix("--drive=") {
+            out.drive = Some(path.to_string());
+        }
+    }
+    out
+}
+
+/// one scheduled `--drive` step
+#[derive(Clone)]
+enum DriveStep {
+    Key(ModifiersState, Key),
+    Type(String),
+}
+
+/// a parsed `--drive` script: steps at cumulative offsets from the moment the
+/// first pane produces output (so scripts never race a cold shell)
+struct Drive {
+    steps: Vec<(Duration, DriveStep)>,
+    next: usize,
+    started: Option<Instant>,
+}
+
+/// parse a drive script: `<delay_ms> key <combo>` or `<delay_ms> type <text>`
+/// per line, delays relative to the previous step; '#' lines are comments.
+/// combos use the keybindings.conf syntax (`ctrl+shift+m`, `enter`, `f7`)
+fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
+    let mut out = Vec::new();
+    let mut at = Duration::ZERO;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ' ');
+        let (Some(ms), Some(verb)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(ms) = ms.parse::<u64>() else {
+            continue;
+        };
+        let arg = parts.next().unwrap_or("");
+        at += Duration::from_millis(ms);
+        match verb {
+            "key" => {
+                if let Some((mods, key)) = parse_combo(arg) {
+                    out.push((at, DriveStep::Key(mods, key)));
+                }
+            }
+            "type" => out.push((at, DriveStep::Type(arg.to_string()))),
+            _ => {}
         }
     }
     out
@@ -3000,6 +3059,8 @@ struct App {
     /// warm-pool tab-open latency via the TERMIE_TIMING log
     #[cfg(debug_assertions)]
     bench_left: u32,
+    /// a running --drive script; steps fire from about_to_wait wakeups
+    drive: Option<Drive>,
     #[cfg(debug_assertions)]
     bench_next: Option<Instant>,
     /// pool shells currently spawning on worker threads (not yet in `pool`)
@@ -3217,6 +3278,7 @@ impl App {
             quake_shown: false,
             quake_hotkey_spawned: false,
             conf_watch_spawned: false,
+            drive: None,
         }
     }
 
@@ -3286,7 +3348,28 @@ impl App {
                 if self.persisted.acrylic {
                     win::apply_backdrop(h.hwnd.get(), true);
                 }
+                // a --drive run must never touch the user's session in either
+                // direction: the window can't activate (their typing can't
+                // land here, chords don't need focus) and paints as focused
+                // so its output is what a focused window would show
+                if self.cli.drive.is_some() {
+                    win::set_no_activate(h.hwnd.get());
+                }
             }
+        if let Some(path) = self.cli.drive.clone() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let steps = parse_drive_script(&text);
+                    if steps.is_empty() {
+                        log::warn!("--drive: no runnable steps in {path}");
+                    } else {
+                        self.drive = Some(Drive { steps, next: 0, started: None });
+                        self.pw.focused = true;
+                    }
+                }
+                Err(e) => log::warn!("--drive: couldn't read {path}: {e}"),
+            }
+        }
 
         // overlap the slow first pwsh spawn with the ~300ms gpu init below: kick it
         // off now so it is already producing its prompt by the time the window
@@ -6687,6 +6770,75 @@ impl App {
         }
     }
 
+    /// run one synthetic --drive key through the exact path a hardware press
+    /// takes: the shortcut/overlay layer first, then the pty encoding
+    fn inject_key(&mut self, mods: ModifiersState, logical: &Key, text: Option<&str>, event_loop: &ActiveEventLoop) {
+        let saved = self.mods;
+        self.mods = mods;
+        if !self.handle_shortcut(logical, text, ElementState::Pressed, event_loop)
+            && let Some(id) = self.active_focused_id()
+        {
+            let (app_cursor, kbd) = self
+                .pw.tabs
+                .get(self.pw.active_tab)
+                .and_then(|t| t.root.as_ref())
+                .and_then(|r| find_pane(r, id))
+                .map(|p| (p.term.app_cursor_keys, p.term.kbd_flags()))
+                .unwrap_or((false, 0));
+            if let Some(bytes) = input::key_to_bytes(
+                logical,
+                text,
+                None,
+                ElementState::Pressed,
+                false,
+                self.mods,
+                winit::keyboard::KeyLocation::Standard,
+                app_cursor,
+                kbd,
+            ) {
+                self.selection = None;
+                self.write_to_focused(&bytes);
+            }
+        }
+        self.mods = saved;
+        self.redraw();
+    }
+
+    /// fire the --drive steps that have come due since the clock was armed
+    fn drive_tick(&mut self, event_loop: &ActiveEventLoop) {
+        // collect due steps first: injecting them re-borrows self
+        let mut due = Vec::new();
+        if let Some(d) = self.drive.as_mut()
+            && let Some(started) = d.started
+        {
+            while d.next < d.steps.len() && started.elapsed() >= d.steps[d.next].0 {
+                due.push(d.steps[d.next].1.clone());
+                d.next += 1;
+            }
+        }
+        for step in due {
+            match step {
+                DriveStep::Key(mods, key) => {
+                    // the text a real press of this chord would carry
+                    let txt = match &key {
+                        Key::Character(s) if !mods.control_key() && !mods.alt_key() => {
+                            Some(if mods.shift_key() { s.to_uppercase() } else { s.to_string() })
+                        }
+                        Key::Named(NamedKey::Space) => Some(" ".to_string()),
+                        _ => None,
+                    };
+                    self.inject_key(mods, &key, txt.as_deref(), event_loop);
+                }
+                DriveStep::Type(text) => {
+                    for ch in text.chars() {
+                        let s = ch.to_string();
+                        self.inject_key(ModifiersState::empty(), &Key::Character(s.as_str().into()), Some(&s), event_loop);
+                    }
+                }
+            }
+        }
+    }
+
     /// grow/shrink the focused pane along `dir` (pane-mode keyboard resize)
     fn resize_focused(&mut self, dir: Dir, grow: bool) {
         let Some(fid) = self.pw.tabs.get(self.pw.active_tab).map(|t| t.focused) else {
@@ -6950,7 +7102,9 @@ impl App {
                 }
             }
             WindowEvent::Focused(f) => {
-                self.pw.focused = f;
+                // a --drive window paints focused no matter the real focus
+                // (it is WS_EX_NOACTIVATE, so real focus never arrives)
+                self.pw.focused = f || self.drive.is_some();
                 if !f {
                     self.pw.ime_composing = false;
                     self.pw.ime_preedit.clear();
@@ -8295,6 +8449,13 @@ impl ApplicationHandler<UserEvent> for App {
                             if !p.ready {
                                 p.ready = true;
                                 newly_ready = true;
+                                // a --drive clock starts at the first output so
+                                // scripts never race a cold shell
+                                if let Some(d) = self.drive.as_mut()
+                                    && d.started.is_none()
+                                {
+                                    d.started = Some(Instant::now());
+                                }
                             }
                             if p.term.cwd_dirty {
                                 p.term.cwd_dirty = false;
@@ -8810,7 +8971,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(f) => {
-                self.pw.focused = f;
+                // a --drive window paints focused no matter the real focus
+                // (it is WS_EX_NOACTIVATE, so real focus never arrives)
+                self.pw.focused = f || self.drive.is_some();
                 // losing focus mid-composition must clear the IME flag, or a
                 // missing Disabled/Commit (a real winit-on-Windows gap) would
                 // leave every keystroke swallowed with no in-app recovery
@@ -9015,6 +9178,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50)));
             return;
+        }
+        // fire any --drive steps that have come due (the flow tail below
+        // schedules the wakeup for the next one)
+        if self.drive.is_some() {
+            self.drive_tick(event_loop);
         }
         // first shell hasn't spawned yet after a failure: wake at the backoff
         // deadline to retry, rather than hot-looping or sleeping indefinitely
@@ -9228,7 +9396,13 @@ impl ApplicationHandler<UserEvent> for App {
         let notice_ms: Option<u64> = self
             .notice_until
             .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 10);
-        match main_ms.into_iter().chain(sat_ms).chain(notice_ms).min() {
+        // a pending --drive step wakes the loop at its due time
+        let drive_ms: Option<u64> = self.drive.as_ref().and_then(|d| {
+            let started = d.started?;
+            (d.next < d.steps.len())
+                .then(|| d.steps[d.next].0.saturating_sub(started.elapsed()).as_millis() as u64 + 5)
+        });
+        match main_ms.into_iter().chain(sat_ms).chain(notice_ms).chain(drive_ms).min() {
             Some(ms) => event_loop
                 .set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(ms))),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -9350,6 +9524,21 @@ mod tests {
         assert_eq!(font_weight_from_label("1000"), Some(900));
         assert_eq!(font_weight_from_label("55"), Some(100));
         assert_eq!(font_weight_from_label("heavyish"), None);
+    }
+
+    #[test]
+    fn drive_scripts_parse_combos_and_text() {
+        let steps = parse_drive_script(
+            "# comment\n\n500 key ctrl+shift+m\n100 type line 1\n50 key enter\nbogus line\n50 nope x\n",
+        );
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].0, Duration::from_millis(500));
+        assert!(matches!(&steps[0].1, DriveStep::Key(m, _) if m.control_key() && m.shift_key()));
+        // delays accumulate; type keeps its full text
+        assert_eq!(steps[1].0, Duration::from_millis(600));
+        assert!(matches!(&steps[1].1, DriveStep::Type(t) if t == "line 1"));
+        assert_eq!(steps[2].0, Duration::from_millis(650));
+        assert!(matches!(&steps[2].1, DriveStep::Key(_, Key::Named(NamedKey::Enter))));
     }
 
     #[test]

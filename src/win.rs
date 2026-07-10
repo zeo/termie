@@ -52,6 +52,26 @@ pub fn apply_window_effects(hwnd_handle: isize) {
 #[cfg(not(windows))]
 pub fn apply_window_effects(_hwnd_handle: isize) {}
 
+/// mark a window non-activating (WS_EX_NOACTIVATE): it can never take
+/// keyboard focus, by click or programmatically. --drive fixtures use this so
+/// an automated run can't steal focus from (or feed keys to) the user
+#[cfg(windows)]
+pub fn set_no_activate(hwnd_handle: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+
+    let hwnd = HWND(hwnd_handle as *mut core::ffi::c_void);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE.0 as isize);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_no_activate(_hwnd_handle: isize) {}
+
 /// opt the window into the Win11 system backdrop (Mica) so the desktop shows
 /// through the chrome. cosmetic only: on Win10 and early Win11 the attribute
 /// is unknown and the call fails, which is ignored — the window keeps its

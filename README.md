@@ -85,7 +85,7 @@ Drop files in `%APPDATA%\termie\`:
 
 Mistyped lines in any of these are reported to `%APPDATA%\termie\termie.log`.
 
-The command line takes Windows Terminal's layout verbs too: `termie new-tab -d C:\src ; split-pane -H --shell cmd` opens a window with that layout (`nt`/`sp` for short; `-V` splits beside and is the default, `-H` below). Scripted windows never overwrite your saved session.
+The command line takes Windows Terminal's layout verbs too: `termie new-tab -d C:\src ; split-pane -H --shell cmd` opens a window with that layout (`nt`/`sp` for short; `-V` splits beside and is the default, `-H` below). Scripted windows never overwrite your saved session. For automation and demos, `--drive script.txt` plays a timed key script (`500 key ctrl+shift+m` / `100 type hello`, combos in the `keybindings.conf` syntax) in a window that never takes focus.
 
 ## build from source
 
