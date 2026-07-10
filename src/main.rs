@@ -5882,6 +5882,18 @@ impl App {
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.pw.cursor = position;
         let (px, py) = (position.x as f32, position.y as f32);
+        // hovering the open palette moves its selection with the pointer
+        if self.palette.is_some() {
+            if let Some(i) = self.pw.renderer.as_ref().and_then(|r| r.palette_row_at(px, py))
+                && self.palette.as_ref().map(|p| p.selected) != Some(i)
+            {
+                if let Some(p) = self.palette.as_mut() {
+                    p.selected = i;
+                }
+                self.redraw();
+            }
+            return;
+        }
         // while the pane menu is open, only track which item is hovered
         if self.pw.pane_menu.is_some() {
             let h = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
@@ -6120,6 +6132,43 @@ impl App {
                 if self.market.is_some() {
                     if state == ElementState::Pressed {
                         self.market_click(cx, cy);
+                    }
+                    return;
+                }
+                // the open palette owns every click: an entry runs, anywhere
+                // else dismisses — and nothing falls through to the panes
+                if self.palette.is_some() {
+                    if state == ElementState::Pressed {
+                        let row = self.pw.renderer.as_ref().and_then(|r| r.palette_row_at(cx, cy));
+                        let inside =
+                            self.pw.renderer.as_ref().is_some_and(|r| r.palette_contains(cx, cy));
+                        if let Some(i) = row {
+                            let q = self.palette.as_ref().map(|p| p.query.clone()).unwrap_or_default();
+                            self.palette = None;
+                            if let Some(&(_, a)) = palette_filter(&q).get(i) {
+                                self.run_action(a, event_loop);
+                            }
+                            self.redraw();
+                        } else if !inside {
+                            self.palette = None;
+                            self.redraw();
+                        }
+                    }
+                    return;
+                }
+                // find-bar buttons: prev / next / close (misses fall through
+                // so text can still be selected while find is open)
+                if self.find.is_some()
+                    && state == ElementState::Pressed
+                    && let Some(btn) = self.pw.renderer.as_ref().and_then(|r| r.find_btn_at(cx, cy))
+                {
+                    match btn {
+                        0 => self.find_step(false),
+                        1 => self.find_step(true),
+                        _ => {
+                            self.find = None;
+                            self.redraw();
+                        }
                     }
                     return;
                 }

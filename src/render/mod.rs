@@ -620,6 +620,11 @@ pub struct Renderer {
     /// installed plugins (display name, enabled) for the settings PLUGINS panel
     plugins_installed: Vec<(String, bool)>,
     palette_view: Option<PaletteView>,
+    /// palette overlay hit geometry, refreshed each build: box, row pitch,
+    /// shown item count (None while the palette is closed)
+    palette_geom: Option<(Rect, f32, usize)>,
+    /// find-bar button rects, refreshed each build: (prev, next, close)
+    find_btns: Option<(Rect, Rect, Rect)>,
     pane_menu_view: Option<PaneMenuView>,
     find_view: Option<FindView>,
     market_view: Option<MarketView>,
@@ -1281,6 +1286,8 @@ impl Renderer {
             status_tabs: (usize::MAX, String::new()),
             plugins_installed: Vec::new(),
             palette_view: None,
+            palette_geom: None,
+            find_btns: None,
             pane_menu_view: None,
             find_view: None,
             market_view: None,
@@ -3865,6 +3872,7 @@ impl Renderer {
     /// centered command-palette overlay: search input + filtered action list
     #[allow(non_snake_case)]
     fn build_palette(&mut self, out: &mut Vec<Instance>, track: f32) {
+        self.palette_geom = None;
         let Some(pv) = self.palette_view.as_ref() else {
             return;
         };
@@ -3891,6 +3899,8 @@ impl Renderer {
         let row_h = chrome_h + 14.0 * s;
         let rows = items.len().max(1) as f32 + 1.0;
         let bh = row_h * rows + 8.0 * s;
+        // remember the box + row pitch so clicks can land on entries
+        self.palette_geom = Some(((bx, by, bw, bh), row_h, items.len()));
         // drop shadow + box + border
         Self::push_rect(out, bx - 2.0 * s, by + 5.0 * s, bw + 4.0 * s, bh, INK_0, 0.5);
         Self::push_rect(out, bx, by, bw, bh, INK_1, 1.0);
@@ -3926,6 +3936,7 @@ impl Renderer {
     /// grid by draw_grid, this only draws the input box
     #[allow(non_snake_case)]
     fn build_find(&mut self, out: &mut Vec<Instance>, track: f32) {
+        self.find_btns = None;
         let Some(fv) = self.find_view.as_ref() else {
             return;
         };
@@ -3952,6 +3963,21 @@ impl Renderer {
         Self::stroke_rect(out, (bx, by, bw, bh), hair, RULE_2);
         let pad = 16.0 * s;
         let iy = (by + 4.0 * s + (row_h - chrome_h) / 2.0).round();
+        // right cluster: prev / next / close buttons, with the counter to
+        // their left. rects are remembered so clicks land on them
+        let btn = (chrome_h + 6.0 * s).round();
+        let bgap = 4.0 * s;
+        let byy = (by + (bh - btn) / 2.0).round();
+        let close_r = (bx + bw - pad + 4.0 * s - btn, byy, btn, btn);
+        let next_r = (close_r.0 - btn - bgap, byy, btn, btn);
+        let prev_r = (next_r.0 - btn - bgap, byy, btn, btn);
+        self.find_btns = Some((prev_r, next_r, close_r));
+        for (r, glyph) in [(prev_r, "\u{f077}"), (next_r, "\u{f078}"), (close_r, "\u{f00d}")] {
+            let gw = self.text_w(FontId::Chrome, glyph, track);
+            let gx = r.0 + (r.2 - gw) / 2.0;
+            let gy = (r.1 + (r.3 - chrome_h) / 2.0).round();
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, gx, gy, glyph, MUTE, 1.0, track);
+        }
         let info = if count == 0 {
             if query.is_empty() {
                 String::new()
@@ -3962,9 +3988,10 @@ impl Renderer {
             format!("{}/{}", current + 1, count)
         };
         let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Chrome, &info, track) };
+        let right_edge = prev_r.0 - 10.0 * s;
         // elide the head of an overlong query so the tail being typed stays
-        // visible and never collides with the match counter
-        let avail = bw - 2.0 * pad - iw - 16.0 * s;
+        // visible and never collides with the counter or the buttons
+        let avail = (right_edge - iw - 16.0 * s) - (bx + pad);
         let mut prompt = format!("\u{f002}  {}", query);
         if self.text_w(FontId::Chrome, &prompt, track) > avail {
             let mut tail = query.as_str();
@@ -3983,7 +4010,40 @@ impl Renderer {
         let cwid = self.text_w(FontId::Chrome, &prompt, track);
         Self::push_rect(out, bx + pad + cwid + 2.0 * s, iy, 2.0 * s, chrome_h, PAPER, 1.0);
         if !info.is_empty() {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + bw - pad - iw, iy, &info, MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, right_edge - iw, iy, &info, MUTE, 1.0, track);
+        }
+    }
+
+    /// palette row index under a point (None outside the item rows)
+    pub fn palette_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let ((bx, by, bw, _), row_h, n) = self.palette_geom?;
+        if x < bx || x >= bx + bw {
+            return None;
+        }
+        let rel = y - (by + row_h);
+        if rel < 0.0 {
+            return None;
+        }
+        let i = (rel / row_h) as usize;
+        (i < n).then_some(i)
+    }
+
+    /// whether a point is inside the open palette's box
+    pub fn palette_contains(&self, x: f32, y: f32) -> bool {
+        self.palette_geom.map(|(r, ..)| in_rect(x, y, r)).unwrap_or(false)
+    }
+
+    /// find-bar button under a point: 0 prev, 1 next, 2 close
+    pub fn find_btn_at(&self, x: f32, y: f32) -> Option<u8> {
+        let (prev, next, close) = self.find_btns?;
+        if in_rect(x, y, prev) {
+            Some(0)
+        } else if in_rect(x, y, next) {
+            Some(1)
+        } else if in_rect(x, y, close) {
+            Some(2)
+        } else {
+            None
         }
     }
 
@@ -5209,6 +5269,43 @@ mod hit_tests {
         // a point in the far corner is outside every region
         assert_eq!(r.market_hit_at(2.0, 2.0), None);
         let _ = std::fs::remove_file(tmp_png("market"));
+    }
+
+    #[test]
+    fn palette_rows_and_find_buttons_are_hittable() {
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_tabs(vec!["a".into()], 0);
+        r.set_palette(Some(PaletteView {
+            query: "ne".into(),
+            items: vec!["new tab".into(), "new tab here".into(), "new window".into()],
+            selected: 0,
+        }));
+        r.settle_overlay();
+        let _ = r.render_png(&[], true, false, false, &tmp_png("palette"));
+        let ((bx, by, bw, _), row_h, n) = r.palette_geom.expect("palette geometry recorded");
+        assert_eq!(n, 3);
+        // the centre of each row resolves to its own index
+        for i in 0..n {
+            let y = by + row_h * (i as f32 + 1.0) + row_h / 2.0;
+            assert_eq!(r.palette_row_at(bx + bw / 2.0, y), Some(i));
+        }
+        // the input row and the outside are not rows
+        assert_eq!(r.palette_row_at(bx + bw / 2.0, by + row_h / 2.0), None);
+        assert!(!r.palette_contains(2.0, 2.0));
+        assert!(r.palette_contains(bx + 2.0, by + 2.0));
+
+        r.set_palette(None);
+        r.set_find(Some(FindView { query: "err".into(), count: 4, current: 1, matches: Vec::new() }));
+        let _ = r.render_png(&[], true, false, false, &tmp_png("find"));
+        let (prev, next, close) = r.find_btns.expect("find buttons recorded");
+        assert_eq!(r.find_btn_at(prev.0 + prev.2 / 2.0, prev.1 + prev.3 / 2.0), Some(0));
+        assert_eq!(r.find_btn_at(next.0 + next.2 / 2.0, next.1 + next.3 / 2.0), Some(1));
+        assert_eq!(r.find_btn_at(close.0 + close.2 / 2.0, close.1 + close.3 / 2.0), Some(2));
+        assert_eq!(r.find_btn_at(2.0, 2.0), None);
+        let _ = std::fs::remove_file(tmp_png("palette"));
+        let _ = std::fs::remove_file(tmp_png("find"));
     }
 
     #[test]
