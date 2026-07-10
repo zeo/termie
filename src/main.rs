@@ -5261,6 +5261,26 @@ impl App {
         if idx >= self.pw.tabs.len() {
             return;
         }
+        // a background shell exit can close a tab while a tab menu or a close
+        // confirm is open; their captured indices go stale as slots shift left.
+        // re-target the menu (or drop it with its tab), and dismiss a pending
+        // close confirm whose prompt no longer matches reality
+        if let Some(MenuTarget::Tab(t)) = self.pw.pane_menu.as_ref().map(|m| m.target) {
+            if t == idx {
+                self.pw.pane_menu = None;
+            } else if t > idx
+                && let Some(m) = self.pw.pane_menu.as_mut()
+            {
+                m.target = MenuTarget::Tab(t - 1);
+            }
+        }
+        if self
+            .pw.confirm
+            .as_ref()
+            .is_some_and(|c| matches!(c.action, ConfirmAction::CloseTab { .. } | ConfirmAction::CloseOthers { .. }))
+        {
+            self.pw.confirm = None;
+        }
         self.remember_closed_tab(idx);
         // capture *before* remove: after remove the active slot already points
         // at a surviving tab (or is out of range), so a post-remove capture
