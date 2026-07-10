@@ -1988,6 +1988,33 @@ impl CloseAction {
     }
 }
 
+/// what a right-click on pane content does: open the context menu (default) or,
+/// for windows-terminal muscle memory, copy-a-selection-else-paste
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RightClick {
+    Menu,
+    Paste,
+}
+
+impl RightClick {
+    fn label(self) -> &'static str {
+        match self {
+            RightClick::Menu => "menu",
+            RightClick::Paste => "paste",
+        }
+    }
+    fn from_label(s: &str) -> Self {
+        match s {
+            "menu" => RightClick::Menu,
+            "paste" => RightClick::Paste,
+            other => {
+                log::warn!("config: unknown right_click value `{other}` (use menu or paste); keeping menu");
+                RightClick::Menu
+            }
+        }
+    }
+}
+
 /// user-tunable settings backed by real effects (see the settings page)
 #[derive(Clone, Copy)]
 struct Config {
@@ -1996,6 +2023,8 @@ struct Config {
     shell: ShellKind,
     load_profile: bool,
     close_action: CloseAction,
+    /// right-click on content: open the context menu, or copy/paste (WT muscle memory)
+    right_click: RightClick,
     backend: render::BackendChoice,
     /// restore the saved tab/split layout on a bare launch
     restore_on_launch: bool,
@@ -2011,6 +2040,7 @@ impl Default for Config {
             shell: ShellKind::Auto,
             load_profile: false,
             close_action: CloseAction::Quit,
+            right_click: RightClick::Menu,
             backend: render::BackendChoice::Auto,
             restore_on_launch: true,
             quake_key: None,
@@ -2025,6 +2055,7 @@ struct Persisted {
     shell: ShellKind,
     load_profile: bool,
     close_action: CloseAction,
+    right_click: RightClick,
     backend: render::BackendChoice,
     restore_on_launch: bool,
     font_size: f32,
@@ -2084,6 +2115,7 @@ impl Default for Persisted {
             shell: ShellKind::Auto,
             load_profile: false,
             close_action: CloseAction::Quit,
+            right_click: RightClick::Menu,
             backend: render::BackendChoice::Auto,
             restore_on_launch: true,
             font_size: CONTENT_PT,
@@ -2533,6 +2565,7 @@ fn parse_persisted(text: &str) -> Persisted {
             "shell" => p.shell = ShellKind::from_label(v),
             "load_profile" => p.load_profile = v == "true",
             "close_action" => p.close_action = CloseAction::from_label(v),
+            "right_click" => p.right_click = RightClick::from_label(v),
             "backend" => p.backend = render::BackendChoice::from_label(v),
             "restore_on_launch" => p.restore_on_launch = v != "false",
             "font_size" => {
@@ -2922,6 +2955,7 @@ impl App {
                 shell: p.shell,
                 load_profile: p.load_profile,
                 close_action: p.close_action,
+                right_click: p.right_click,
                 backend: p.backend,
                 restore_on_launch: p.restore_on_launch,
                 quake_key: p.quake_key,
@@ -5706,6 +5740,7 @@ impl App {
         let _ = writeln!(s, "shell={}", self.config.shell.label());
         let _ = writeln!(s, "load_profile={}", self.config.load_profile);
         let _ = writeln!(s, "close_action={}", self.config.close_action.label());
+        let _ = writeln!(s, "right_click={}", self.config.right_click.label());
         let _ = writeln!(s, "backend={}", self.config.backend.label());
         let _ = writeln!(s, "restore_on_launch={}", self.config.restore_on_launch);
         let _ = writeln!(s, "font_size={}", r.content_pt() as i32);
@@ -6839,9 +6874,22 @@ impl App {
                 match self.pw.renderer.as_ref().map(|r| r.hit_test(cx, cy)) {
                     Some(Hit::Content) => {
                         self.focus_pane_at(cx, cy);
-                        self.pw.pane_menu =
-                            Some(PaneMenu { x: cx, y: cy, hovered: None, target: MenuTarget::Pane });
-                        self.redraw();
+                        // right_click=paste (WT muscle memory): copy an active
+                        // selection then clear it, else paste. shift bypasses to
+                        // the context menu, which carries splits / pop-out
+                        if self.config.right_click == RightClick::Paste && !self.mods.shift_key() {
+                            if self.selection.is_some() {
+                                self.copy_selection();
+                                self.selection = None;
+                                self.redraw();
+                            } else {
+                                self.paste();
+                            }
+                        } else {
+                            self.pw.pane_menu =
+                                Some(PaneMenu { x: cx, y: cy, hovered: None, target: MenuTarget::Pane });
+                            self.redraw();
+                        }
                     }
                     Some(Hit::Button(Hot::Tab(i) | Hot::TabClose(i))) => {
                         self.pw.pane_menu = Some(PaneMenu {
@@ -8989,6 +9037,15 @@ mod tests {
         assert!(parse_persisted("mica=on").acrylic);
         assert!(!parse_persisted("acrylic=false").acrylic);
         assert!(!Persisted::default().acrylic);
+    }
+
+    #[test]
+    fn config_parses_right_click() {
+        assert_eq!(parse_persisted("right_click=paste").right_click, RightClick::Paste);
+        assert_eq!(parse_persisted("right_click=menu").right_click, RightClick::Menu);
+        // an unknown value warns and keeps the default (menu)
+        assert_eq!(parse_persisted("right_click=bogus").right_click, RightClick::Menu);
+        assert_eq!(Persisted::default().right_click, RightClick::Menu);
     }
 
     #[test]

@@ -76,7 +76,7 @@ A shell or profile can carry its own theme — `theme.<name>=<theme>` paints tha
 
 Drop files in `%APPDATA%\termie\`:
 
-- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` (drop-down hotkey), `plugin_sandbox=appcontainer` (sandbox every plugin), `latency_hud=true` (input-to-photon readout), `acrylic=true` (Win11 Mica backdrop behind a translucent window; `mica=true` also works), `term_program=ghostty` (override `$TERM_PROGRAM` for apps that only enable the kitty keyboard protocol on a hard-coded host allowlist; default is `termie`).
+- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` (drop-down hotkey), `plugin_sandbox=appcontainer` (sandbox every plugin), `latency_hud=true` (input-to-photon readout), `acrylic=true` (Win11 Mica backdrop behind a translucent window; `mica=true` also works), `right_click=paste` (right-click pastes, or copies an active selection and clears it, instead of opening the context menu — Windows Terminal style; `Shift+right-click` still opens the menu), `term_program=ghostty` (override `$TERM_PROGRAM` for apps that only enable the kitty keyboard protocol on a hard-coded host allowlist; default is `termie`).
 - `colors.conf` — override theme colors, one `key=color` per line (`fg`, `bg`, `cursor`, `sel`, `ansi0`..`ansi255`; `#rrggbb`, `#rgb`, or `r,g,b`).
 - `keybindings.conf` — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`.
 
