@@ -804,6 +804,70 @@ fn parse_combo(s: &str) -> Option<(ModifiersState, Key)> {
     key.map(|k| (mods, k))
 }
 
+/// format a key back to a keybindings.conf token, the inverse of parse_key. None
+/// for a key the syntax can't express (the '+' separator)
+fn key_label(key: &Key) -> Option<String> {
+    let named = |s: &str| Some(s.to_string());
+    match key {
+        Key::Character(c) => {
+            if c.as_str() == "+" {
+                return None; // '+' is the combo separator, unrepresentable in a chord
+            }
+            Some(c.to_string())
+        }
+        Key::Named(n) => match n {
+            NamedKey::Enter => named("enter"),
+            NamedKey::Tab => named("tab"),
+            NamedKey::Space => named("space"),
+            NamedKey::Escape => named("esc"),
+            NamedKey::ArrowUp => named("up"),
+            NamedKey::ArrowDown => named("down"),
+            NamedKey::ArrowLeft => named("left"),
+            NamedKey::ArrowRight => named("right"),
+            NamedKey::Insert => named("insert"),
+            NamedKey::Delete => named("delete"),
+            NamedKey::Home => named("home"),
+            NamedKey::End => named("end"),
+            NamedKey::PageUp => named("pageup"),
+            NamedKey::PageDown => named("pagedown"),
+            NamedKey::F1 => named("f1"),
+            NamedKey::F2 => named("f2"),
+            NamedKey::F3 => named("f3"),
+            NamedKey::F4 => named("f4"),
+            NamedKey::F5 => named("f5"),
+            NamedKey::F6 => named("f6"),
+            NamedKey::F7 => named("f7"),
+            NamedKey::F8 => named("f8"),
+            NamedKey::F9 => named("f9"),
+            NamedKey::F10 => named("f10"),
+            NamedKey::F11 => named("f11"),
+            NamedKey::F12 => named("f12"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// format a chord back to a keybindings.conf combo like "ctrl+shift+t"; None when
+/// the key can't be written (see key_label)
+fn combo_label(mods: &ModifiersState, key: &Key) -> Option<String> {
+    let mut s = String::new();
+    if mods.control_key() {
+        s.push_str("ctrl+");
+    }
+    if mods.shift_key() {
+        s.push_str("shift+");
+    }
+    if mods.alt_key() {
+        s.push_str("alt+");
+    }
+    if mods.super_key() {
+        s.push_str("super+");
+    }
+    s.push_str(&key_label(key)?);
+    Some(s)
+}
+
 /// where the active-tab index lands after the tab at `from` is moved to `to`:
 /// the active tab itself follows the move, tabs between the two slots shift one
 fn active_after_move(active: usize, from: usize, to: usize) -> usize {
@@ -978,8 +1042,32 @@ fn jumplist_entries() -> Vec<(String, String)> {
     v
 }
 
+/// keybinding-only action labels — the ones not in the command palette. several
+/// labels can alias one action; the first label of each action is the canonical
+/// name the generated keybindings.conf template uses
+const KEYBIND_ALIASES: &[(&str, PaletteAction)] = &[
+    ("copy", PaletteAction::Copy),
+    ("paste", PaletteAction::Paste),
+    ("find", PaletteAction::OpenFind),
+    ("toggle broadcast", PaletteAction::ToggleBroadcast),
+    ("broadcast", PaletteAction::ToggleBroadcast),
+    ("command palette", PaletteAction::OpenPalette),
+    ("palette", PaletteAction::OpenPalette),
+    ("toggle settings", PaletteAction::ToggleSettings),
+    ("font increase", PaletteAction::FontInc),
+    ("font bigger", PaletteAction::FontInc),
+    ("font decrease", PaletteAction::FontDec),
+    ("font smaller", PaletteAction::FontDec),
+    ("font reset", PaletteAction::FontReset),
+    ("close pane", PaletteAction::CloseFocusedPane),
+    ("prompt prev", PaletteAction::JumpPromptPrev),
+    ("previous prompt", PaletteAction::JumpPromptPrev),
+    ("prompt next", PaletteAction::JumpPromptNext),
+    ("next prompt", PaletteAction::JumpPromptNext),
+];
+
 /// resolve a keybindings.conf action label to an action — the palette entries
-/// plus the keybinding-only actions (copy/paste/find/font/select-tab/etc.)
+/// plus the keybinding-only aliases (copy/paste/find/font/select-tab/etc.)
 fn action_from_label(name: &str) -> Option<PaletteAction> {
     let n = name.trim();
     if let Some((_, a)) = all_palette_actions().iter().find(|(l, _)| l.eq_ignore_ascii_case(n)) {
@@ -992,36 +1080,27 @@ fn action_from_label(name: &str) -> Option<PaletteAction> {
     {
         return Some(PaletteAction::SelectTab(num - 1));
     }
-    Some(match lower.as_str() {
-        "copy" => PaletteAction::Copy,
-        "paste" => PaletteAction::Paste,
-        "find" => PaletteAction::OpenFind,
-        "broadcast" | "toggle broadcast" => PaletteAction::ToggleBroadcast,
-        "command palette" | "palette" => PaletteAction::OpenPalette,
-        "toggle settings" => PaletteAction::ToggleSettings,
-        "font increase" | "font bigger" => PaletteAction::FontInc,
-        "font decrease" | "font smaller" => PaletteAction::FontDec,
-        "font reset" => PaletteAction::FontReset,
-        "close pane" => PaletteAction::CloseFocusedPane,
-        "prompt prev" | "previous prompt" => PaletteAction::JumpPromptPrev,
-        "prompt next" | "next prompt" => PaletteAction::JumpPromptNext,
-        _ => return None,
-    })
+    KEYBIND_ALIASES.iter().find(|(l, _)| l.eq_ignore_ascii_case(n)).map(|(_, a)| *a)
 }
 
-/// load keybindings: built-in defaults first, then user overrides from
-/// %APPDATA%\termie\keybindings.conf. `combo=none` (or `unbind`) frees a chord
-/// so it falls through to the program; any other line overrides; unknown actions
-/// and unparseable combos warn instead of silently dropping
-fn load_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
-    let mut out = default_keybindings();
-    let Some(dir) = std::env::var_os("APPDATA") else {
-        return out;
-    };
-    let path = std::path::Path::new(&dir).join("termie").join("keybindings.conf");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return out;
-    };
+/// the canonical label for an action, for the keybindings.conf template: the
+/// palette label when it has one, else the keybinding-only alias
+fn action_label(action: PaletteAction) -> Option<String> {
+    if let PaletteAction::SelectTab(n) = action {
+        return Some(format!("select tab {}", n + 1));
+    }
+    PALETTE_ACTIONS
+        .iter()
+        .chain(KEYBIND_ALIASES)
+        .find(|(_, a)| *a == action)
+        .map(|(l, _)| l.to_string())
+}
+
+/// apply a keybindings.conf body onto `out`, returning how many lines were
+/// ignored — no '=', an unparseable combo, or an unknown action; each also warns.
+/// `combo=none` (or `unbind`) frees a chord and doesn't count as ignored
+fn apply_keybindings_conf(text: &str, out: &mut Vec<(ModifiersState, Key, PaletteAction)>) -> usize {
+    let mut ignored = 0;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1029,10 +1108,12 @@ fn load_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         }
         let Some((combo, action)) = line.split_once('=') else {
             log::warn!("keybindings.conf: no '=' in line: {line}");
+            ignored += 1;
             continue;
         };
         let Some((mods, key)) = parse_combo(combo.trim()) else {
             log::warn!("keybindings.conf: unparseable combo: {}", combo.trim());
+            ignored += 1;
             continue;
         };
         let action = action.trim();
@@ -1043,10 +1124,75 @@ fn load_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         }
         match action_from_label(action) {
             Some(a) => out.push((mods, key, a)),
-            None => log::warn!("keybindings.conf: unknown action '{action}' (combo {})", combo.trim()),
+            None => {
+                log::warn!("keybindings.conf: unknown action '{action}' (combo {})", combo.trim());
+                ignored += 1;
+            }
+        }
+    }
+    ignored
+}
+
+/// load keybindings (built-in defaults + user overrides from
+/// %APPDATA%\termie\keybindings.conf) with the count of ignored config lines
+fn load_keybindings() -> (Vec<(ModifiersState, Key, PaletteAction)>, usize) {
+    let mut out = default_keybindings();
+    let Some(dir) = std::env::var_os("APPDATA") else {
+        return (out, 0);
+    };
+    let path = std::path::Path::new(&dir).join("termie").join("keybindings.conf");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (out, 0);
+    };
+    let ignored = apply_keybindings_conf(&text, &mut out);
+    (out, ignored)
+}
+
+/// a fully commented keybindings.conf listing every action with its default
+/// chord, generated from default_keybindings + PALETTE_ACTIONS so it never drifts
+fn keybindings_template() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    out.push_str(
+        "# termie keybindings\n\
+         #\n\
+         # each line is `combo = action`. a combo joins modifiers (ctrl, shift, alt,\n\
+         # super) and a key with + — a letter/digit, or a name like enter tab esc up\n\
+         # down left right home end pageup pagedown insert delete f1..f12, e.g.\n\
+         # ctrl+shift+t. set the action to `none` (or `unbind`) to free a chord.\n\
+         #\n\
+         # every line below is commented out and shows the built-in default;\n\
+         # uncomment and edit to change it.\n\n",
+    );
+    let mut shown: Vec<PaletteAction> = Vec::new();
+    for (m, k, a) in default_keybindings() {
+        if let (Some(combo), Some(label)) = (combo_label(&m, &k), action_label(a)) {
+            let _ = writeln!(out, "# {combo} = {label}");
+            shown.push(a);
+        }
+    }
+    out.push_str("\n# no default chord (add a combo before the =):\n");
+    for (label, action) in PALETTE_ACTIONS {
+        if !shown.contains(action) {
+            let _ = writeln!(out, "# <combo> = {label}");
         }
     }
     out
+}
+
+/// write the commented template on first run so keybindings.conf is discoverable;
+/// never touches an existing config
+fn write_keybindings_template_if_absent() {
+    let Some(dir) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir).join("termie");
+    let path = dir.join("keybindings.conf");
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, keybindings_template());
 }
 
 /// the git branch (or short detached hash) for a cwd, walking up to the repo root.
@@ -2557,6 +2703,9 @@ struct App {
     /// user keybindings (combo -> palette action) loaded from disk; checked
     /// before the built-in shortcuts, empty when there is no config file
     keybindings: Vec<(ModifiersState, Key, PaletteAction)>,
+    /// keybindings.conf lines ignored at load; surfaced once as a status notice
+    /// after the first frame (the renderer doesn't exist yet at load time)
+    kb_ignored: usize,
     settings_anim: Option<Instant>,
     /// set when the focused pane changes, so its accent border eases in instead
     /// of snapping; cleared once the ease settles
@@ -2667,6 +2816,7 @@ impl App {
         // the default distro for the plain wsl shell
         pty::set_profiles(with_wsl_profiles(p.profiles.clone(), win::wsl_distros()));
         let cli = parse_args(std::env::args().skip(1));
+        let (keybindings, kb_ignored) = load_keybindings();
         App {
             proxy,
             kitty_demo_pending: cli.kitty_demo,
@@ -2699,7 +2849,8 @@ impl App {
             cur_sat: None,
             next_id: 0,
             mods: ModifiersState::empty(),
-            keybindings: load_keybindings(),
+            keybindings,
+            kb_ignored,
             shown: false,
             pool: Vec::new(),
             selection: None,
@@ -2906,6 +3057,10 @@ impl App {
         // watch colors.conf/keybindings.conf so hand edits apply live
         if !self.conf_watch_spawned {
             self.conf_watch_spawned = true;
+            // drop a fully-commented keybindings.conf on first run so the format
+            // and every action are discoverable; if the watcher then reloads it,
+            // every line is a comment so it just re-applies the defaults
+            write_keybindings_template_if_absent();
             spawn_conf_watcher(self.proxy.clone());
         }
         // an inbound default-terminal session becomes tab one — ephemeral like
@@ -2959,6 +3114,12 @@ impl App {
         timing("window shown");
         self.shown = true;
         window.request_redraw();
+        // surface any keybindings.conf parse errors now that the status bar exists
+        if self.kb_ignored > 0 {
+            let noun = if self.kb_ignored == 1 { "line" } else { "lines" };
+            let msg = format!("keybindings.conf: {} {noun} ignored", self.kb_ignored);
+            self.show_notice(&msg);
+        }
         // populate the taskbar jump list and keep the default-terminal COM
         // registration pointed at this exe, both off-thread; COM shell calls
         // have no business on the startup render path
@@ -7930,7 +8091,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::ToggleQuake => self.toggle_quake(),
             UserEvent::UserConfChanged => {
-                self.keybindings = load_keybindings();
+                let (kb, ignored) = load_keybindings();
+                self.keybindings = kb;
+                // a live edit that introduces an error gets the same notice as boot
+                if ignored > 0 {
+                    let noun = if ignored == 1 { "line" } else { "lines" };
+                    let msg = format!("keybindings.conf: {ignored} {noun} ignored");
+                    self.show_notice(&msg);
+                }
                 let overrides = load_color_overrides();
                 if let Some(r) = self.pw.renderer.as_mut() {
                     r.set_color_overrides(overrides.clone());
@@ -9019,6 +9187,38 @@ mod tests {
         assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));
         assert_eq!(action_from_label("select tab 3"), Some(PaletteAction::SelectTab(2)));
         assert_eq!(action_from_label("bogus action"), None);
+    }
+
+    #[test]
+    fn keybindings_template_lists_every_action_commented() {
+        let t = keybindings_template();
+        // every palette action label appears (bound in the defaults block or in
+        // the no-default block), so the template can't silently drop an action
+        for (label, _) in PALETTE_ACTIONS {
+            assert!(t.contains(label), "template missing action label: {label}");
+        }
+        // keybinding-only actions with defaults show up with their alias label
+        assert!(t.contains("# ctrl+, = toggle settings"));
+        assert!(t.contains("# ctrl+1 = select tab 1"));
+        // nothing is active: every non-blank line is a comment
+        assert!(t.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')));
+    }
+
+    #[test]
+    fn keybindings_conf_counts_ignored_lines() {
+        let mut out = default_keybindings();
+        let ignored = apply_keybindings_conf(
+            "# a comment, not counted\n\
+             ctrl+shift+q = copy\n\
+             this line has no equals\n\
+             ctrl+nope = paste\n\
+             ctrl+j = not a real action\n\
+             ctrl+k = none\n",
+            &mut out,
+        );
+        // missing '=', unparseable combo, and unknown action each count once; the
+        // comment, the valid override, and the `none` unbind do not
+        assert_eq!(ignored, 3);
     }
 
     #[test]
