@@ -169,6 +169,7 @@ pub struct PaletteView {
     pub query: String,
     pub items: Vec<String>,
     pub selected: usize,
+    pub scope: &'static str,
 }
 
 /// right-click context menu: a small overlay at (x, y) listing `items`. the
@@ -4093,7 +4094,7 @@ impl Renderer {
         // search input row, centered in [by, by+row_h] — an extra top offset
         // here used to push the caret and descenders 1px past the separator
         let iy = (by + (row_h - chrome_h) / 2.0).round();
-        let prompt = format!("\u{f002}  {}", query);
+        let prompt = format!("\u{f002}  {}  {}", pv.scope, query);
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, iy, &prompt, TEXT_2, 1.0, track);
         let cwid = self.text_w(FontId::Chrome, &prompt, track);
         Self::push_rect(out, bx + pad + cwid + 2.0 * s, iy, 2.0 * s, chrome_h, PAPER, 1.0);
@@ -5612,6 +5613,7 @@ mod hit_tests {
             query: "ne".into(),
             items: vec!["new tab".into(), "new tab here".into(), "new window".into()],
             selected: 0,
+            scope: "commands",
         }));
         r.settle_overlay();
         let _ = r.render_png(&[], true, false, false, &tmp_png("palette"));
@@ -5633,6 +5635,7 @@ mod hit_tests {
             query: String::new(),
             items: (0..20).map(|i| format!("font {i}")).collect(),
             selected: 15,
+            scope: "fonts",
         }));
         r.settle_overlay();
         let _ = r.render_png(&[], true, false, false, &tmp_png("palette"));

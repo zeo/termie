@@ -10,6 +10,7 @@
 - **Old MSI leftovers can't survive a native install.** Removing the previous per-machine MSI now elevates via UAC when a quiet uninstall is not enough, then scrubs `Program Files\termie`, the all-users Start shortcut, and a machine PATH entry so Search never shows two termies side by side.
 
 ### Interface
+- **Search every open tab.** Run `tab search` from the command palette to open a numbered fuzzy switcher over the current window's tabs. Duplicate titles stay distinct by number, the current tab starts selected, keyboard and mouse selection both work, and the action can be assigned directly in `keybindings.conf`.
 - **New window from the keyboard.** `Ctrl+Shift+N` opens one fresh window in the focused pane's shell and directory, matching Windows Terminal's standard chord without restoring an unrelated saved layout. The action is also on the command palette and is rebindable.
 - **Select all.** `Ctrl+Shift+A` selects the focused pane's retained history and live screen for copying, with the action also available from the command palette and `keybindings.conf`. "Jump to attention" moves to `Ctrl+Alt+A` so the standard selection chord wins.
 - **Word movement in mark mode.** `Ctrl+Left` / `Ctrl+Right` move to word boundaries, and adding `Shift` extends the selection by words. Movement crosses wrapped lines and scrollback instead of stopping at the visible row.

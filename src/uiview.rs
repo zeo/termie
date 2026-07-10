@@ -85,6 +85,7 @@ pub fn maybe_run() -> bool {
                     "toggle broadcast".into(),
                 ],
                 selected: 1,
+                scope: "commands",
             }));
             r.settle_overlay();
         }

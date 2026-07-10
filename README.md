@@ -22,7 +22,7 @@ Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG) and sixel �
 
 On Windows 11 termie can be the **default terminal**: run "default terminal" from the palette once, and console apps launched from the run box, the start menu, or a double-clicked script open in a termie window instead of the legacy console host. The same palette action turns it back off (your previous choice is restored), and so does uninstalling.
 
-A command palette (`Ctrl+P`) for fuzzy access to every action. Seven built-in themes — three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord — a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. An optional Quake-style drop-down (`quake_key`).
+A command palette (`Ctrl+P`) for fuzzy access to every action, plus a searchable numbered tab switcher (`tab search` in the palette) for crowded windows. Seven built-in themes — three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord — a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. An optional Quake-style drop-down (`quake_key`).
 
 A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and can be confined to a Windows AppContainer. An in-app marketplace browses and installs them.
 

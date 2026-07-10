@@ -248,6 +248,8 @@ enum PaletteAction {
     SplitH,
     NextTab,
     PrevTab,
+    /// searchable switcher over every tab in the current window
+    TabSearch,
     /// reorder: nudge the active tab one slot along the strip
     MoveTabLeft,
     MoveTabRight,
@@ -301,7 +303,7 @@ enum PaletteAction {
     /// check for a newer release / confirm installing a pending one
     InstallUpdate,
     /// 0-based tab index (Ctrl+1..9)
-    SelectTab(u8),
+    SelectTab(usize),
 }
 
 const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
@@ -317,6 +319,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("split horizontal", PaletteAction::SplitH),
     ("next tab", PaletteAction::NextTab),
     ("previous tab", PaletteAction::PrevTab),
+    ("tab search", PaletteAction::TabSearch),
     ("move tab left", PaletteAction::MoveTabLeft),
     ("move tab right", PaletteAction::MoveTabRight),
     ("close tab", PaletteAction::CloseTab),
@@ -460,9 +463,33 @@ fn palette_filter(query: &str) -> Vec<(&'static str, PaletteAction)> {
     scored.into_iter().map(|(_, l, a)| (l, a)).collect()
 }
 
+/// searchable tab rows, numbered for duplicate titles and direct numeric lookup
+fn tab_filter(query: &str, labels: &[String]) -> Vec<(String, usize)> {
+    let query = query.trim();
+    let mut rows: Vec<(i32, usize, String)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| {
+            let row = format!("{}  {label}", i + 1);
+            fuzzy_score(query, &row).map(|score| (score, i, row))
+        })
+        .collect();
+    if !query.is_empty() {
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    rows.into_iter().map(|(_, i, row)| (row, i)).collect()
+}
+
+#[derive(Clone, Copy)]
+enum PaletteMode {
+    Commands,
+    Tabs,
+}
+
 struct PaletteState {
     query: String,
     selected: usize,
+    mode: PaletteMode,
 }
 
 /// right-click context menu state: anchor point, hovered item, and what it acts on
@@ -1051,7 +1078,7 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         (ctrl | ModifiersState::ALT, chr("a"), A::JumpAttention),
     ];
     for n in 1u8..=9 {
-        v.push((ctrl, chr(&n.to_string()), A::SelectTab(n - 1)));
+        v.push((ctrl, chr(&n.to_string()), A::SelectTab((n - 1) as usize)));
     }
     v
 }
@@ -1123,7 +1150,7 @@ fn action_from_label(name: &str) -> Option<PaletteAction> {
         && let Ok(num) = d.trim().parse::<u8>()
         && (1..=9).contains(&num)
     {
-        return Some(PaletteAction::SelectTab(num - 1));
+        return Some(PaletteAction::SelectTab((num - 1) as usize));
     }
     KEYBIND_ALIASES.iter().find(|(l, _)| l.eq_ignore_ascii_case(n)).map(|(_, a)| *a)
 }
@@ -3784,7 +3811,11 @@ impl App {
         }
         self.font_pick_orig =
             self.pw.renderer.as_ref().map(|r| r.font_name().to_string());
-        self.font_pick = Some(PaletteState { query: String::new(), selected: 0 });
+        self.font_pick = Some(PaletteState {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::Commands,
+        });
         // start the highlight on the current font if it's in the list
         if let Some(cur) = self.font_pick_orig.as_deref() {
             let list = self.font_pick_filter("");
@@ -3811,6 +3842,45 @@ impl App {
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
         scored.into_iter().map(|(_, f)| f.clone()).collect()
+    }
+
+    fn palette_choices(&self, mode: PaletteMode, query: &str) -> Vec<(String, PaletteAction)> {
+        match mode {
+            PaletteMode::Commands => palette_filter(query)
+                .into_iter()
+                .map(|(label, action)| (label.to_string(), action))
+                .collect(),
+            PaletteMode::Tabs => {
+                let labels: Vec<String> = self.pw.tabs.iter().map(tab_label).collect();
+                tab_filter(query, &labels)
+                    .into_iter()
+                    .map(|(label, tab)| (label, PaletteAction::SelectTab(tab)))
+                    .collect()
+            }
+        }
+    }
+
+    fn open_tab_search(&mut self) {
+        self.palette = Some(PaletteState {
+            query: String::new(),
+            selected: self.pw.active_tab,
+            mode: PaletteMode::Tabs,
+        });
+        self.redraw();
+    }
+
+    fn run_palette_choice(
+        &mut self,
+        mode: PaletteMode,
+        query: &str,
+        selected: usize,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let choices = self.palette_choices(mode, query);
+        let index = selected.min(choices.len().saturating_sub(1));
+        if let Some(&(_, action)) = choices.get(index) {
+            self.run_action(action, event_loop);
+        }
     }
 
     /// preview the highlighted font without committing (live as you navigate)
@@ -4264,15 +4334,21 @@ impl App {
                 query: fp.query.clone(),
                 items: self.font_pick_filter(&fp.query),
                 selected: fp.selected,
+                scope: "fonts",
             })
         } else {
-            self.palette.as_ref().map(|p| render::PaletteView {
-            query: p.query.clone(),
-            items: palette_filter(&p.query)
-                .into_iter()
-                .map(|(l, _)| l.to_string())
-                .collect(),
-            selected: p.selected,
+            self.palette.as_ref().map(|p| {
+                let items: Vec<String> =
+                    self.palette_choices(p.mode, &p.query).into_iter().map(|(l, _)| l).collect();
+                render::PaletteView {
+                    query: p.query.clone(),
+                    selected: p.selected.min(items.len().saturating_sub(1)),
+                    items,
+                    scope: match p.mode {
+                        PaletteMode::Commands => "commands",
+                        PaletteMode::Tabs => "tabs",
+                    },
+                }
             })
         };
         let find_view = self.build_find_view();
@@ -4982,6 +5058,7 @@ impl App {
                     self.switch_tab((self.pw.active_tab + n - 1) % n);
                 }
             }
+            PaletteAction::TabSearch => self.open_tab_search(),
             PaletteAction::MoveTabLeft => self.shift_active_tab(-1),
             PaletteAction::MoveTabRight => self.shift_active_tab(1),
             PaletteAction::CloseTab => {
@@ -5055,7 +5132,11 @@ impl App {
             }
             PaletteAction::OpenFind => self.open_find(),
             PaletteAction::OpenPalette => {
-                self.palette = Some(PaletteState { query: String::new(), selected: 0 });
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    selected: 0,
+                    mode: PaletteMode::Commands,
+                });
                 self.redraw();
             }
             PaletteAction::Copy => self.copy_selection(),
@@ -5070,7 +5151,7 @@ impl App {
                     self.redraw();
                 }
             }
-            PaletteAction::SelectTab(n) => self.switch_tab(n as usize),
+            PaletteAction::SelectTab(n) => self.switch_tab(n),
         }
         true
     }
@@ -7149,11 +7230,13 @@ impl App {
                         let inside =
                             self.pw.renderer.as_ref().is_some_and(|r| r.palette_contains(cx, cy));
                         if let Some(i) = row {
-                            let q = self.palette.as_ref().map(|p| p.query.clone()).unwrap_or_default();
+                            let (mode, q) = self
+                                .palette
+                                .as_ref()
+                                .map(|p| (p.mode, p.query.clone()))
+                                .unwrap_or((PaletteMode::Commands, String::new()));
                             self.palette = None;
-                            if let Some(&(_, a)) = palette_filter(&q).get(i) {
-                                self.run_action(a, event_loop);
-                            }
+                            self.run_palette_choice(mode, &q, i, event_loop);
                             self.redraw();
                         } else if !inside {
                             self.palette = None;
@@ -7797,23 +7880,22 @@ impl App {
                     self.redraw();
                 }
                 Key::Named(NamedKey::Enter) => {
-                    let (q, sel) = self
+                    let (mode, q, sel) = self
                         .palette
                         .as_ref()
-                        .map(|p| (p.query.clone(), p.selected))
-                        .unwrap_or_default();
+                        .map(|p| (p.mode, p.query.clone(), p.selected))
+                        .unwrap_or((PaletteMode::Commands, String::new(), 0));
                     self.palette = None;
-                    if let Some(&(_, a)) = palette_filter(&q).get(sel) {
-                        self.run_action(a, event_loop);
-                    }
+                    self.run_palette_choice(mode, &q, sel, event_loop);
                     self.redraw();
                 }
                 Key::Named(NamedKey::ArrowDown) => {
-                    let len = self
+                    let (mode, query) = self
                         .palette
                         .as_ref()
-                        .map(|p| palette_filter(&p.query).len())
-                        .unwrap_or(0);
+                        .map(|p| (p.mode, p.query.clone()))
+                        .unwrap_or((PaletteMode::Commands, String::new()));
+                    let len = self.palette_choices(mode, &query).len();
                     if let Some(p) = self.palette.as_mut()
                         && len > 0 {
                             p.selected = (p.selected + 1) % len;
@@ -7821,11 +7903,12 @@ impl App {
                     self.redraw();
                 }
                 Key::Named(NamedKey::ArrowUp) => {
-                    let len = self
+                    let (mode, query) = self
                         .palette
                         .as_ref()
-                        .map(|p| palette_filter(&p.query).len())
-                        .unwrap_or(0);
+                        .map(|p| (p.mode, p.query.clone()))
+                        .unwrap_or((PaletteMode::Commands, String::new()));
+                    let len = self.palette_choices(mode, &query).len();
                     if let Some(p) = self.palette.as_mut()
                         && len > 0 {
                             p.selected = (p.selected + len - 1) % len;
@@ -9504,6 +9587,7 @@ mod tests {
         // label resolution covers palette + keybinding-only + select-tab
         assert_eq!(action_from_label("new tab"), Some(PaletteAction::NewTab));
         assert_eq!(action_from_label("new window"), Some(PaletteAction::NewWindow));
+        assert_eq!(action_from_label("tab search"), Some(PaletteAction::TabSearch));
         assert_eq!(action_from_label("reopen closed tab"), Some(PaletteAction::ReopenTab));
         assert_eq!(action_from_label("copy"), Some(PaletteAction::Copy));
         assert_eq!(action_from_label("select tab 3"), Some(PaletteAction::SelectTab(2)));
@@ -9691,6 +9775,21 @@ mod tests {
         assert!(r.iter().all(|(l, _)| fuzzy_score("split", l).is_some()));
         assert!(r.first().map(|(l, _)| l.starts_with("split")).unwrap_or(false));
         assert_eq!(palette_filter("").len(), all_palette_actions().len());
+    }
+
+    #[test]
+    fn tab_search_numbers_duplicates_and_filters_fuzzily() {
+        let labels = vec!["repo".to_string(), "repo".to_string(), "logs".to_string()];
+        assert_eq!(
+            tab_filter("", &labels),
+            vec![
+                ("1  repo".to_string(), 0),
+                ("2  repo".to_string(), 1),
+                ("3  logs".to_string(), 2),
+            ]
+        );
+        assert_eq!(tab_filter("2", &labels), vec![("2  repo".to_string(), 1)]);
+        assert_eq!(tab_filter("lg", &labels), vec![("3  logs".to_string(), 2)]);
     }
 
     #[test]
