@@ -483,6 +483,41 @@ fn cwd_label(cwd: Option<&str>) -> String {
     }
 }
 
+/// conpty and the shells announce themselves through OSC 0/2 the moment a pane
+/// spawns (exe paths, bare shell names); letting those through would displace
+/// the more useful cwd label on every tab
+fn boring_title(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    if lower.ends_with(".exe")
+        || lower.starts_with("\\\\")
+        || lower.as_bytes().get(1..3) == Some(b":\\")
+        || lower.as_bytes().get(1..3) == Some(b":/")
+    {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "pwsh" | "powershell" | "windows powershell" | "powershell 7" | "cmd"
+            | "command prompt" | "nu" | "nushell" | "bash" | "wsl"
+    )
+}
+
+/// the label a tab shows: a user rename wins, then a meaningful OSC 0/2 title
+/// from the focused pane (agents report status this way), then its cwd
+fn tab_label(tab: &Tab) -> String {
+    if let Some(title) = tab.title.as_deref().filter(|s| !s.is_empty()) {
+        return title.to_string();
+    }
+    let pane = tab.root.as_ref().and_then(|r| find_pane(r, tab.focused));
+    if let Some(p) = pane {
+        let t = p.term.title.trim();
+        if !t.is_empty() && !boring_title(t) {
+            return t.chars().take(64).collect();
+        }
+    }
+    cwd_label(pane.and_then(|p| p.term.cwd.as_deref()))
+}
+
 /// turn an OSC-7 file:// uri into a filesystem path (forward slashes are fine for std::fs)
 fn cwd_path(cwd: Option<&str>) -> Option<String> {
     let u = cwd?;
@@ -3469,9 +3504,13 @@ impl App {
         let title = self
             .pw.tabs
             .get(self.pw.active_tab)
-            .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, t.focused)))
-            .and_then(|p| p.term.cwd.as_deref())
-            .map(|c| format!("{} — termie", cwd_label(Some(c))))
+            .filter(|t| {
+                t.root
+                    .as_ref()
+                    .and_then(|r| find_pane(r, t.focused))
+                    .is_some_and(|p| p.term.cwd.is_some() || !p.term.title.is_empty())
+            })
+            .map(|t| format!("{} — termie", tab_label(t)))
             .unwrap_or_else(|| "termie".to_string());
         if self.last_title != title {
             if let Some(w) = &self.pw.window {
@@ -3623,22 +3662,7 @@ impl App {
         {
             t.attention = false;
         }
-        let labels: Vec<String> = self
-            .pw.tabs
-            .iter()
-            .map(|t| {
-                // a user-given title wins; otherwise label by the focused cwd
-                if let Some(title) = t.title.as_deref().filter(|s| !s.is_empty()) {
-                    return title.to_string();
-                }
-                let cwd = t
-                    .root
-                    .as_ref()
-                    .and_then(|r| find_pane(r, t.focused))
-                    .and_then(|p| p.term.cwd.as_deref());
-                cwd_label(cwd)
-            })
-            .collect();
+        let labels: Vec<String> = self.pw.tabs.iter().map(tab_label).collect();
         let attention: Vec<bool> = self.pw.tabs.iter().map(|t| t.attention).collect();
         let active = self.pw.active_tab;
         let cwd: Option<String> = self
@@ -6419,6 +6443,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 p.term.cwd_dirty = false;
                                 cwd_changed = true;
                             }
+                            if p.term.title_dirty {
+                                p.term.title_dirty = false;
+                                cwd_changed = true;
+                            }
                             in_sync = p.term.sync_output;
                             if !p.term.responses.is_empty() {
                                 responses = Some(std::mem::take(&mut p.term.responses));
@@ -6470,6 +6498,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if p.term.cwd_dirty {
                                 p.term.cwd_dirty = false;
+                                sat_cwd = true;
+                            }
+                            if p.term.title_dirty {
+                                p.term.title_dirty = false;
                                 sat_cwd = true;
                             }
                             if !p.term.responses.is_empty() {
@@ -6632,7 +6664,7 @@ impl ApplicationHandler<UserEvent> for App {
                             sp.pty.write(&r);
                         }
                 }
-                // relabel tabs only when a tab pane's cwd actually changed
+                // relabel tabs only when a tab pane's cwd or title actually changed
                 if cwd_changed {
                     self.sync_tabs();
                 }
@@ -7345,6 +7377,26 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boring_titles_yield_to_the_cwd_label() {
+        // conpty announces the spawned exe; shells announce themselves
+        for t in [
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "Administrator: C:\\Windows\\system32\\cmd.exe",
+            "c:/windows/system32/cmd.exe",
+            "\\\\server\\share\\tool.exe",
+            "Windows PowerShell",
+            "pwsh",
+            "Command Prompt",
+        ] {
+            assert!(boring_title(t), "{t:?} should be boring");
+        }
+        // titles an app set on purpose survive
+        for t in ["✳ fixing tests", "vim readme.md", "3/5 done", "user@host: ~/src"] {
+            assert!(!boring_title(t), "{t:?} should win the label");
+        }
+    }
 
     #[test]
     fn merge_progress_picks_the_taskbar_value() {

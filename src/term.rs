@@ -70,6 +70,8 @@ pub struct Terminal {
     pub alt_scroll: bool,
 
     pub title: String,
+    /// set when OSC 0/2 changes the title; drained by the app like cwd_dirty
+    pub title_dirty: bool,
     pub cwd: Option<String>,
     /// set when OSC-7 updates cwd; the app consumes it to relabel tabs instead
     /// of rescanning every output chunk for the escape (which also missed an
@@ -129,6 +131,7 @@ impl Terminal {
             focus_events: false,
             alt_scroll: true,
             title: String::new(),
+            title_dirty: false,
             cwd: None,
             cwd_dirty: false,
             last_osc133: None,
@@ -1061,7 +1064,13 @@ impl Perform for Terminal {
         match kind {
             b"0" | b"2" => {
                 if let Some(t) = params.get(1) {
-                    self.title = String::from_utf8_lossy(t).into_owned();
+                    // same control-strip + length bound as notifications: the
+                    // title feeds the tab strip and the OS window title
+                    let title = notification_text(&[t]);
+                    if title != self.title {
+                        self.title = title;
+                        self.title_dirty = true;
+                    }
                 }
             }
             b"7" => {
@@ -1905,6 +1914,22 @@ mod tests {
         // RIS clears a live progress
         feed(&mut t, b"\x1b]9;4;1;10\x1b\\\x1bc");
         assert_eq!(t.progress, None);
+    }
+
+    #[test]
+    fn osc_title_dirty_only_on_real_change() {
+        let mut t = Terminal::new(2, 10);
+        feed(&mut t, b"\x1b]2;claude \x01- working\x1b\\");
+        assert_eq!(t.title, "claude - working");
+        assert!(t.title_dirty);
+        t.title_dirty = false;
+        // the same title again is not a change
+        feed(&mut t, b"\x1b]2;claude - working\x1b\\");
+        assert!(!t.title_dirty);
+        // OSC 0 (icon+title) goes through the same path
+        feed(&mut t, b"\x1b]0;done\x1b\\");
+        assert_eq!(t.title, "done");
+        assert!(t.title_dirty);
     }
 
     #[test]
