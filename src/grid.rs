@@ -1690,6 +1690,21 @@ impl Grid {
         self.placements.retain(|p| p.image_id != image_id);
     }
 
+    /// drop the placements matching a predicate, returning the image ids that
+    /// lost one (kitty a=d sub-targets: by z-index, at the cursor cell)
+    pub fn remove_placements_where(&mut self, hit: impl Fn(&Placement) -> bool) -> Vec<u32> {
+        let mut dropped = Vec::new();
+        self.placements.retain(|p| {
+            if hit(p) {
+                dropped.push(p.image_id);
+                false
+            } else {
+                true
+            }
+        });
+        dropped
+    }
+
     /// drop every image placement (kitty bare a=d delete-all, no id specified)
     pub fn clear_placements(&mut self) {
         self.placements.clear();

@@ -126,6 +126,9 @@ pub struct KittyCmd {
     pub rows: u32,
     /// z=: stacking order; negative draws beneath the pane's text
     pub z: i32,
+    /// d=: delete target letter (a=d only); 0 when absent. uppercase variants
+    /// also free the stored image data
+    pub delete: u8,
     /// m=1: more chunks of this image follow
     pub more: bool,
     /// C=1: leave the cursor where it is instead of stepping past the placement
@@ -158,6 +161,7 @@ impl KittyCmd {
             cols: 0,
             rows: 0,
             z: 0,
+            delete: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -180,6 +184,7 @@ impl KittyCmd {
                 b"c" => cmd.cols = vs.parse().ok()?,
                 b"r" => cmd.rows = vs.parse().ok()?,
                 b"z" => cmd.z = vs.parse().ok()?,
+                b"d" => cmd.delete = val.first().copied().unwrap_or(0),
                 b"m" => cmd.more = vs == "1",
                 b"C" => cmd.no_cursor_move = vs == "1",
                 b"q" => cmd.quiet = vs.parse().unwrap_or(0),

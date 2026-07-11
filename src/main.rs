@@ -2120,15 +2120,64 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
             }
         }
         b'd' => {
-            // bare a=d (no i=) means delete-all: the d= sub-target key isn't
-            // parsed, so cmd.id stays 0 and an id-scoped removal would be a no-op.
-            // also free the decoded pixels (delete-all means images + placements)
-            if cmd.id == 0 {
-                term.images.clear();
-                term.grid.clear_placements();
-            } else {
-                term.images.delete(cmd.id);
-                term.grid.remove_placements(cmd.id);
+            // d= names the delete target; an UPPERCASE letter also frees the
+            // stored image data, lowercase drops placements only (the store's
+            // count/byte caps bound whatever lingers). absent d= defaults to
+            // 'a' per the spec, except the legacy i=-only form which keeps
+            // its old free-the-image behavior
+            let sel = match (cmd.delete, cmd.id) {
+                (0, 0) => b'a',
+                (0, _) => b'I',
+                (d, _) => d,
+            };
+            let free = sel.is_ascii_uppercase();
+            let dropped = match sel.to_ascii_lowercase() {
+                b'i' if cmd.id != 0 => {
+                    term.grid.remove_placements(cmd.id);
+                    vec![cmd.id]
+                }
+                b'z' => term.grid.remove_placements_where(|p| p.z == cmd.z),
+                // at the cursor cell: a placement is hit when its cell box
+                // (or its pixel size over the cell metrics) covers the cursor
+                b'c' => {
+                    let (r, c) = (term.grid.cursor.row, term.grid.cursor.col);
+                    let (cw, ch) = term.cell_px();
+                    let cw = if cw > 0 { cw as usize } else { 10 };
+                    let ch = if ch > 0 { ch as usize } else { 20 };
+                    let cursor_abs =
+                        term.grid.abs_base() + term.grid.scrollback.len() as u64 + r as u64;
+                    let boxes: std::collections::HashMap<u32, (usize, usize)> = term
+                        .grid
+                        .placements()
+                        .iter()
+                        .map(|p| p.image_id)
+                        .filter_map(|id| {
+                            term.images.get(id).map(|i| {
+                                (id, ((i.width as usize).div_ceil(cw), (i.height as usize).div_ceil(ch)))
+                            })
+                        })
+                        .collect();
+                    term.grid.remove_placements_where(|p| {
+                        let (nat_c, nat_r) = boxes.get(&p.image_id).copied().unwrap_or((1, 1));
+                        let cols = if p.cols > 0 { p.cols as usize } else { nat_c };
+                        let rows = if p.rows > 0 { p.rows as usize } else { nat_r };
+                        p.col <= c
+                            && c < p.col + cols.max(1)
+                            && p.abs_line <= cursor_abs
+                            && cursor_abs < p.abs_line + rows.max(1) as u64
+                    })
+                }
+                _ => {
+                    // 'a' and any target this v1 doesn't know: all placements
+                    let all: Vec<u32> = term.grid.placements().iter().map(|p| p.image_id).collect();
+                    term.grid.clear_placements();
+                    all
+                }
+            };
+            if free {
+                for id in dropped {
+                    term.images.delete(id);
+                }
             }
         }
         b'q' if cmd.quiet == 0 => {
@@ -10535,6 +10584,7 @@ mod tests {
             cols: 3,
             rows: 2,
             z: 0,
+            delete: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -10556,6 +10606,7 @@ mod tests {
             cols: 0,
             rows: 0,
             z: 0,
+            delete: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -10575,6 +10626,7 @@ mod tests {
             cols,
             rows,
             z: 0,
+            delete: 0,
             more: false,
             no_cursor_move: no_move,
             quiet: 2,
@@ -10627,6 +10679,7 @@ mod tests {
             cols: 0,
             rows: 0,
             z: 0,
+            delete: 0,
             more: false,
             no_cursor_move: false,
             quiet: 2,
@@ -10635,6 +10688,58 @@ mod tests {
         handle_kitty(&mut term, &done);
         assert_eq!(term.grid.placements().len(), 1);
         assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 4));
+    }
+
+    fn kitty_del(delete: u8, id: u32, z: i32) -> apc::KittyCmd {
+        apc::KittyCmd {
+            action: b'd',
+            format: 0,
+            width: 0,
+            height: 0,
+            id,
+            cols: 0,
+            rows: 0,
+            z,
+            delete,
+            more: false,
+            no_cursor_move: false,
+            quiet: 2,
+            payload: vec![],
+        }
+    }
+
+    #[test]
+    fn kitty_delete_subtargets_scope_placements_and_data() {
+        let mut term = term::Terminal::new(6, 20);
+        handle_kitty(&mut term, &kitty_display(1, 1, 1, false));
+        let mut low = kitty_display(2, 1, 1, false);
+        low.z = -4;
+        handle_kitty(&mut term, &low);
+        assert_eq!(term.grid.placements().len(), 2);
+
+        // lowercase d=z drops only that layer's placements, data stays
+        handle_kitty(&mut term, &kitty_del(b'z', 0, -4));
+        assert_eq!(term.grid.placements().len(), 1);
+        assert!(term.images.get(2).is_some(), "lowercase keeps the pixels");
+
+        // uppercase d=C at the cursor cell frees the covering image too
+        term.grid.cursor.row = 0;
+        term.grid.cursor.col = 0;
+        handle_kitty(&mut term, &kitty_del(b'C', 0, 0));
+        assert!(term.grid.placements().is_empty());
+        assert!(term.images.get(1).is_none(), "uppercase frees the pixels");
+
+        // bare a=d (no d=, no i=) clears every placement but keeps the data
+        handle_kitty(&mut term, &kitty_display(3, 1, 1, false));
+        handle_kitty(&mut term, &kitty_del(0, 0, 0));
+        assert!(term.grid.placements().is_empty());
+        assert!(term.images.get(3).is_some(), "spec default 'a' keeps the pixels");
+
+        // the legacy i=-only form still frees the image (old termie behavior)
+        handle_kitty(&mut term, &kitty_display(4, 1, 1, false));
+        handle_kitty(&mut term, &kitty_del(0, 4, 0));
+        assert!(term.grid.placements().is_empty());
+        assert!(term.images.get(4).is_none());
     }
 
     #[test]
