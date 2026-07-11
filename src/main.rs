@@ -9106,9 +9106,34 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                // typing a dropped file's path at the prompt; quote it if it has
-                // spaces so the shell treats it as a single argument
-                if let Some(id) = self.active_focused_id() {
+                // winit reports no drop position, but the cursor still sits
+                // exactly where the user let go — ask the OS. a drop on the
+                // tab strip opens a tab at the folder (wt-style); a drop on
+                // the content types the quoted path at the prompt
+                let strip_drop = self
+                    .pw.window.as_ref()
+                    .and_then(|w| match w.window_handle().map(|h| h.as_raw()) {
+                        Ok(RawWindowHandle::Win32(h)) => win::cursor_client_pos(h.hwnd.get()),
+                        _ => None,
+                    })
+                    .zip(self.pw.renderer.as_ref())
+                    .is_some_and(|((x, y), r)| {
+                        matches!(
+                            r.hit_test(x, y),
+                            Hit::TitleBar
+                                | Hit::Button(
+                                    Hot::Tab(_) | Hot::TabClose(_) | Hot::NewTab | Hot::NewTabMenu
+                                )
+                        )
+                    });
+                if strip_drop {
+                    let dir = if path.is_dir() { Some(path.as_path()) } else { path.parent() };
+                    if let Some(d) = dir {
+                        self.new_tab_cwd(Some(d.to_string_lossy().into_owned()), None);
+                    }
+                } else if let Some(id) = self.active_focused_id() {
+                    // quote the typed path if it has spaces so the shell
+                    // treats it as a single argument
                     let s = path.to_string_lossy();
                     let text = if s.contains(' ') {
                         format!("\"{s}\" ")

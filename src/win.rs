@@ -72,6 +72,30 @@ pub fn set_no_activate(hwnd_handle: isize) {
 #[cfg(not(windows))]
 pub fn set_no_activate(_hwnd_handle: isize) {}
 
+/// the cursor's position in a window's client area (physical pixels), for
+/// events that carry no position of their own — winit's DroppedFile fires at
+/// the drop instant, so the cursor is still exactly where the user let go
+#[cfg(windows)]
+pub fn cursor_client_pos(hwnd_handle: isize) -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let hwnd = HWND(hwnd_handle as *mut core::ffi::c_void);
+    let mut p = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut p).is_err() || !ScreenToClient(hwnd, &mut p).as_bool() {
+            return None;
+        }
+    }
+    Some((p.x as f32, p.y as f32))
+}
+
+#[cfg(not(windows))]
+pub fn cursor_client_pos(_hwnd_handle: isize) -> Option<(f32, f32)> {
+    None
+}
+
 /// opt the window into the Win11 system backdrop (Mica) so the desktop shows
 /// through the chrome. cosmetic only: on Win10 and early Win11 the attribute
 /// is unknown and the call fails, which is ignored — the window keeps its
