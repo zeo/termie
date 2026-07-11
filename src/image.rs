@@ -70,7 +70,13 @@ pub struct Image {
 /// a display request from an a=T chunk: the c=/r= cell box, whether the
 /// cursor steps past the placement (the kitty C= movement policy), and the
 /// z= stacking order
-pub type DisplayReq = (u16, u16, bool, i32);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DisplayReq {
+    pub cols: u16,
+    pub rows: u16,
+    pub step: bool,
+    pub z: i32,
+}
 
 struct Pending {
     format: u32,

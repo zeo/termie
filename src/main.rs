@@ -2086,18 +2086,21 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
             // the display intent (its c=/r= box and cursor policy) belongs to
             // the a=T chunk; the store carries it across a chunked transfer,
             // whose completing chunk parses with the default action
-            let display = (cmd.action == b'T').then(|| {
-                (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16, !cmd.no_cursor_move, cmd.z)
+            let display = (cmd.action == b'T').then(|| image::DisplayReq {
+                cols: cmd.cols.min(500) as u16,
+                rows: cmd.rows.min(500) as u16,
+                step: !cmd.no_cursor_move,
+                z: cmd.z,
             });
             if let Some((id, disp)) = term
                 .images
                 .transmit(cmd.id, cmd.format, cmd.width, cmd.height, cmd.more, display, &cmd.payload)
             {
-                if let Some((c, r, step, z)) = disp {
-                    term.grid.place_image(id, c, r, z);
+                if let Some(d) = disp {
+                    term.grid.place_image(id, d.cols, d.rows, d.z);
                     let dims = term.images.get(id).map(|i| (i.width, i.height));
-                    if step && let Some((w, h)) = dims {
-                        term.advance_cursor_past_image(w, h, c, r);
+                    if d.step && let Some((w, h)) = dims {
+                        term.advance_cursor_past_image(w, h, d.cols, d.rows);
                     }
                 }
                 // ack with the resolved id (an i=0 transmit gets an auto id)
