@@ -67,9 +67,10 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// a display request from an a=T chunk: the c=/r= cell box plus whether the
-/// cursor steps past the placement (the kitty C= movement policy)
-pub type DisplayReq = (u16, u16, bool);
+/// a display request from an a=T chunk: the c=/r= cell box, whether the
+/// cursor steps past the placement (the kitty C= movement policy), and the
+/// z= stacking order
+pub type DisplayReq = (u16, u16, bool, i32);
 
 struct Pending {
     format: u32,

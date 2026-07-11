@@ -2086,14 +2086,15 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
             // the display intent (its c=/r= box and cursor policy) belongs to
             // the a=T chunk; the store carries it across a chunked transfer,
             // whose completing chunk parses with the default action
-            let display = (cmd.action == b'T')
-                .then(|| (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16, !cmd.no_cursor_move));
+            let display = (cmd.action == b'T').then(|| {
+                (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16, !cmd.no_cursor_move, cmd.z)
+            });
             if let Some((id, disp)) = term
                 .images
                 .transmit(cmd.id, cmd.format, cmd.width, cmd.height, cmd.more, display, &cmd.payload)
             {
-                if let Some((c, r, step)) = disp {
-                    term.grid.place_image(id, c, r);
+                if let Some((c, r, step, z)) = disp {
+                    term.grid.place_image(id, c, r, z);
                     let dims = term.images.get(id).map(|i| (i.width, i.height));
                     if step && let Some((w, h)) = dims {
                         term.advance_cursor_past_image(w, h, c, r);
@@ -2109,7 +2110,7 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
             let dims = term.images.get(cmd.id).map(|i| (i.width, i.height));
             if let Some((w, h)) = dims {
                 let (c, r) = (cmd.cols.min(500) as u16, cmd.rows.min(500) as u16);
-                term.grid.place_image(cmd.id, c, r);
+                term.grid.place_image(cmd.id, c, r, cmd.z);
                 if !cmd.no_cursor_move {
                     term.advance_cursor_past_image(w, h, c, r);
                 }
@@ -10533,6 +10534,7 @@ mod tests {
             id: 5,
             cols: 3,
             rows: 2,
+            z: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -10553,6 +10555,7 @@ mod tests {
             id: 0,
             cols: 0,
             rows: 0,
+            z: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -10571,6 +10574,7 @@ mod tests {
             id,
             cols,
             rows,
+            z: 0,
             more: false,
             no_cursor_move: no_move,
             quiet: 2,
@@ -10622,6 +10626,7 @@ mod tests {
             id: 9,
             cols: 0,
             rows: 0,
+            z: 0,
             more: false,
             no_cursor_move: false,
             quiet: 2,

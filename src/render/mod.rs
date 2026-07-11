@@ -2742,6 +2742,67 @@ impl Renderer {
         true
     }
 
+    /// emit one z-layer of a pane's kitty placements as color-atlas quads,
+    /// anchored to their absolute lines so they scroll with the text. `under`
+    /// selects the z < 0 layer (drawn before any cell content); placements
+    /// stack by z within the layer, arrival order breaking ties
+    #[allow(clippy::too_many_arguments)]
+    fn push_image_placements(
+        atlas: &mut GlyphAtlas,
+        out: &mut Vec<Instance>,
+        term: &Terminal,
+        ox: f32,
+        oy: f32,
+        cell_w: f32,
+        cell_h: f32,
+        under: bool,
+    ) {
+        let grid = &term.grid;
+        let content_h = grid.rows as f32 * cell_h;
+        let mut layer: Vec<&crate::grid::Placement> =
+            grid.placements().iter().filter(|p| (p.z < 0) == under).collect();
+        layer.sort_by_key(|p| p.z);
+        for p in layer {
+            let Some(img) = term.images.get(p.image_id) else {
+                continue;
+            };
+            let Some(g) = atlas.get_image(img.key, &img.rgba, img.width, img.height) else {
+                continue;
+            };
+            // a client-requested cell box (kitty c=/r=) scales the image; one
+            // axis alone keeps the aspect ratio, per the protocol
+            let (disp_w, disp_h) = match (p.cols, p.rows) {
+                (0, 0) => (g.width, g.height),
+                (c, 0) => {
+                    let w = c as f32 * cell_w;
+                    (w, w * g.height / g.width.max(1.0))
+                }
+                (0, r) => {
+                    let h = r as f32 * cell_h;
+                    (h * g.width / g.height.max(1.0), h)
+                }
+                (c, r) => (c as f32 * cell_w, r as f32 * cell_h),
+            };
+            // crop the quad to the pane's visible rows so an image taller than the
+            // remaining space doesn't bleed into a sibling pane or the status bar,
+            // and a placement scrolled partly above the top shows its lower rows
+            let top_y = grid.screen_row_signed(p.abs_line) as f32 * cell_h;
+            let Some((vis_top, vis_h, uf0, uf1)) = clip_image_v(top_y, disp_h, content_h) else {
+                continue;
+            };
+            let uspan = g.uv_max[1] - g.uv_min[1];
+            out.push(Instance {
+                pos: [ox + p.col as f32 * cell_w, oy + vis_top],
+                size: [disp_w, vis_h],
+                uv_min: [g.uv_min[0], g.uv_min[1] + uspan * uf0],
+                uv_max: [g.uv_max[0], g.uv_min[1] + uspan * uf1],
+                color: [0.0, 0.0, 0.0, 1.0],
+                kind: 3,
+                _pad: [0; 3],
+            });
+        }
+    }
+
     /// draw one terminal grid at a pixel origin
     #[allow(clippy::too_many_arguments)]
     fn draw_grid(
@@ -2774,6 +2835,10 @@ impl Renderer {
         let show_cursor = cur.visible && !scrolled;
         let (crow, ccol) = (cur.row, cur.col.min(grid.cols.saturating_sub(1)));
         let sel_norm = sel.map(|(a, b, block)| if a <= b { (a, b, block) } else { (b, a, block) });
+
+        // kitty placements with z < 0 draw beneath everything the cells paint,
+        // so the image shows wherever a cell has no ink or colored background
+        Self::push_image_placements(atlas, out, term, ox, oy, cell_w, cell_h, true);
 
         // find-match highlights drawn beneath glyphs; current match is brighter
         for &(mr, mc, mlen, cur) in matches {
@@ -3023,49 +3088,9 @@ impl Renderer {
             }
         }
 
-        // kitty image placements: each visible image drawn as a color-atlas quad
-        // on top of the cells it overlaps, anchored to its absolute line so it
-        // scrolls with the text
-        let content_h = grid.rows as f32 * cell_h;
-        for p in grid.placements() {
-            let Some(img) = term.images.get(p.image_id) else {
-                continue;
-            };
-            let Some(g) = atlas.get_image(img.key, &img.rgba, img.width, img.height) else {
-                continue;
-            };
-            // a client-requested cell box (kitty c=/r=) scales the image; one
-            // axis alone keeps the aspect ratio, per the protocol
-            let (disp_w, disp_h) = match (p.cols, p.rows) {
-                (0, 0) => (g.width, g.height),
-                (c, 0) => {
-                    let w = c as f32 * cell_w;
-                    (w, w * g.height / g.width.max(1.0))
-                }
-                (0, r) => {
-                    let h = r as f32 * cell_h;
-                    (h * g.width / g.height.max(1.0), h)
-                }
-                (c, r) => (c as f32 * cell_w, r as f32 * cell_h),
-            };
-            // crop the quad to the pane's visible rows so an image taller than the
-            // remaining space doesn't bleed into a sibling pane or the status bar,
-            // and a placement scrolled partly above the top shows its lower rows
-            let top_y = grid.screen_row_signed(p.abs_line) as f32 * cell_h;
-            let Some((vis_top, vis_h, uf0, uf1)) = clip_image_v(top_y, disp_h, content_h) else {
-                continue;
-            };
-            let uspan = g.uv_max[1] - g.uv_min[1];
-            out.push(Instance {
-                pos: [ox + p.col as f32 * cell_w, oy + vis_top],
-                size: [disp_w, vis_h],
-                uv_min: [g.uv_min[0], g.uv_min[1] + uspan * uf0],
-                uv_max: [g.uv_max[0], g.uv_min[1] + uspan * uf1],
-                color: [0.0, 0.0, 0.0, 1.0],
-                kind: 3,
-                _pad: [0; 3],
-            });
-        }
+        // kitty image placements with z >= 0 draw on top of the cells they
+        // overlap (the z < 0 pass ran before any cell content)
+        Self::push_image_placements(atlas, out, term, ox, oy, cell_w, cell_h, false);
 
         // scroll thumb on the pane's right edge, sized + positioned to the
         // viewport's slice of total (scrollback + screen) lines. keep this rail
@@ -5512,6 +5537,50 @@ mod tests {
             .max()
             .expect("bg rects present");
         assert!(last_run_bg < strip, "bg {last_run_bg} must precede strip {strip}");
+    }
+
+    // kitty z-index: a z<0 placement's quad must land before every cell
+    // instance (so text and colored backgrounds paint over it), a z>=0 one
+    // after them (instances paint in vec order)
+    #[test]
+    fn negative_z_placements_paint_beneath_the_cells() {
+        let mut term = Terminal::new(4, 10);
+        let mut p = vte::Parser::new();
+        p.advance(&mut term, b"\x1b[41mxx\x1b[0m");
+        let under_id = term.images.insert(1, 1, vec![9, 9, 9, 255]);
+        let over_id = term.images.insert(1, 1, vec![7, 7, 7, 255]);
+        term.grid.place_image_at(under_id, 0, 0, 1, 1, -1);
+        term.grid.place_image_at(over_id, 0, 0, 1, 1, 0);
+        let mut atlas = GlyphAtlas::new(14.0, 12.5, 1.0, None, 1.32);
+        let palette = Palette::from_theme(ThemeId::Instrument);
+        let mut out = Vec::new();
+        Renderer::draw_grid(
+            &mut atlas,
+            &palette,
+            &mut out,
+            &term,
+            0.0,
+            0.0,
+            true,
+            true,
+            true,
+            2.0,
+            CursorShape::Block,
+            None,
+            None,
+            &[],
+            true,
+            1.0,
+            false,
+        );
+        let quads: Vec<usize> =
+            out.iter().enumerate().filter(|(_, i)| i.kind == 3).map(|(j, _)| j).collect();
+        assert_eq!(quads.len(), 2, "both placements render");
+        let bgs: Vec<usize> =
+            out.iter().enumerate().filter(|(_, i)| i.kind == 0).map(|(j, _)| j).collect();
+        assert!(!bgs.is_empty(), "the red cells push bg rects");
+        assert!(quads[0] < *bgs.first().unwrap(), "z=-1 sits beneath every cell rect");
+        assert!(quads[1] > *bgs.last().unwrap(), "z=0 sits above the cell rects");
     }
 
     #[test]

@@ -1375,13 +1375,13 @@ impl Perform for Terminal {
                 let id = self.images.insert(w, h, rgba);
                 if self.sixel_display_mode {
                     // DECSDM: the image pins to the upper-left, cursor untouched
-                    self.grid.place_image_at(id, 0, 0, 0, 0);
+                    self.grid.place_image_at(id, 0, 0, 0, 0, 0);
                 } else {
                     // sixel scrolling (the default): anchor at the cursor, then
                     // move the cursor to the line below the image, scrolling as
                     // needed. an unknown cell height (renderer not attached
                     // yet) assumes 20 px
-                    self.grid.place_image(id, 0, 0);
+                    self.grid.place_image(id, 0, 0, 0);
                     let cell_h = if self.cell_px.1 > 0 { self.cell_px.1 as usize } else { 20 };
                     for _ in 0..(h as usize).div_ceil(cell_h) {
                         self.grid.linefeed();

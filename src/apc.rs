@@ -124,6 +124,8 @@ pub struct KittyCmd {
     /// (0 = natural pixel size)
     pub cols: u32,
     pub rows: u32,
+    /// z=: stacking order; negative draws beneath the pane's text
+    pub z: i32,
     /// m=1: more chunks of this image follow
     pub more: bool,
     /// C=1: leave the cursor where it is instead of stepping past the placement
@@ -155,6 +157,7 @@ impl KittyCmd {
             id: 0,
             cols: 0,
             rows: 0,
+            z: 0,
             more: false,
             no_cursor_move: false,
             quiet: 0,
@@ -176,6 +179,7 @@ impl KittyCmd {
                 b"i" => cmd.id = vs.parse().ok()?,
                 b"c" => cmd.cols = vs.parse().ok()?,
                 b"r" => cmd.rows = vs.parse().ok()?,
+                b"z" => cmd.z = vs.parse().ok()?,
                 b"m" => cmd.more = vs == "1",
                 b"C" => cmd.no_cursor_move = vs == "1",
                 b"q" => cmd.quiet = vs.parse().unwrap_or(0),
@@ -333,6 +337,9 @@ mod tests {
         assert_eq!((q.action, q.quiet), (b'q', 2));
         let still = KittyCmd::parse(b"Ga=T,C=1;AAAA").expect("C=1");
         assert!(still.no_cursor_move);
+        let under = KittyCmd::parse(b"Ga=T,z=-7;AAAA").expect("z=-7");
+        assert_eq!(under.z, -7);
+        assert_eq!(d.z, 0); // unspecified stays at the text layer
         assert!(KittyCmd::parse(b"Gf=notanumber;AAAA").is_none()); // bad int -> None
         assert!(KittyCmd::parse(b"Zfoo").is_none()); // not a G payload
     }

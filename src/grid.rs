@@ -67,6 +67,8 @@ pub struct Placement {
     pub col: usize,
     pub cols: u16,
     pub rows: u16,
+    /// kitty z=: negative stacks beneath the pane's text, 0+ above it
+    pub z: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1654,13 +1656,13 @@ impl Grid {
     /// place a kitty image at the cursor, anchored to the current absolute line
     /// so it scrolls with the surrounding text. cols/rows = the client's
     /// requested cell box (kitty c=/r=), 0 = draw at native pixel size
-    pub fn place_image(&mut self, image_id: u32, cols: u16, rows: u16) {
-        self.place_image_at(image_id, self.cursor.row, self.cursor.col, cols, rows);
+    pub fn place_image(&mut self, image_id: u32, cols: u16, rows: u16, z: i32) {
+        self.place_image_at(image_id, self.cursor.row, self.cursor.col, cols, rows, z);
     }
 
     /// place an image at an explicit screen position (sixel display mode pins
     /// its image to the top-left instead of the cursor)
-    pub fn place_image_at(&mut self, image_id: u32, row: usize, col: usize, cols: u16, rows: u16) {
+    pub fn place_image_at(&mut self, image_id: u32, row: usize, col: usize, cols: u16, rows: u16, z: i32) {
         let abs_line = self.total_scrolled + row as u64;
         self.placements.push(Placement {
             image_id,
@@ -1668,6 +1670,7 @@ impl Grid {
             col,
             cols,
             rows,
+            z,
         });
         if self.placements.len() > 1024 {
             self.placements.remove(0);
@@ -1942,7 +1945,7 @@ mod tests {
     fn placements_anchor_remove_and_clear() {
         let mut g = Grid::new(4, 8);
         g.put_char('x'); // cursor advances to col 1
-        g.place_image(7, 0, 0);
+        g.place_image(7, 0, 0, 0);
         let p = g.placements();
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].image_id, p[0].abs_line, p[0].col), (7, 0, 1));
@@ -1951,8 +1954,9 @@ mod tests {
         // on-screen line (no scroll, no view offset): signed row == abs_line
         assert_eq!(g.screen_row_signed(0), 0);
         // id-scoped removal keeps the others
-        g.place_image(9, 10, 5);
+        g.place_image(9, 10, 5, -3);
         assert_eq!((g.placements()[1].cols, g.placements()[1].rows), (10, 5));
+        assert_eq!(g.placements()[1].z, -3);
         g.remove_placements(7);
         assert_eq!(g.placements().iter().map(|p| p.image_id).collect::<Vec<_>>(), vec![9]);
         // clear-all empties them
@@ -1970,7 +1974,7 @@ mod tests {
         }
         g.linefeed();
         g.carriage_return();
-        g.place_image_at(1, 1, 2, 0, 0);
+        g.place_image_at(1, 1, 2, 0, 0, 0);
         assert_eq!(g.placements().len(), 1);
         // width change reflows; the placement survives on its content line
         g.resize(4, 12);
