@@ -1137,6 +1137,9 @@ impl Perform for Terminal {
                 self.sixel_display_mode = false;
                 // dynamic OSC colors don't survive a hard reset (xterm)
                 self.colors.clear();
+                // neither do decoded images: the fresh grid already dropped
+                // the placements, so a kept store would just pin dead pixels
+                self.images.clear();
             }
             _ => {}
         }
