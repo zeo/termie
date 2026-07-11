@@ -129,6 +129,9 @@ pub struct KittyCmd {
     /// d=: delete target letter (a=d only); 0 when absent. uppercase variants
     /// also free the stored image data
     pub delete: u8,
+    /// x=/y=: the inclusive image-id bounds of a d=r ranged delete
+    pub x: u32,
+    pub y: u32,
     /// m=1: more chunks of this image follow
     pub more: bool,
     /// C=1: leave the cursor where it is instead of stepping past the placement
@@ -165,6 +168,8 @@ impl KittyCmd {
             rows: 0,
             z: 0,
             delete: 0,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: false,
             unicode_placeholder: false,
@@ -189,6 +194,8 @@ impl KittyCmd {
                 b"r" => cmd.rows = vs.parse().ok()?,
                 b"z" => cmd.z = vs.parse().ok()?,
                 b"d" => cmd.delete = val.first().copied().unwrap_or(0),
+                b"x" => cmd.x = vs.parse().ok()?,
+                b"y" => cmd.y = vs.parse().ok()?,
                 b"m" => cmd.more = vs == "1",
                 b"C" => cmd.no_cursor_move = vs == "1",
                 b"U" => cmd.unicode_placeholder = vs == "1",

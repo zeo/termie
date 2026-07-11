@@ -298,6 +298,11 @@ impl ImageStore {
         self.images.get(&id)
     }
 
+    /// the stored image ids inside [lo, hi], for a ranged delete's free pass
+    pub fn ids_in(&self, lo: u32, hi: u32) -> Vec<u32> {
+        self.images.keys().copied().filter(|id| (lo..=hi).contains(id)).collect()
+    }
+
     /// drop an image (kitty a=d delete), forgetting any decoded pixels
     pub fn delete(&mut self, id: u32) {
         self.images.remove(&id);

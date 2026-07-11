@@ -2160,6 +2160,15 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
                     vec![cmd.id]
                 }
                 b'z' => term.grid.remove_placements_where(|p| p.z == cmd.z),
+                // ranged delete: every image id in [x, y] inclusive; with i/I
+                // this is a target that also reaches virtual placements. an
+                // inverted range matches nothing, per the spec's wording
+                b'r' => {
+                    let (lo, hi) = (cmd.x, cmd.y);
+                    term.grid.remove_placements_where(|p| (lo..=hi).contains(&p.image_id));
+                    term.grid.remove_virtual_placements_in(lo, hi);
+                    term.images.ids_in(lo, hi)
+                }
                 // at the cursor cell: a placement is hit when its cell box
                 // (or its pixel size over the cell metrics) covers the cursor
                 b'c' => {
@@ -2190,7 +2199,7 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
                             && cursor_abs < p.abs_line + rows.max(1) as u64
                     })
                 }
-                // targets this v1 doesn't implement (p/x/y/r/n/f/q, or i
+                // targets this v1 doesn't implement (p/x/y/n/f/q, or i
                 // without an id): a scoped delete must never escalate to a
                 // wipe, so they drop nothing
                 _ => Vec::new(),
@@ -10619,6 +10628,8 @@ mod tests {
             rows: 2,
             z: 0,
             delete: 0,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: false,
             unicode_placeholder: false,
@@ -10642,6 +10653,8 @@ mod tests {
             rows: 0,
             z: 0,
             delete: 0,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: false,
             unicode_placeholder: false,
@@ -10663,6 +10676,8 @@ mod tests {
             rows,
             z: 0,
             delete: 0,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: no_move,
             unicode_placeholder: false,
@@ -10717,6 +10732,8 @@ mod tests {
             rows: 0,
             z: 0,
             delete: 0,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: false,
             unicode_placeholder: false,
@@ -10726,6 +10743,33 @@ mod tests {
         handle_kitty(&mut term, &done);
         assert_eq!(term.grid.placements().len(), 1);
         assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 4));
+    }
+
+    // d=r wipes the id range [x, y] — placements and virtual boxes both —
+    // and only the uppercase form frees the pixels
+    #[test]
+    fn kitty_ranged_delete_reaches_virtual_placements() {
+        let mut term = term::Terminal::new(6, 20);
+        for id in [3u32, 5, 9] {
+            handle_kitty(&mut term, &kitty_display(id, 1, 1, false));
+        }
+        let mut virt = kitty_display(5, 2, 2, false);
+        virt.unicode_placeholder = true;
+        handle_kitty(&mut term, &virt);
+        // x=4 y=8 catches only id 5: its placement and virtual box go, the
+        // pixels stay (lowercase)
+        let mut del = kitty_del(b'r', 0, 0);
+        (del.x, del.y) = (4, 8);
+        handle_kitty(&mut term, &del);
+        assert!(term.grid.placements().iter().all(|p| p.image_id != 5));
+        assert_eq!(term.grid.virtual_placement(5), None);
+        assert!(term.images.get(5).is_some(), "lowercase keeps the pixels");
+        // uppercase R frees them; neighbors outside the range survive
+        let mut del = kitty_del(b'R', 0, 0);
+        (del.x, del.y) = (5, 5);
+        handle_kitty(&mut term, &del);
+        assert!(term.images.get(5).is_none());
+        assert!(term.images.get(3).is_some() && term.images.get(9).is_some());
     }
 
     // a U=1 placement is a prototype for placeholder cells: it paints nothing,
@@ -10774,6 +10818,8 @@ mod tests {
             rows: 0,
             z,
             delete,
+            x: 0,
+            y: 0,
             more: false,
             no_cursor_move: false,
             unicode_placeholder: false,

@@ -1757,10 +1757,16 @@ impl Grid {
         self.virtual_placements.get(&image_id).copied()
     }
 
-    /// forget an image's virtual placement (kitty d=i/I — the only delete
-    /// targets that touch virtual placements, which have no screen position)
+    /// forget an image's virtual placement (kitty d=i/I — id-scoped deletes
+    /// are the only ones that touch virtual placements, which have no screen
+    /// position)
     pub fn remove_virtual_placement(&mut self, image_id: u32) {
         self.virtual_placements.remove(&image_id);
+    }
+
+    /// forget the virtual placements of every image id in [lo, hi] (d=r)
+    pub fn remove_virtual_placements_in(&mut self, lo: u32, hi: u32) {
+        self.virtual_placements.retain(|id, _| !(lo..=hi).contains(id));
     }
 
     /// drop only the placements of a given image (kitty a=d for one image id)
