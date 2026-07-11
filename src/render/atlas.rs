@@ -848,6 +848,21 @@ impl GlyphAtlas {
         if let Some(g) = self.image_cache.get(&key) {
             return *g;
         }
+        // an image over the atlas ceiling packs box-filtered down instead of
+        // never rendering; the glyph keeps the ORIGINAL draw size, so quads
+        // still cover the cells the protocol laid out and only sampling blurs
+        const MAX_PACK: u32 = 2048 - PAD * 2;
+        let needed = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if (w > MAX_PACK || h > MAX_PACK) && w > 0 && h > 0 && rgba.len() >= needed {
+            let (scaled, sw, sh) = crate::image::downscale_rgba(rgba, w, h, MAX_PACK);
+            let packed = self.get_image(key, &scaled, sw, sh).map(|mut g| {
+                g.width = w as f32;
+                g.height = h as f32;
+                g
+            });
+            self.image_cache.insert(key, packed);
+            return packed;
+        }
         match self.pack_image(rgba, w, h) {
             ImagePack::Ok(g) => {
                 self.image_cache.insert(key, Some(g));
@@ -1107,6 +1122,17 @@ mod tests {
         let g = atlas.get_image(7, &rgba, w, h);
         assert!(g.is_some(), "the atlas must grow to fit a 1024..2048 image");
         assert_eq!(atlas.dim, 2048);
+        // an image over the 2048 ceiling packs downscaled but draws at its
+        // original size (it used to silently never render)
+        let (bw, bh) = (3000u32, 50u32);
+        let big = vec![200u8; (bw * bh * 4) as usize];
+        let g = atlas.get_image(8, &big, bw, bh).expect("oversized image still renders");
+        assert_eq!((g.width, g.height), (3000.0, 50.0), "draw size stays the original");
+        let packed_w = (g.uv_max[0] - g.uv_min[0]) * atlas.dim as f32;
+        assert!(packed_w <= 2046.5, "packed pixels fit the atlas ceiling");
+        // the cache serves the patched glyph on the second lookup too
+        let again = atlas.get_image(8, &big, bw, bh).expect("cached");
+        assert_eq!(again.width, 3000.0);
     }
 
     #[test]
