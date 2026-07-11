@@ -10788,4 +10788,29 @@ mod tests {
         assert_eq!(term.grid.placements().len(), 1);
         assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (0, 1));
     }
+
+    #[test]
+    fn kitty_single_axis_box_advances_by_the_scaled_size() {
+        // a 1x2 px image with c=4 draws 4 cols wide and, aspect-scaled at the
+        // assumed 10x20 cell, 4 rows tall (4*10px wide -> 80px tall); the
+        // cursor must land on that scaled box's last row, not the 1-row box
+        // the raw pixel height suggests
+        let mut term = term::Terminal::new(8, 20);
+        let mut cmd = kitty_display(6, 4, 0, false);
+        cmd.width = 1;
+        cmd.height = 2;
+        cmd.payload = vec![0; 8];
+        handle_kitty(&mut term, &cmd);
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (3, 4));
+
+        // the symmetric r-only case scales the columns: 2x1 px with r=2 is
+        // 40px tall -> 80px wide -> 8 cols
+        let mut term = term::Terminal::new(8, 20);
+        let mut cmd = kitty_display(7, 0, 2, false);
+        cmd.width = 2;
+        cmd.height = 1;
+        cmd.payload = vec![0; 8];
+        handle_kitty(&mut term, &cmd);
+        assert_eq!((term.grid.cursor.row, term.grid.cursor.col), (1, 8));
+    }
 }

@@ -230,13 +230,25 @@ impl Terminal {
     /// kitty cursor-movement policy after a placement: right by the box's
     /// columns and down onto its LAST row (not past it), wrapping at the right
     /// edge and scrolling past the bottom margin exactly like printed text.
-    /// cols/rows of 0 fall back to the image's pixel size over the cell size
+    /// the box mirrors how the renderer sizes the quad: both axes given are
+    /// taken verbatim, one axis given scales the other by the image's aspect
+    /// ratio, neither falls back to the pixel size over the cell size
     /// (assumed 10x20 until the renderer attaches, like the sixel path)
     pub fn advance_cursor_past_image(&mut self, px_w: u32, px_h: u32, cols: u16, rows: u16) {
         let cw = if self.cell_px.0 > 0 { self.cell_px.0 as usize } else { 10 };
         let ch = if self.cell_px.1 > 0 { self.cell_px.1 as usize } else { 20 };
-        let cols_eff = if cols > 0 { cols as usize } else { (px_w as usize).div_ceil(cw) };
-        let rows_eff = if rows > 0 { rows as usize } else { (px_h as usize).div_ceil(ch) };
+        let (cols_eff, rows_eff) = match (cols, rows) {
+            (0, 0) => ((px_w as usize).div_ceil(cw), (px_h as usize).div_ceil(ch)),
+            (c, 0) => {
+                let disp_h = (c as f32 * cw as f32) * px_h as f32 / (px_w as f32).max(1.0);
+                (c as usize, (disp_h / ch as f32).ceil() as usize)
+            }
+            (0, r) => {
+                let disp_w = (r as f32 * ch as f32) * px_w as f32 / (px_h as f32).max(1.0);
+                ((disp_w / cw as f32).ceil() as usize, r as usize)
+            }
+            (c, r) => (c as usize, r as usize),
+        };
         let mut down = rows_eff.saturating_sub(1);
         let col = self.grid.cursor.col + cols_eff;
         if col >= self.grid.cols {
