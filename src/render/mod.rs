@@ -110,6 +110,7 @@ pub enum Hot {
     LineHeightDec,
     LineHeightInc,
     BoldBright,
+    #[cfg(windows)]
     Mica,
     ScrollbackDec,
     ScrollbackInc,
@@ -304,6 +305,7 @@ pub struct SettingsView {
     /// theme=auto: the trailing chip is lit and the theme follows the OS
     pub theme_auto: bool,
     /// win11 mica backdrop on/off (config `acrylic=`), toggled live
+    #[cfg(windows)]
     pub acrylic: bool,
     pub shell_name: &'static str,
     pub close_action_name: &'static str,
@@ -317,6 +319,7 @@ impl Default for SettingsView {
             copy_on_select: false,
             load_profile: false,
             theme_auto: false,
+            #[cfg(windows)]
             acrylic: false,
             shell_name: "auto",
             close_action_name: "quit",
@@ -435,6 +438,7 @@ struct SettingsGeom {
     opacity_y: f32,
     line_height_y: f32,
     boldbright_y: f32,
+    #[cfg(windows)]
     mica_y: f32,
     cursor_y: f32,
     blink_y: f32,
@@ -459,6 +463,7 @@ struct SettingsGeom {
     lh_dec: Rect,
     lh_inc: Rect,
     boldbright_btn: Rect,
+    #[cfg(windows)]
     mica_btn: Rect,
     cursor_btn: Rect,
     blink_btn: Rect,
@@ -2224,8 +2229,12 @@ impl Renderer {
         y += row;
         let boldbright_l = y;
         y += row;
+        #[cfg(windows)]
         let mica_l = y;
-        y += row;
+        #[cfg(windows)]
+        {
+            y += row;
+        }
         let theme_label_l = y;
         y += lh;
         let theme_chip_l = y;
@@ -2275,6 +2284,7 @@ impl Renderer {
         let cursor_btn = (val_x, ay(cursor_l), cluster, bh);
         let blink_btn = (val_x, ay(blink_l), cluster, bh);
         let boldbright_btn = (val_x, ay(boldbright_l), cluster, bh);
+        #[cfg(windows)]
         let mica_btn = (val_x, ay(mica_l), cluster, bh);
         let copysel_btn = (val_x, ay(copysel_l), cluster, bh);
         let shell_btn = (val_x, ay(shell_l), cluster, bh);
@@ -2319,6 +2329,7 @@ impl Renderer {
             (Hot::LineHeightDec, lh_dec),
             (Hot::LineHeightInc, lh_inc),
             (Hot::BoldBright, boldbright_btn),
+            #[cfg(windows)]
             (Hot::Mica, mica_btn),
             (Hot::CursorCycle, cursor_btn),
             (Hot::CursorBlink, blink_btn),
@@ -2366,6 +2377,7 @@ impl Renderer {
             opacity_y: ay(opacity_l),
             line_height_y: ay(line_height_l),
             boldbright_y: ay(boldbright_l),
+            #[cfg(windows)]
             mica_y: ay(mica_l),
             cursor_y: ay(cursor_l),
             blink_y: ay(blink_l),
@@ -2388,6 +2400,7 @@ impl Renderer {
             lh_dec,
             lh_inc,
             boldbright_btn,
+            #[cfg(windows)]
             mica_btn,
             cursor_btn,
             blink_btn,
@@ -4122,8 +4135,11 @@ impl Renderer {
         let bb = self.bold_as_bright;
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.boldbright_y), "BOLD AS BRIGHT", MUTE, 1.0, wide);
         self.toggle_btn(out, g.boldbright_btn, bb, Hot::BoldBright, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.mica_y), "MICA BACKDROP", MUTE, 1.0, wide);
-        self.toggle_btn(out, g.mica_btn, sv.acrylic, Hot::Mica, track);
+        #[cfg(windows)]
+        {
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.mica_y), "MICA BACKDROP", MUTE, 1.0, wide);
+            self.toggle_btn(out, g.mica_btn, sv.acrylic, Hot::Mica, track);
+        }
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.cursor_y), "CURSOR", MUTE, 1.0, wide);
         self.cycle_btn(out, g.cursor_btn, cur_name, Hot::CursorCycle, track);
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.blink_y), "CURSOR BLINK", MUTE, 1.0, wide);

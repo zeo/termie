@@ -1061,6 +1061,9 @@ fn assets_font_dir() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent() {
             candidates.push(dir.join("assets/fonts"));
+            if let Some(prefix) = dir.parent() {
+                candidates.push(prefix.join("share/termie/fonts"));
+            }
         }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts"));
     candidates.push(PathBuf::from("assets/fonts"));

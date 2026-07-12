@@ -48,7 +48,10 @@ pub fn spawn(
     net: bool,
 ) -> io::Result<Sandboxed> {
     let mut cmd = Command::new("bwrap");
-    cmd.args(["--die-with-parent", "--unshare-all", "--new-session"])
+    cmd.args(["--die-with-parent", "--unshare-all", "--new-session", "--clearenv"])
+        .args(["--setenv", "PATH", "/usr/bin:/bin"])
+        .args(["--setenv", "LANG", "C.UTF-8"])
+        .args(["--setenv", "TMPDIR", "/tmp"])
         // system libraries + interpreters, read-only; -try tolerates distros
         // where a dir doesn't exist (merged-usr vs split lib layouts)
         .args(["--ro-bind", "/usr", "/usr"])
@@ -114,5 +117,22 @@ mod tests {
         sb.take_stdout().unwrap().read_to_string(&mut out).unwrap();
         sb.kill();
         assert_eq!(out.trim(), "0", "home should be invisible, got: {out:?}");
+    }
+
+    #[test]
+    #[ignore = "needs bubblewrap installed"]
+    fn sandboxed_child_cannot_read_host_environment() {
+        use std::io::Read;
+        const SECRET: &str = "TERMIE_SANDBOX_TEST_SECRET";
+        unsafe { std::env::set_var(SECRET, "visible-on-host") };
+        let dir = std::env::temp_dir();
+        let sh = Path::new("/bin/sh");
+        let args = vec!["-c".to_string(), format!("printf %s \"${{{SECRET}-}}\"")];
+        let mut sb = spawn("termie.plugin.env-test", sh, &args, &dir, false).expect("bwrap spawn");
+        let mut out = String::new();
+        sb.take_stdout().unwrap().read_to_string(&mut out).unwrap();
+        sb.kill();
+        unsafe { std::env::remove_var(SECRET) };
+        assert!(out.is_empty(), "sandbox inherited host secret: {out:?}");
     }
 }

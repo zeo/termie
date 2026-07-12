@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Termie
+Comment=GPU-rendered terminal multiplexer
+Exec=termie
+TryExec=termie
+Icon=termie
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;terminal;
+StartupNotify=true
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=termie

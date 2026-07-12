@@ -64,10 +64,13 @@ enum UserEvent {
     /// entries, or Err with a reason the fetch failed)
     Market(Result<Vec<plugin::market::Entry>, String>),
     /// the global quake hotkey fired (from the hotkey thread)
+    #[cfg(windows)]
     ToggleQuake,
     /// colors.conf or keybindings.conf changed on disk (watcher thread):
     /// re-read both so hand edits apply live, without a restart
     UserConfChanged,
+    #[cfg(not(windows))]
+    SystemThemeChanged(Option<bool>),
     /// a release check finished (None = up to date / unreachable); bool =
     /// the user asked from the palette, so silence is worth a status notice
     UpdateCheckDone(Option<update::Update>, bool),
@@ -273,6 +276,7 @@ enum PaletteAction {
     /// windows-only, kept everywhere like AdminWindow
     #[cfg_attr(not(windows), allow(dead_code))]
     DefaultTerminal,
+    #[cfg(windows)]
     Quake,
     Theme,
     Plugins,
@@ -366,6 +370,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("tab color: blue", PaletteAction::SetTabColor(4)),
     ("tab color: magenta", PaletteAction::SetTabColor(5)),
     ("tab color: cyan", PaletteAction::SetTabColor(6)),
+    #[cfg(windows)]
     ("quake drop-down", PaletteAction::Quake),
     ("cycle theme", PaletteAction::Theme),
     ("plugins", PaletteAction::Plugins),
@@ -378,7 +383,10 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("scroll to bottom", PaletteAction::ScrollBottom),
     ("clear scrollback", PaletteAction::ClearScrollback),
     ("export scrollback", PaletteAction::ExportScrollback),
+    #[cfg(windows)]
     ("install update", PaletteAction::InstallUpdate),
+    #[cfg(not(windows))]
+    ("open release page", PaletteAction::InstallUpdate),
     #[cfg(windows)]
     ("default terminal", PaletteAction::DefaultTerminal),
     ("broadcast input", PaletteAction::ToggleBroadcast),
@@ -2452,6 +2460,7 @@ struct Config {
     /// restore the saved tab/split layout on a bare launch
     restore_on_launch: bool,
     // global quake hotkey as (win32 modifiers, virtual-key); None disables it
+    #[cfg(windows)]
     quake_key: Option<(u32, u32)>,
 }
 
@@ -2466,6 +2475,7 @@ impl Default for Config {
             right_click: RightClick::Menu,
             backend: render::BackendChoice::Auto,
             restore_on_launch: true,
+            #[cfg(windows)]
             quake_key: None,
         }
     }
@@ -2488,7 +2498,7 @@ struct Persisted {
     bold_as_bright: bool,
     line_height: f32,
     theme: color::ThemeId,
-    /// `theme=auto`: follow the windows light/dark setting, resolving to
+    /// `theme=auto`: follow the OS light/dark setting, resolving to
     /// theme_dark / theme_light (which only matter while auto is on)
     theme_auto: bool,
     theme_dark: color::ThemeId,
@@ -2507,6 +2517,7 @@ struct Persisted {
     /// default on; fonts without liga/calt render identically)
     ligatures: bool,
     opacity: i32,
+    #[cfg(windows)]
     quake_key: Option<(u32, u32)>,
     /// the quake_key line as written, kept so save_config can re-emit it —
     /// the parsed (mods, vk) tuple can't be turned back into the user's text
@@ -2571,6 +2582,7 @@ impl Default for Persisted {
             background_image_opacity: 0.3,
             ligatures: true,
             opacity: 85,
+            #[cfg(windows)]
             quake_key: None,
             quake_key_raw: None,
             wsl_distro: None,
@@ -2665,7 +2677,7 @@ fn cursor_from_name(s: &str) -> grid::CursorShape {
 
 /// whether a chrome button mutates a persisted setting (triggers a save)
 fn is_settings_hot(h: Hot) -> bool {
-    matches!(
+    let common = matches!(
         h,
         Hot::FontDec
             | Hot::FontInc
@@ -2681,7 +2693,6 @@ fn is_settings_hot(h: Hot) -> bool {
             | Hot::LineHeightDec
             | Hot::LineHeightInc
             | Hot::BoldBright
-            | Hot::Mica
             | Hot::ScrollbackDec
             | Hot::ScrollbackInc
             | Hot::CopyOnSelect
@@ -2689,7 +2700,11 @@ fn is_settings_hot(h: Hot) -> bool {
             | Hot::LoadProfile
             | Hot::CloseActionCycle
             | Hot::BackendCycle
-    )
+    );
+    #[cfg(windows)]
+    return common || h == Hot::Mica;
+    #[cfg(not(windows))]
+    return common;
 }
 
 /// poll the hand-edited conf files (colors.conf, keybindings.conf) once a
@@ -2721,8 +2736,16 @@ fn spawn_conf_watcher(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
-/// termie's per-user config/data directory: %APPDATA%\termie on windows,
-/// $XDG_CONFIG_HOME/termie (falling back to ~/.config/termie) elsewhere
+#[cfg(not(windows))]
+fn user_dir(env_name: &str, fallback: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(env_name)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(fallback)))
+        .map(|p| p.join("termie"))
+}
+
+/// termie's per-user configuration directory
 pub fn app_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
@@ -2731,13 +2754,44 @@ pub fn app_dir() -> Option<std::path::PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        // the xdg spec says a relative XDG_CONFIG_HOME must be ignored
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-        Some(base.join("termie"))
+        user_dir("XDG_CONFIG_HOME", ".config")
     }
+}
+
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    return app_dir();
+    #[cfg(not(windows))]
+    return user_dir("XDG_DATA_HOME", ".local/share");
+}
+
+pub fn state_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    return app_dir();
+    #[cfg(not(windows))]
+    return user_dir("XDG_STATE_HOME", ".local/state");
+}
+
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    return app_dir();
+    #[cfg(not(windows))]
+    return user_dir("XDG_CACHE_HOME", ".cache");
+}
+
+fn migrated_path(dir: std::path::PathBuf, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    #[cfg(not(windows))]
+    if !path.exists()
+        && let Some(legacy) = app_dir().map(|d| d.join(name))
+        && legacy.exists()
+    {
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::rename(&legacy, &path).is_ok() {
+            return path;
+        }
+        return legacy;
+    }
+    path
 }
 
 /// the user's home directory (%USERPROFILE% / $HOME)
@@ -2805,7 +2859,7 @@ fn local_timestamp() -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-/// %APPDATA%\termie\termie.log — the `log` facade's sink. the release build is
+/// the per-user state directory's `termie.log` sink. the release build is
 /// a windowed app with no console, so without this every parser warning
 /// (colors.conf typos, bad keybinding lines, unknown config keys) vanished
 struct FileLog(std::sync::Mutex<std::fs::File>);
@@ -2829,7 +2883,7 @@ impl log::Log for FileLog {
 }
 
 fn install_file_log() {
-    let Some(dir) = app_dir() else {
+    let Some(dir) = state_dir() else {
         return;
     };
     let _ = std::fs::create_dir_all(&dir);
@@ -2851,12 +2905,12 @@ fn install_file_log() {
 }
 
 fn session_path() -> Option<std::path::PathBuf> {
-    Some(app_dir()?.join("session.json"))
+    Some(migrated_path(state_dir()?, "session.json"))
 }
 
-/// the `plugins` dir under app_dir() — one subdirectory per installed plugin
+/// installed plugin payloads are user data, separate from their configuration
 fn plugins_dir() -> Option<std::path::PathBuf> {
-    Some(app_dir()?.join("plugins"))
+    Some(migrated_path(data_dir()?, "plugins"))
 }
 
 /// `plugins.cfg` under app_dir() — per-plugin enabled state + granted perms.
@@ -2946,6 +3000,7 @@ struct Discovered {
 /// parse a quake hotkey combo like "ctrl+grave" or "ctrl+shift+t" into
 /// (win32 modifiers, virtual-key). returns None if empty or missing a real
 /// modifier so the global hotkey simply stays off
+#[cfg(windows)]
 fn parse_quake_key(s: &str) -> Option<(u32, u32)> {
     // win32 MOD_* values, plus MOD_NOREPEAT so a held key fires once
     const MOD_ALT: u32 = 0x0001;
@@ -2974,6 +3029,7 @@ fn parse_quake_key(s: &str) -> Option<(u32, u32)> {
 }
 
 /// map a key name to a win32 virtual-key code
+#[cfg(windows)]
 fn vk_from_name(name: &str) -> Option<u32> {
     let b = name.as_bytes();
     if b.len() == 1 {
@@ -3101,8 +3157,14 @@ fn parse_persisted(text: &str) -> Persisted {
                 }
             }
             "quake_key" => {
-                p.quake_key = parse_quake_key(v);
-                p.quake_key_raw = p.quake_key.is_some().then(|| v.to_string());
+                p.quake_key_raw = (!v.is_empty()).then(|| v.to_string());
+                #[cfg(windows)]
+                {
+                    p.quake_key = parse_quake_key(v);
+                    if p.quake_key.is_none() {
+                        p.quake_key_raw = None;
+                    }
+                }
             }
             "wsl_distro" => {
                 if !v.is_empty() {
@@ -3311,11 +3373,17 @@ struct App {
     drag_divider: Option<Vec<usize>>,
     drag_pane: Option<usize>,
     /// quake drop-down currently summoned (always-on-top at screen top)
+    #[cfg(windows)]
     quake_shown: bool,
     /// the global quake hotkey thread has been spawned (once per process)
+    #[cfg(windows)]
     quake_hotkey_spawned: bool,
     /// the colors.conf/keybindings.conf watcher thread has been spawned
     conf_watch_spawned: bool,
+    #[cfg(not(windows))]
+    system_dark: Option<bool>,
+    #[cfg(not(windows))]
+    theme_watch_spawned: bool,
     /// persisted settings loaded at startup; renderer-owned ones applied in boot
     persisted: Persisted,
     /// broadcast input: typed keys go to every pane in the active tab
@@ -3475,6 +3543,7 @@ impl App {
                 right_click: p.right_click,
                 backend: p.backend,
                 restore_on_launch: p.restore_on_launch,
+                #[cfg(windows)]
                 quake_key: p.quake_key,
             },
             persisted: p,
@@ -3516,9 +3585,15 @@ impl App {
             shutting_down: false,
             drag_divider: None,
             drag_pane: None,
+            #[cfg(windows)]
             quake_shown: false,
+            #[cfg(windows)]
             quake_hotkey_spawned: false,
             conf_watch_spawned: false,
+            #[cfg(not(windows))]
+            system_dark: None,
+            #[cfg(not(windows))]
+            theme_watch_spawned: false,
             drive: None,
         }
     }
@@ -3672,6 +3747,7 @@ impl App {
 
         self.pw.active_tab = 0;
         // register the global quake hotkey once (opt-in via the quake_key setting)
+        #[cfg(windows)]
         if !self.quake_hotkey_spawned
             && let Some((mods, vk)) = self.config.quake_key
         {
@@ -3692,6 +3768,10 @@ impl App {
             // every line is a comment so it just re-applies the defaults
             write_keybindings_template_if_absent();
             spawn_conf_watcher(self.proxy.clone());
+        }
+        #[cfg(not(windows))]
+        if self.persisted.theme_auto {
+            self.ensure_theme_watcher();
         }
         // an inbound default-terminal session becomes tab one — ephemeral like
         // an explicit cli launch, so it never overwrites the saved session
@@ -4923,6 +5003,7 @@ impl App {
                 copy_on_select: config.copy_on_select,
                 load_profile: config.load_profile,
                 theme_auto: self.persisted.theme_auto,
+                #[cfg(windows)]
                 acrylic: self.persisted.acrylic,
                 shell_name: config.shell.label(),
                 close_action_name: config.close_action.label(),
@@ -5511,8 +5592,16 @@ impl App {
                 if let Some(u) = &self.update {
                     // an update is already known: straight to the confirm
                     self.pw.confirm = Some(ConfirmState {
-                        prompt: format!("install termie {} and restart?", u.version),
-                        hint: "enter: update \u{b7} esc: not now".to_string(),
+                        prompt: if cfg!(windows) {
+                            format!("install termie {} and restart?", u.version)
+                        } else {
+                            format!("open the termie {} release page?", u.version)
+                        },
+                        hint: if cfg!(windows) {
+                            "enter: update \u{b7} esc: not now".to_string()
+                        } else {
+                            "enter: open \u{b7} esc: not now".to_string()
+                        },
                         action: ConfirmAction::InstallUpdate,
                     });
                     self.redraw();
@@ -5646,6 +5735,7 @@ impl App {
             // the "default terminal" delegation only exists on windows
             #[cfg(not(windows))]
             PaletteAction::DefaultTerminal => {}
+            #[cfg(windows)]
             PaletteAction::Quake => self.toggle_quake(),
             PaletteAction::Theme => {
                 self.persisted.theme_auto = false;
@@ -6265,10 +6355,7 @@ impl App {
     /// folder (wt-style); a drop on the content lands in the pane under the
     /// pointer, like right-click, and types the quoted path at its prompt
     fn on_dropped_file(&mut self, path: &std::path::Path) {
-        let at = self.pw.window.as_ref().and_then(|w| match w.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => win::cursor_client_pos(h.hwnd.get()),
-            _ => None,
-        });
+        let at = Some((self.pw.cursor.x as f32, self.pw.cursor.y as f32));
         let hit = at.zip(self.pw.renderer.as_ref()).map(|((x, y), r)| r.hit_test(x, y));
         if matches!(
             hit,
@@ -6386,6 +6473,10 @@ impl App {
             }
             Hot::ThemeAuto => {
                 self.persisted.theme_auto = true;
+                #[cfg(not(windows))]
+                {
+                    self.ensure_theme_watcher();
+                }
                 self.apply_os_theme();
             }
             Hot::SplitV => self.split_focused(Dir::Vertical),
@@ -6444,6 +6535,7 @@ impl App {
                 }
                 self.redraw();
             }
+            #[cfg(windows)]
             Hot::Mica => {
                 self.persisted.acrylic = !self.persisted.acrylic;
                 let on = self.persisted.acrylic;
@@ -6528,6 +6620,7 @@ impl App {
         if !self.persisted.theme_auto {
             return self.persisted.theme;
         }
+        #[cfg(windows)]
         let dark = self
             .main_pw()
             .window
@@ -6535,7 +6628,21 @@ impl App {
             .and_then(|w| w.theme())
             .map(|t| t == winit::window::Theme::Dark)
             .unwrap_or(true);
+        #[cfg(not(windows))]
+        let dark = self.system_dark.unwrap_or(true);
         if dark { self.persisted.theme_dark } else { self.persisted.theme_light }
+    }
+
+    #[cfg(not(windows))]
+    fn ensure_theme_watcher(&mut self) {
+        if self.theme_watch_spawned {
+            return;
+        }
+        self.theme_watch_spawned = true;
+        let proxy = self.proxy.clone();
+        win::watch_system_theme(move |dark| {
+            let _ = proxy.send_event(UserEvent::SystemThemeChanged(dark));
+        });
     }
 
     /// re-resolve and apply the auto theme on every window (called on the OS
@@ -6683,10 +6790,15 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return None;
         }
-        let pos = w.outer_position().ok()?;
+        let pos = w
+            .outer_position()
+            .ok()
+            .map(|p| (p.x, p.y))
+            .or_else(|| self.last_window_bounds.as_ref().map(|p| (p.x, p.y)))
+            .unwrap_or((0, 0));
         Some(session::WindowBounds {
-            x: pos.x,
-            y: pos.y,
+            x: pos.0,
+            y: pos.1,
             width: size.width,
             height: size.height,
             maximized: w.is_maximized(),
@@ -7422,6 +7534,9 @@ impl App {
                 }
             }
             WindowEvent::Focused(f) => {
+                if f && let Some(window) = self.pw.window.as_ref() {
+                    window.request_user_attention(None);
+                }
                 // a --drive window paints focused no matter the real focus
                 // (it is WS_EX_NOACTIVATE, so real focus never arrives)
                 self.pw.focused = f || self.drive.is_some();
@@ -7506,6 +7621,7 @@ impl App {
     /// toggle the quake drop-down: summon the window to the top of the active
     /// monitor (full width, ~45% height, always-on-top, focused), or hide it.
     /// only ever reached via the global hotkey or the palette action
+    #[cfg(windows)]
     fn toggle_quake(&mut self) {
         let Some(win) = self.pw.window.clone() else {
             return;
@@ -7751,7 +7867,7 @@ impl App {
             }
             // hover a url: underline it and show a hand so links read as
             // clickable without holding a modifier. opening still needs
-            // ctrl+click (checked against the real key at click time); a plain
+            // ctrl+click (checked against tracked modifiers at click time); a plain
             // click here still starts a selection
             let new_link = if !self.pw.settings_open {
                 self.focused_url_at(px, py).map(|(r, a, b, _)| (r, a, b))
@@ -8108,7 +8224,7 @@ impl App {
                 }
                 // ctrl+click opens a web link under the cursor (before any TUI
                 // forwarding, so it works inside mouse-reporting apps too)
-                if state == ElementState::Pressed && win::ctrl_held()
+                if state == ElementState::Pressed && self.mods.control_key()
                     && let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
                         win::open_url(&url);
                         return;
@@ -9197,6 +9313,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
             }
+            #[cfg(windows)]
             UserEvent::ToggleQuake => self.toggle_quake(),
             UserEvent::UserConfChanged => {
                 let (kb, sends, ignored) = load_keybindings();
@@ -9222,6 +9339,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.redraw();
             }
+            #[cfg(not(windows))]
+            UserEvent::SystemThemeChanged(dark) => {
+                self.system_dark = dark;
+                if self.persisted.theme_auto {
+                    self.apply_os_theme();
+                }
+            }
             #[cfg(windows)]
             UserEvent::Handoff(h) => self.handoff_tab(h),
             UserEvent::UpdateCheckDone(found, manual) => {
@@ -9233,15 +9357,21 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         if manual {
                             self.pw.confirm = Some(ConfirmState {
-                                prompt: format!("install termie {} and restart?", u.version),
-                                hint: "enter: update \u{b7} esc: not now".to_string(),
+                                prompt: if cfg!(windows) {
+                                    format!("install termie {} and restart?", u.version)
+                                } else {
+                                    format!("open the termie {} release page?", u.version)
+                                },
+                                hint: if cfg!(windows) {
+                                    "enter: update \u{b7} esc: not now".to_string()
+                                } else {
+                                    "enter: open \u{b7} esc: not now".to_string()
+                                },
                                 action: ConfirmAction::InstallUpdate,
                             });
                         } else {
-                            self.show_notice(&format!(
-                                "update {} available \u{2014} palette: install update",
-                                u.version
-                            ));
+                            let action = if cfg!(windows) { "install update" } else { "open release page" };
+                            self.show_notice(&format!("update {} available \u{2014} palette: {action}", u.version));
                         }
                         self.update = Some(u);
                         self.redraw();
@@ -9292,6 +9422,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(f) => {
+                if f && let Some(window) = self.pw.window.as_ref() {
+                    window.request_user_attention(None);
+                }
                 // a --drive window paints focused no matter the real focus
                 // (it is WS_EX_NOACTIVATE, so real focus never arrives)
                 self.pw.focused = f || self.drive.is_some();
@@ -10638,6 +10771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn parse_quake_key_forms() {
         // MOD_NOREPEAT(0x4000) is always set; ctrl=0x2, shift=0x4, alt=0x1
         // ctrl+grave -> VK_OEM_3 (0xC0)

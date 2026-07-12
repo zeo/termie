@@ -1,3 +1,5 @@
 # golden snapshots are string-compared against the harness's LF dump output;
 # keep them LF in the working tree regardless of core.autocrlf
 tests/golden/*.txt text eol=lf
+packaging/linux/*.sh text eol=lf
+packaging/linux/*.desktop text eol=lf

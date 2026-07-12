@@ -164,11 +164,7 @@ impl Parser {
                         *b += by;
                     }
                 }
-                Inst::Jmp(t) => {
-                    if *t >= at && *t != usize::MAX {
-                        *t += by;
-                    }
-                }
+                Inst::Jmp(t) if *t >= at && *t != usize::MAX => *t += by,
                 _ => {}
             }
         }

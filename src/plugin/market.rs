@@ -1,6 +1,6 @@
 //! plugin marketplace: a curated remote index of installable plugins plus the
-//! local install/remove plumbing. archive work shells out to `tar` (ships with
-//! Windows). catalog + plugin downloads go through the GitHub CLI (`gh`) when
+//! local install/remove plumbing. archive work uses the OS ZIP extractor.
+//! catalog + plugin downloads go through the GitHub CLI (`gh`) when
 //! the file lives in the catalog repo, so a private catalog works with the
 //! user's existing login, and fall back to anonymous `curl` for a public host.
 //!
@@ -9,7 +9,7 @@
 //! BEFORE anything is moved into the plugins directory, so a malicious archive
 //! can't traverse out or shadow another plugin.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use super::json::Json;
@@ -115,6 +115,77 @@ pub(crate) fn quiet_command(program: &str) -> Command {
     Command::new(program)
 }
 
+fn archive_path_is_safe(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+}
+
+fn validate_archive_listing(bytes: Vec<u8>) -> Result<(), String> {
+    let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 paths")?;
+    if listing.lines().any(|path| !archive_path_is_safe(path)) {
+        return Err("archive contains an unsafe path".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
+    let listing = quiet_command("tar")
+        .arg("-tf")
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("couldn't inspect archive: {e}"))?;
+    if !listing.status.success() {
+        return Err(format!("couldn't inspect archive: status {:?}", listing.status));
+    }
+    validate_archive_listing(listing.stdout)?;
+    let status = quiet_command("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(unpack)
+        .status()
+        .map_err(|e| format!("couldn't run tar: {e}"))?;
+    status.success().then_some(()).ok_or_else(|| format!("unpack failed: status {status:?}"))
+}
+
+#[cfg(not(windows))]
+fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
+    let listing = quiet_command("unzip")
+        .arg("-Z1")
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("couldn't run unzip: {e}"))?;
+    if !listing.status.success() {
+        return Err(format!("couldn't inspect archive: status {:?}", listing.status));
+    }
+    validate_archive_listing(listing.stdout)?;
+    let status = quiet_command("unzip")
+        .arg("-qq")
+        .arg(archive)
+        .arg("-d")
+        .arg(unpack)
+        .status()
+        .map_err(|e| format!("couldn't run unzip: {e}"))?;
+    status.success().then_some(()).ok_or_else(|| format!("unpack failed: status {status:?}"))
+}
+
+fn reject_symlinks(dir: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("inspect archive: {e}"))? {
+        let entry = entry.map_err(|e| format!("inspect archive: {e}"))?;
+        let kind = entry.file_type().map_err(|e| format!("inspect archive: {e}"))?;
+        if kind.is_symlink() {
+            return Err(format!("archive contains symlink {:?}", entry.file_name()));
+        }
+        if kind.is_dir() {
+            reject_symlinks(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// fetch raw bytes for a catalog URL. files under the catalog repo go through
 /// the GitHub CLI (`gh api … Accept: raw`) so a private repo works with the
 /// user's login; anything else — or a missing/unauthenticated gh — falls back
@@ -169,18 +240,8 @@ pub fn install(entry: &Entry, plugins_dir: &Path, temp_dir: &Path) -> Result<Man
     let bytes = fetch_bytes(&entry.url).map_err(|e| format!("download failed: {e}"))?;
     std::fs::write(&archive, &bytes).map_err(|e| format!("write archive: {e}"))?;
 
-    // unpack with tar (handles .zip on modern Windows). -C extracts into unpack
-    let ex = quiet_command("tar")
-        .arg("-xf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&unpack)
-        .status();
-    match ex {
-        Ok(s) if s.success() => {}
-        Ok(s) => return Err(format!("unpack failed: status {s:?}")),
-        Err(e) => return Err(format!("unpack failed: {e}")),
-    }
+    unpack_archive(&archive, &unpack)?;
+    reject_symlinks(&unpack)?;
 
     // the archive may wrap its files in a top dir; find the dir containing
     // plugin.json (the archive root or exactly one nested dir)
@@ -290,6 +351,15 @@ mod tests {
     }
 
     #[test]
+    fn archive_paths_cannot_escape_install_dir() {
+        assert!(archive_path_is_safe("plugin/plugin.json"));
+        assert!(archive_path_is_safe("plugin/assets/icon.png"));
+        assert!(!archive_path_is_safe("../plugin.json"));
+        assert!(!archive_path_is_safe("plugin/../../outside"));
+        assert!(!archive_path_is_safe("/tmp/plugin.json"));
+    }
+
+    #[test]
     fn parse_index_handles_garbage() {
         assert!(parse_index("not json").is_empty());
         assert!(parse_index("{}").is_empty());
@@ -351,5 +421,30 @@ mod tests {
         assert!(remove("pet", &base).is_err());
         assert!(remove("../escape", &base).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "needs zip and unzip installed"]
+    fn linux_unpacks_a_real_zip_archive() {
+        let base = temp_subdir("unzip");
+        let source = base.join("source");
+        let unpack = base.join("unpack");
+        let archive = base.join("plugin.zip");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&unpack).unwrap();
+        std::fs::write(source.join("plugin.json"), r#"{"id":"pet","entry":"pet"}"#).unwrap();
+        let status = quiet_command("zip")
+            .args(["-q", "-r"])
+            .arg(&archive)
+            .arg(".")
+            .current_dir(&source)
+            .status()
+            .expect("zip installed");
+        assert!(status.success());
+        unpack_archive(&archive, &unpack).expect("unzip archive");
+        reject_symlinks(&unpack).expect("ordinary archive has no symlinks");
+        assert!(unpack.join("plugin.json").is_file());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -4,15 +4,15 @@ A fast, lightweight GPU terminal multiplexer for Windows and Linux — tabs, spl
 
 ![termie](shot.png)
 
-- downloads: [GitHub Releases](https://github.com/lintowe/termie/releases) (Windows x64 installer; Linux builds from source)
+- downloads: [GitHub Releases](https://github.com/lintowe/termie/releases) (Windows x64 installer; Linux x86-64 archive)
 - plugins: registry at [`lintowe/termie-plugins`](https://github.com/lintowe/termie-plugins)
 - license: MIT OR Apache-2.0
 
-> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core; a few OS-integration touches are Windows-only and noted below.
+> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. Default-terminal handoff, Quake mode, Mica, admin relaunch, and the taskbar jump list are Windows-only.
 
 ## features
 
-GPU-rendered (wgpu glyph-atlas), a ~8.8 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps a started PowerShell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
+GPU-rendered (wgpu glyph-atlas), a ~8.8 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps the default shell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
 
 Tabs and recursive split panes — split vertically or horizontally, drag tabs to reorder them, drag dividers, swap panes, tear a pane off into its own window, and broadcast input to every pane in a tab. Splits and "new tab here" open in the focused pane's directory; pick a per-tab shell from the command palette — `pwsh` / `cmd` / `wsl` on Windows, `bash` / `zsh` / `fish` on Linux, plus any custom profile. A bell in a background tab dots that tab, and a bell while the window is unfocused asks for attention (a taskbar flash on Windows, the window-manager's urgency hint on Linux) — so a finished agent or build finds you, not the other way around. On Windows the taskbar icon also carries a jump list: right-click it for a new window in any shell or custom profile (`termie --shell bash` from a script does the same everywhere).
 
@@ -22,7 +22,7 @@ Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG, cursor flow
 
 On Windows 11 termie can be the **default terminal**: run "default terminal" from the palette once, and console apps launched from the run box, the start menu, or a double-clicked script open in a termie window instead of the legacy console host. The same palette action turns it back off (your previous choice is restored), and so does uninstalling. (This one is Windows-only — Linux has no equivalent console-handoff to intercept.)
 
-A command palette (`Ctrl+P`) for fuzzy access to every action, plus a searchable numbered tab switcher (`tab search` in the palette) for crowded windows. Seven built-in themes — three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord — a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. An optional Quake-style drop-down (`quake_key`).
+A command palette (`Ctrl+P`) for fuzzy access to every action, plus a searchable numbered tab switcher (`tab search` in the palette) for crowded windows. Seven built-in themes — three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord — a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. Windows also has an optional Quake-style drop-down (`quake_key`).
 
 A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and can be confined to an OS sandbox — a Windows AppContainer or a Linux [bubblewrap](https://github.com/containers/bubblewrap) jail. An in-app marketplace browses and installs them.
 
@@ -32,7 +32,7 @@ A plugin system: plugins run as separate processes over a small JSON protocol, r
 
 termie checks for a newer release once a day and shows a small `UPDATE` chip on the status bar when one exists. On Windows, clicking it (or running "install update" from the palette) installs the new version and relaunches with your session restored; nothing downloads without that confirmation. On Linux the chip opens the release page instead, since the binary comes from your package manager or a source build rather than a self-installer. Turn the check off entirely with `update_check=false` in `config`. An MSI is still attached to each release for anyone scripting Windows installs.
 
-**Linux.** Build from source (see below) — there's no prebuilt Linux binary yet. termie runs on X11 and Wayland; a working Vulkan or GL driver is all the GPU side needs.
+**Linux.** Download `termie-<version>-linux-x86_64.tar.gz`, extract it, and run `./install.sh`. The default prefix is `~/.local`; pass an absolute prefix such as `/usr/local` to install elsewhere. `./uninstall.sh` uses the same prefix. The archive includes the desktop entry, icon, licenses, and bundled assets. Termie runs on X11 and Wayland; a working Vulkan or GL driver is all the GPU side needs.
 
 ## keybindings
 
@@ -63,7 +63,7 @@ Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list
 
 ## shells
 
-Auto-detects and prefers `pwsh` → `powershell` → `cmd`, with WSL also selectable. PowerShell launches `-NoLogo -NoProfile` (profile loading is opt-in) with telemetry and update checks off for a fast prompt. PowerShell and CMD both emit shell-integration prompt marks and current-directory updates, so prompt navigation, scrollbar marks, tab labels, and "new tab here" work in either shell. Set the default in settings, or open a one-off tab in any shell from the palette.
+Windows auto-detects `pwsh` → `powershell` → `cmd`, with WSL selectable. Linux auto-detects `bash` → `zsh` → `fish` → `pwsh`. PowerShell launches `-NoLogo -NoProfile` unless profile loading is enabled. Bash, zsh, fish, PowerShell, and CMD emit prompt, command-start, command-finished, exit-status, and current-directory marks where the shell exposes them. These marks drive prompt navigation, status badges, scrollbar marks, tab labels, and "new tab here".
 
 Any other shell works as a custom profile — add `profile.<name>=<command line>` to `config` (quote paths with spaces):
 
@@ -79,15 +79,15 @@ A shell or profile can carry its own theme — `theme.<name>=<theme>` paints tha
 
 ## configuration
 
-Drop files in `%APPDATA%\termie\` on Windows, or `$XDG_CONFIG_HOME/termie/` (usually `~/.config/termie/`) on Linux:
+Configuration lives in `%APPDATA%\termie\` on Windows. Linux follows the XDG base-directory split: configuration in `$XDG_CONFIG_HOME/termie` (usually `~/.config/termie`), plugins in `$XDG_DATA_HOME/termie`, session state and logs in `$XDG_STATE_HOME/termie`, and generated shell hooks plus the update stamp in `$XDG_CACHE_HOME/termie`. Existing Linux files migrate from the old config directory on first use.
 
-- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` (drop-down hotkey), `plugin_sandbox=appcontainer` on Windows or `plugin_sandbox=bwrap` on Linux (sandbox every plugin), `latency_hud=true` (input-to-photon readout), `acrylic=true` (Win11 Mica backdrop behind a translucent window; `mica=true` also works), `right_click=paste` (right-click pastes, or copies an active selection and clears it, instead of opening the context menu — Windows Terminal style; `Shift+right-click` still opens the menu), `term_program=ghostty` (override `$TERM_PROGRAM` for apps that only enable the kitty keyboard protocol on a hard-coded host allowlist; default is `termie`), `font_weight=semibold` (base weight for regular text, a name or 100–900), `min_contrast=3` (lift low-contrast text to a WCAG ratio, up to 21), `background_image=<path.png>` with `background_image_opacity=0.3` (a picture behind the panes), `ligatures=false` (turn off programming ligatures, which are on by default).
+- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` on Windows, `plugin_sandbox=appcontainer` on Windows or `plugin_sandbox=bwrap` on Linux, `latency_hud=true`, `acrylic=true` on Windows 11, `right_click=paste`, `term_program=ghostty`, `font_weight=semibold`, `min_contrast=3`, `background_image=<path.png>` with `background_image_opacity=0.3`, and `ligatures=false`.
 - `colors.conf` — override theme colors, one `key=color` per line (`fg`, `bg`, `cursor`, `sel`, `ansi0`..`ansi255`; `#rrggbb`, `#rgb`, or `r,g,b`).
 - `keybindings.conf` — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`.
 
-Mistyped lines in any of these are reported to `termie.log` in that same directory.
+Mistyped lines are reported to `termie.log` in the state directory.
 
-The command line takes Windows Terminal's layout verbs too: `termie new-tab -d ~/src ; split-pane -H --shell bash` opens a window with that layout (`nt`/`sp` for short; `-V` splits beside and is the default, `-H` below). Scripted windows never overwrite your saved session. For automation and demos, `--drive script.txt` plays a timed key script (`500 key ctrl+shift+m` / `100 type hello`, combos in the `keybindings.conf` syntax) in a window that never takes focus.
+The command line takes Windows Terminal's layout verbs too: `termie new-tab -d ~/src ; split-pane -H --shell bash` opens a window with that layout (`nt`/`sp` for short; `-V` splits beside and is the default, `-H` below). Scripted windows never overwrite your saved session. For automation and demos, `--drive script.txt` plays a timed key script (`500 key ctrl+shift+m` / `100 type hello`). Windows creates this window without activation. Linux compositors control activation, so a drive window can receive focus there.
 
 ## build from source
 
@@ -107,7 +107,7 @@ This builds in release, installs to `%LOCALAPPDATA%\Programs\termie`, bundles th
 
 ```sh
 sudo apt install pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
-                 libxcursor-dev libxi-dev libxrandr-dev
+                 libxcursor-dev libxi-dev libxrandr-dev unzip
 # Fedora: pkgconf-pkg-config wayland-devel libxkbcommon-devel libX11-devel \
 #         libXcursor-devel libXi-devel libXrandr-devel
 # Arch:   pkgconf wayland libxkbcommon libx11 libxcursor libxi libxrandr
@@ -117,7 +117,7 @@ cd termie
 cargo build --release      # target/release/termie
 ```
 
-At runtime the binary needs those same libraries plus a Vulkan (or GL) driver — `mesa-vulkan-drivers` covers the software fallback if you have no GPU driver. Optional: `bubblewrap` for the plugin sandbox, `xdg-open` for opening links, `xdg-desktop-portal` if you want `theme=auto` to follow the desktop's light/dark setting. Copy `assets/fonts/` next to the binary (or run from the repo) so the bundled Maple Mono ships with it; otherwise termie falls back to an installed monospace font.
+At runtime the binary needs those same libraries, `unzip` for marketplace installs, and a Vulkan or GL driver. `mesa-vulkan-drivers` covers the software fallback. Optional: `bubblewrap` for the plugin sandbox and `xdg-open` for opening links. `theme=auto` reads and monitors the desktop color scheme through `xdg-desktop-portal` using `gdbus`. Copy `assets/fonts/` next to a source-built binary (or run from the repo); the release archive already carries them.
 
 Every platform:
 

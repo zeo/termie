@@ -74,28 +74,82 @@ pub fn set_no_activate(hwnd_handle: isize) {
 #[cfg(not(windows))]
 pub fn set_no_activate(_hwnd_handle: isize) {}
 
-/// the cursor's position in a window's client area (physical pixels), for
-/// events that carry no position of their own — winit's DroppedFile fires at
-/// the drop instant, so the cursor is still exactly where the user let go
-#[cfg(windows)]
-pub fn cursor_client_pos(hwnd_handle: isize) -> Option<(f32, f32)> {
-    use windows::Win32::Foundation::{HWND, POINT};
-    use windows::Win32::Graphics::Gdi::ScreenToClient;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-
-    let hwnd = HWND(hwnd_handle as *mut core::ffi::c_void);
-    let mut p = POINT::default();
-    unsafe {
-        if GetCursorPos(&mut p).is_err() || !ScreenToClient(hwnd, &mut p).as_bool() {
-            return None;
-        }
+#[cfg(not(windows))]
+fn parse_portal_color_scheme(text: &str) -> Option<bool> {
+    let value = text.split("uint32").nth(1)?.trim_start().chars().next()?;
+    match value {
+        '1' => Some(true),
+        '2' => Some(false),
+        _ => None,
     }
-    Some((p.x as f32, p.y as f32))
 }
 
 #[cfg(not(windows))]
-pub fn cursor_client_pos(_hwnd_handle: isize) -> Option<(f32, f32)> {
-    None
+fn system_theme_is_dark() -> Option<bool> {
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--timeout",
+            "2",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.Settings.Read",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_portal_color_scheme(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+#[cfg(not(windows))]
+pub fn watch_system_theme(on_change: impl Fn(Option<bool>) + Send + 'static) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        on_change(system_theme_is_dark());
+        let mut command = std::process::Command::new("gdbus");
+        command
+            .args([
+                "monitor",
+                "--session",
+                "--dest",
+                "org.freedesktop.portal.Desktop",
+                "--object-path",
+                "/org/freedesktop/portal/desktop",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let Ok(mut child) = command.spawn() else {
+            return;
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return;
+        };
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.contains("color-scheme") {
+                on_change(system_theme_is_dark());
+            }
+        }
+        let _ = child.wait();
+    });
 }
 
 /// opt the window into the Win11 system backdrop (Mica) so the desktop shows
@@ -935,26 +989,6 @@ pub fn spawn_global_hotkey(id: i32, modifiers: u32, vk: u32, on_press: impl Fn()
     rx.recv().unwrap_or(false)
 }
 
-#[cfg(not(windows))]
-pub fn spawn_global_hotkey(_id: i32, _modifiers: u32, _vk: u32, _on_press: impl Fn() + Send + 'static) -> bool {
-    false
-}
-
-/// whether either ctrl key is physically down right now, read from the os rather
-/// than tracked modifier state. winit can miss a ctrl release (after a focus
-/// change or a tui that grabs input), leaving the tracked state stuck; reading
-/// the real key here keeps the ctrl-hover link from latching on without ctrl
-#[cfg(windows)]
-pub fn ctrl_held() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
-    unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
-}
-
-#[cfg(not(windows))]
-pub fn ctrl_held() -> bool {
-    false
-}
-
 /// the foreground window right now, as a raw HWND value (0 if none). captured at
 /// startup to remember which window launched us, before we create our own
 #[cfg(windows)]
@@ -1051,4 +1085,16 @@ pub fn explorer_dir_for(hwnd: isize) -> Option<String> {
 #[cfg(not(windows))]
 pub fn explorer_dir_for(_hwnd: isize) -> Option<String> {
     None
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::parse_portal_color_scheme;
+
+    #[test]
+    fn portal_color_scheme_values_map_to_dark_and_light() {
+        assert_eq!(parse_portal_color_scheme("(<<uint32 1>>,)"), Some(true));
+        assert_eq!(parse_portal_color_scheme("(<uint32 2>,)"), Some(false));
+        assert_eq!(parse_portal_color_scheme("(<uint32 0>,)"), None);
+    }
 }

@@ -14,14 +14,16 @@ const RELEASES_URL: &str = "https://api.github.com/repos/lintowe/termie/releases
 #[derive(Clone, Debug, PartialEq)]
 pub struct Update {
     pub version: String,
+    #[cfg(windows)]
     pub url: String,
     /// sha256 hex of the setup asset, from the release api; the download is
     /// refused unless it hashes to exactly this
+    #[cfg(windows)]
     pub digest: String,
 }
 
 fn stamp_path() -> Option<PathBuf> {
-    Some(crate::app_dir()?.join("update.stamp"))
+    Some(crate::cache_dir()?.join("update.stamp"))
 }
 
 /// at most one automatic check per ~20h (a manual palette check skips this)
@@ -68,7 +70,7 @@ fn fetch_latest() -> Option<Update> {
     // release page), so a newer tag alone is enough — no asset to verify
     #[cfg(not(windows))]
     {
-        Some(Update { version, url: String::new(), digest: String::new() })
+        Some(Update { version })
     }
     #[cfg(windows)]
     {

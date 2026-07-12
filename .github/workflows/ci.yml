@@ -28,7 +28,6 @@ jobs:
   # it's cheap after the build. formatting is intentionally not enforced (the
   # project keeps its own non-rustfmt style); clippy is the quality gate.
   build:
-    if: github.actor == 'lintowe'
     runs-on: [self-hosted, windows-vm]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -48,7 +47,6 @@ jobs:
   # tests skip themselves when the runner has no adapter, so this passes on a
   # headless vm while still covering the platform layer, pty, and parser
   build-linux:
-    if: github.actor == 'lintowe'
     runs-on: [self-hosted, linux-vm]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -68,17 +66,18 @@ jobs:
       - name: system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libwayland-dev libxkbcommon-dev libx11-dev
+          sudo apt-get install -y -qq pkg-config libwayland-dev libxkbcommon-dev libx11-dev bubblewrap unzip zip
       - name: build
         run: cargo build --all-targets
       - name: test
         run: cargo test
+      - name: linux integration tests
+        run: cargo test -- --ignored
       - name: clippy
         run: cargo clippy --all-targets
 
   # security advisory scan of the dependency tree (RUSTSEC database)
   audit:
-    if: github.actor == 'lintowe'
     runs-on: [self-hosted, linux-vm]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

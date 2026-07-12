@@ -6,13 +6,13 @@ use std::thread;
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-// a prompt hook that emits OSC-133;A (prompt mark, drives ctrl+up/down jump
-// nav) and OSC-7 (cwd) before the prompt text. it wraps whatever prompt is
+// a prompt hook that emits OSC-133 command lifecycle marks and OSC-7 cwd
+// reporting around the prompt text. it wraps whatever prompt is
 // already defined — the pwsh default, or the profile's starship/oh-my-posh
 // when load_profile is on — instead of replacing it. single-quoted pwsh +
 // string concatenation so the command line carries no double quotes
 #[cfg(windows)]
-const PWSH_PROMPT_HOOK: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $p=$PWD.ProviderPath; [char]27+']133;A'+[char]27+'\'+[char]27+']7;file:///'+($p -replace '\\','/')+[char]27+'\'+(& $global:__termie_prompt) }"#;
+const PWSH_PROMPT_HOOK: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $ok=$?; $code=if($ok){0}elseif($global:LASTEXITCODE){$global:LASTEXITCODE}else{1}; $p=$PWD.ProviderPath; [char]27+']133;D;'+$code+[char]27+'\'+[char]27+']133;A'+[char]27+'\'+[char]27+']7;file:///'+($p -replace '\\','/')+[char]27+'\'+(& $global:__termie_prompt)+[char]27+']133;B'+[char]27+'\' }"#;
 
 // cmd expands $e to ESC and %PROMPT% before it installs the new prompt
 const CMD_PROMPT_HOOK: &str = r#"$e]133;D$e\$e]133;A$e\$e]9;9;$P$e\%PROMPT%$e]133;B$e\"#;
@@ -31,28 +31,30 @@ fn pwsh_prompt_hook() -> &'static str {
 }
 
 #[cfg(not(windows))]
-const PWSH_PROMPT_HOOK_UNIX: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $p=$PWD.ProviderPath; [char]27+']133;A'+[char]27+'\'+[char]27+']7;file://'+$p+[char]27+'\'+(& $global:__termie_prompt) }"#;
+const PWSH_PROMPT_HOOK_UNIX: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $ok=$?; $code=if($ok){0}elseif($global:LASTEXITCODE){$global:LASTEXITCODE}else{1}; $p=$PWD.ProviderPath; [char]27+']133;D;'+$code+[char]27+'\'+[char]27+']133;A'+[char]27+'\'+[char]27+']7;file://'+$p+[char]27+'\'+(& $global:__termie_prompt)+[char]27+']133;B'+[char]27+'\' }"#;
 
-// fish registers the hook inline via -C; no rc file dance needed
+// fish registers the hooks inline via -C; no rc file dance needed
 #[cfg(unix)]
-const FISH_PROMPT_HOOK: &str = r#"function __termie_prompt --on-event fish_prompt; printf '\033]133;A\033\\\033]7;file://%s\033\\' $PWD; end"#;
+const FISH_PROMPT_HOOK: &str = r#"function __termie_preexec --on-event fish_preexec; printf '\033]133;B\033\\'; printf '\033]133;C\033\\'; end; function __termie_postexec --on-event fish_postexec; printf '\033]133;D;%d\033\\' $status; end; function __termie_prompt --on-event fish_prompt; printf '\033]133;A\033\\'; printf '\033]7;file://%s\033\\' $PWD; end"#;
 
 #[cfg(unix)]
-const BASH_RC: &str = r#"# termie's bash integration: source the user's own rc, then wrap the prompt
-# with OSC 133;A (prompt mark) + OSC 7 (cwd) so prompt-jump and cwd tracking work
+const BASH_RC: &str = r#"# termie's bash integration: source the user's own rc, then add lifecycle marks
 [ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-__termie_prompt() { printf '\033]133;A\033\\\033]7;file://%s\033\\' "$PWD"; }
+__termie_prompt() { local s=$?; printf '\033]133;D;%d\033\\\033]133;A\033\\\033]7;file://%s\033\\' "$s" "$PWD"; }
+PS0=$'\033]133;B\033\\\033]133;C\033\\'"${PS0-}"
 PROMPT_COMMAND="__termie_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 "#;
 
 #[cfg(unix)]
-const ZSH_ENV: &str = r#"# termie's zsh integration: hand startup back to $HOME for the user's own
-# files, registering a precmd that emits OSC 133;A + OSC 7 first
-ZDOTDIR="$HOME"
-[ -r "$HOME/.zshenv" ] && . "$HOME/.zshenv"
+const ZSH_ENV: &str = r#"# termie's zsh integration: restore the user's startup directory, then add hooks
+ZDOTDIR="${TERMIE_USER_ZDOTDIR:-$HOME}"
+unset TERMIE_USER_ZDOTDIR
+[ -r "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
 autoload -Uz add-zsh-hook
-__termie_prompt() { printf '\033]133;A\033\\\033]7;file://%s\033\\' "$PWD"; }
-add-zsh-hook precmd __termie_prompt
+__termie_preexec() { printf '\033]133;B\033\\\033]133;C\033\\'; }
+__termie_precmd() { local s=$?; printf '\033]133;D;%d\033\\\033]133;A\033\\\033]7;file://%s\033\\' "$s" "$PWD"; }
+add-zsh-hook preexec __termie_preexec
+add-zsh-hook precmd __termie_precmd
 "#;
 
 /// write the bash/zsh integration files once per process and hand back their
@@ -61,7 +63,7 @@ add-zsh-hook precmd __termie_prompt
 fn integration_dir() -> Option<std::path::PathBuf> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = crate::app_dir()?.join("shell");
+        let dir = crate::cache_dir()?.join("shell");
         std::fs::create_dir_all(&dir).ok()?;
         std::fs::write(dir.join("bashrc"), BASH_RC).ok()?;
         std::fs::write(dir.join(".zshenv"), ZSH_ENV).ok()?;
@@ -310,9 +312,11 @@ impl Pty {
                     }
                     #[cfg(unix)]
                     "zsh" => {
-                        // a ZDOTDIR whose .zshenv chains back to $HOME for the
-                        // user's own startup files after registering the hook
                         if let Some(dir) = integration_dir() {
+                            c.env(
+                                "TERMIE_USER_ZDOTDIR",
+                                env::var_os("ZDOTDIR").or_else(|| env::var_os("HOME")).unwrap_or_default(),
+                            );
                             c.env("ZDOTDIR", dir);
                         }
                         c.arg("-i");
@@ -875,16 +879,13 @@ mod live_tests_unix {
         assert!(text.contains("termie-itest-OK"), "output not seen; got: {text:?}");
     }
 
-    #[test]
-    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
-    fn bash_integration_hook_emits_prompt_marks() {
-        // resolve bash directly; skip quietly on systems without it
-        if find_in_path("bash").is_none() {
-            eprintln!("skip: no bash on PATH");
+    fn assert_shell_lifecycle(shell: ShellKind, executable: &str) {
+        if find_in_path(executable).is_none() {
+            eprintln!("skip: no {executable} on PATH");
             return;
         }
         let mut pty =
-            Pty::spawn(24, 80, ShellKind::Bash, false, None, None, None, "termie", 0, 0)
+            Pty::spawn(24, 80, shell, false, None, None, None, "termie", 0, 0)
                 .expect("spawn pty");
         let (tx, rx) = mpsc::channel();
         pty.start_reader(move |m| {
@@ -906,16 +907,57 @@ mod live_tests_unix {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        pty.write(b"false\r");
+        let done = b"\x1b]133;D;1\x1b\\";
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(PtyMsg::Output(b)) => {
+                    out.extend_from_slice(&b);
+                    if out.windows(done.len()).any(|w| w == done) {
+                        break;
+                    }
+                }
+                Ok(PtyMsg::Exited) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         pty.kill();
         assert!(
             out.windows(needle.len()).any(|w| w == needle),
-            "bash never emitted a prompt mark: {:?}",
+            "{executable} never emitted a prompt mark: {:?}",
             String::from_utf8_lossy(&out)
         );
         assert!(
             out.windows(b"\x1b]7;file://".len()).any(|w| w == b"\x1b]7;file://"),
             "no OSC 7 cwd report"
         );
+        for mark in [b"\x1b]133;B\x1b\\".as_slice(), b"\x1b]133;C\x1b\\", done] {
+            assert!(
+                out.windows(mark.len()).any(|w| w == mark),
+                "missing lifecycle mark {mark:?}: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn bash_integration_hook_emits_lifecycle_marks() {
+        assert_shell_lifecycle(ShellKind::Bash, "bash");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn zsh_integration_hook_emits_lifecycle_marks() {
+        assert_shell_lifecycle(ShellKind::Zsh, "zsh");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell; run locally with `cargo test -- --ignored`"]
+    fn fish_integration_hook_emits_lifecycle_marks() {
+        assert_shell_lifecycle(ShellKind::Fish, "fish");
     }
 }
 
