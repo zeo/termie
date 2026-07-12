@@ -49,13 +49,6 @@ microbench = []
 embed-manifest = "1.5.0"
 embed-resource = "2.5"
 
-# crates.io still ships wayland-scanner 0.31.10 on quick-xml 0.39 (RUSTSEC-2026-0194/0195).
-# upstream master already bumped to 0.41; pull that until a crates.io release lands.
-# only used as a build dep of winit's linux wayland path — never linked into the
-# windows binary, but cargo-audit scans the whole lockfile
-[patch.crates-io]
-wayland-scanner = { git = "https://github.com/smithay/wayland-rs", rev = "d07c4f91f28b" }
-
 [profile.release]
 opt-level = 3
 lto = true

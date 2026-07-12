@@ -1,0 +1,9 @@
+# cargo-audit configuration
+[advisories]
+# quick-xml 0.39 (RUSTSEC-2026-0194/0195) sits behind wayland-scanner 0.31.10,
+# a build-time codegen dep on the linux wayland path that only ever parses the
+# protocol XML bundled inside the crate — never untrusted input. crates.io has
+# not shipped the 0.41 bump yet and upstream master's scanner no longer
+# generates 0.31-compatible code, so patching is not an option. drop these
+# ignores when wayland-scanner > 0.31.10 lands
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
