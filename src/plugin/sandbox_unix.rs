@@ -116,12 +116,15 @@ mod tests {
         use std::io::Read;
         let dir = std::env::temp_dir();
         let sh = Path::new("/bin/sh");
-        let args = vec!["-c".to_string(), "ls /home 2>/dev/null | wc -l".to_string()];
+        let args = vec![
+            "-c".to_string(),
+            "if [ -e /home ]; then printf visible; else printf hidden; fi".to_string(),
+        ];
         let mut sb = spawn("termie.plugin.selftest", sh, &args, &dir, false).expect("bwrap spawn");
         let mut out = String::new();
         sb.take_stdout().unwrap().read_to_string(&mut out).unwrap();
         sb.kill();
-        assert_eq!(out.trim(), "0", "home should be invisible, got: {out:?}");
+        assert_eq!(out, "hidden", "home should be invisible, got: {out:?}");
     }
 
     #[test]
