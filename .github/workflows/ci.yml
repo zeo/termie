@@ -56,11 +56,14 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      # the ephemeral linux vms image /usr/bin/rustup, so the toolchain action
-      # skips its own rustup install — the only step of it that puts the cargo
-      # shim dir on PATH. add it ourselves or `cargo` is command-not-found
+      # the ephemeral linux vms image /usr/bin/rustup without user-level shims,
+      # so nothing puts cargo on PATH. ask rustup where the real cargo binary
+      # lives and add that toolchain bin dir (plus the shim dir, if it exists)
       - name: cargo on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "HOME=$HOME CARGO_HOME=${CARGO_HOME:-<unset>} rustup=$(command -v rustup)"
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          dirname "$(rustup which cargo)" | tee -a "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: system deps
         run: |
