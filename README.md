@@ -8,13 +8,13 @@ A fast, lightweight GPU terminal multiplexer for Windows and Linux — tabs, spl
 - plugins: registry at [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins)
 - license: MIT OR Apache-2.0
 
-> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. Quake mode, Mica, and the taskbar jump list are Windows-only.
+> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. Quake mode and Mica are Windows-only.
 
 ## features
 
 GPU-rendered (wgpu glyph-atlas), a ~8.8 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps the default shell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
 
-Tabs and recursive split panes — split vertically or horizontally, drag tabs to reorder them, drag dividers, swap panes, tear a pane off into its own window, and broadcast input to every pane in a tab. Splits and "new tab here" open in the focused pane's directory; pick a per-tab shell from the command palette — `pwsh` / `cmd` / `wsl` on Windows, `bash` / `zsh` / `fish` on Linux, plus any custom profile. A bell in a background tab dots that tab, and a bell while the window is unfocused asks for attention (a taskbar flash on Windows, the window-manager's urgency hint on Linux) — so a finished agent or build finds you, not the other way around. On Windows the taskbar icon also carries a jump list: right-click it for a new window in any shell or custom profile (`termie --shell bash` from a script does the same everywhere).
+Tabs and recursive split panes — split vertically or horizontally, drag tabs to reorder them, drag dividers, swap panes, tear a pane off into its own window, and broadcast input to every pane in a tab. Splits and "new tab here" open in the focused pane's directory; pick a per-tab shell from the command palette — `pwsh` / `cmd` / `wsl` on Windows, `bash` / `zsh` / `fish` on Linux, plus any custom profile. A bell in a background tab dots that tab, and a bell while the window is unfocused asks for attention (a taskbar flash on Windows, the window-manager's urgency hint on Linux) — so a finished agent or build finds you, not the other way around. Right-click the pinned launcher for a new window or a built-in shell; Windows also lists custom profiles dynamically (`termie --shell bash` from a script does the same everywhere).
 
 Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting, bracketed paste, OSC 7 cwd (tab labels + window title), reflow on resize, the kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs), OSC 8 hyperlinks, OSC 52 clipboard writes, OSC 4/10/11/12 color queries, OSC 9;4 taskbar progress, underline styles, strikethrough, blink, and DEC 2026 synchronized output for tear-free frames.
 

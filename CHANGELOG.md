@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Platform
+- **Linux launchers have shell actions.** Right-clicking a pinned Termie icon now offers a plain new window plus Bash, Zsh, and Fish windows, matching the built-in-shell entries in the Windows taskbar jump list.
 - **Admin windows work on Linux.** "New admin window" keeps Termie's renderer in the user's Wayland/X11 session and elevates the new shell through `pkexec --keep-cwd`, falling back to `sudo -s`. The focused directory carries into the new window and root state uses the same badge Windows already shows.
 - **Linux can make Termie the default terminal.** The desktop entry now declares the `xdg-terminal-exec` command and directory arguments. The existing "default terminal" palette action puts Termie first for the active desktop, toggles back to the previous choice without erasing it, and uninstall removes only Termie's selection.
 - **Windows stay inside the screen.** Fresh, restored, moved, and test-driven windows are capped to the current monitor's native pixel bounds. A saved window can no longer reopen larger than the display or leave most of itself beyond an edge, while the normal 1000×640 size stays in logical units on fractional-scale Wayland displays.

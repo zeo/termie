@@ -15,6 +15,7 @@ escaped_exe=$(printf '%s' "$prefix/bin/termie" | sed 's/[\\"`$]/\\&/g')
 while IFS= read -r line; do
   case "$line" in
     Exec=termie) printf 'Exec="%s"\n' "$escaped_exe" ;;
+    Exec=termie\ *) printf 'Exec="%s"%s\n' "$escaped_exe" "${line#Exec=termie}" ;;
     TryExec=termie) printf 'TryExec=%s\n' "$prefix/bin/termie" ;;
     *) printf '%s\n' "$line" ;;
   esac

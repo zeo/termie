@@ -12,8 +12,20 @@ X-TerminalArgExec=--
 X-TerminalArgDir=--cwd=
 StartupNotify=true
 StartupWMClass=termie
-Actions=NewWindow;
+Actions=NewWindow;NewBash;NewZsh;NewFish;
 
 [Desktop Action NewWindow]
 Name=New Window
 Exec=termie
+
+[Desktop Action NewBash]
+Name=New Bash Window
+Exec=termie --shell bash
+
+[Desktop Action NewZsh]
+Name=New Zsh Window
+Exec=termie --shell zsh
+
+[Desktop Action NewFish]
+Name=New Fish Window
+Exec=termie --shell fish
