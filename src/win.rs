@@ -812,11 +812,6 @@ pub fn launch_elevated(args: &str) -> bool {
     h.0 as usize > 32
 }
 
-#[cfg(not(windows))]
-pub fn launch_elevated(_args: &str) -> bool {
-    false
-}
-
 // the CLSID appears twice — as a GUID for COM and as registry-path text — and
 // the two must never drift apart
 #[cfg(all(test, windows))]

@@ -261,11 +261,7 @@ enum PaletteAction {
     NewShell(ShellKind),
     /// open one fresh window carrying the focused pane's shell and cwd
     NewWindow,
-    /// relaunch elevated via UAC: a new admin termie window with the focused
-    /// pane's shell and cwd (an unelevated process can't host an elevated pty).
-    /// windows-only, but the variant exists everywhere so keybinding configs
-    /// parse identically on both OSes
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// open a new window with an elevated shell in the focused directory
     AdminWindow,
     SplitV,
     SplitH,
@@ -352,7 +348,6 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     #[cfg(not(windows))]
     ("new tab: fish", PaletteAction::NewShell(ShellKind::Fish)),
     ("new window", PaletteAction::NewWindow),
-    #[cfg(windows)]
     ("new admin window", PaletteAction::AdminWindow),
     ("split vertical", PaletteAction::SplitV),
     ("split horizontal", PaletteAction::SplitH),
@@ -1799,11 +1794,17 @@ struct CliArgs {
     /// ConPTY strips APC, so no shell can deliver one — this is the way to
     /// see the decoder + image pipeline work on a live window
     kitty_demo: bool,
+    /// the Linux GUI stays user-owned while its first child shell is elevated
+    admin_shell: bool,
 }
 
 impl CliArgs {
     fn is_bare(&self) -> bool {
-        self.cwd.is_none() && self.shell.is_none() && self.command.is_none() && self.tabs.is_empty()
+        self.cwd.is_none()
+            && self.shell.is_none()
+            && self.command.is_none()
+            && self.tabs.is_empty()
+            && !self.admin_shell
     }
 }
 
@@ -1841,6 +1842,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> CliArgs {
             out.shell = Some(name.to_string());
         } else if a == "--kitty-demo" {
             out.kitty_demo = true;
+        } else if a == "--admin-shell" {
+            out.admin_shell = true;
         } else if a == "--drive" {
             if let Some(path) = it.next() {
                 out.drive = Some(path);
@@ -2072,6 +2075,28 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
         return s.trim_end_matches('/').to_string();
     };
     norm(a) == norm(b)
+}
+
+#[cfg(not(windows))]
+fn program_in_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn linux_admin_command(has_pkexec: bool, has_sudo: bool) -> Option<&'static [&'static str]> {
+    if has_pkexec {
+        Some(&["pkexec", "--keep-cwd"])
+    } else if has_sudo {
+        Some(&["sudo", "-s"])
+    } else {
+        None
+    }
 }
 
 /// snapshot a pane tree into the serializable session form, recording the
@@ -3481,6 +3506,10 @@ struct App {
 }
 
 impl App {
+    fn elevated(&self) -> bool {
+        win::is_elevated() || self.cli.admin_shell
+    }
+
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let p = load_persisted();
         // install profiles before anything derives from them (palette entries,
@@ -3657,14 +3686,6 @@ impl App {
         let monitors = monitor_rects(event_loop);
         let placement = restore_bounds.map(|b| clamp_window_bounds(&monitors, (b.x, b.y, b.width, b.height)));
         let restore_max = restore_bounds.is_some_and(|b| b.maximized);
-        let launch_monitor = event_loop
-            .primary_monitor()
-            .or_else(|| event_loop.available_monitors().next());
-        let default_size = launch_monitor.as_ref().map(|monitor| {
-            let desired = LogicalSize::new(1000.0, 640.0).to_physical::<u32>(monitor.scale_factor());
-            let screen = monitor.size();
-            PhysicalSize::new(desired.width.min(screen.width), desired.height.min(screen.height))
-        });
         let mut attrs = Window::default_attributes()
             .with_title("termie")
             .with_window_icon(icon)
@@ -3683,10 +3704,7 @@ impl App {
         }
         let attrs = match placement {
             Some((_, _, w, h)) => attrs.with_inner_size(PhysicalSize::new(w, h)),
-            None => match default_size {
-                Some(size) => attrs.with_inner_size(size),
-                None => attrs.with_inner_size(LogicalSize::new(1000.0, 640.0)),
-            },
+            None => attrs.with_inner_size(LogicalSize::new(1000.0, 640.0)),
         };
         // app id so wayland and x11 match every window to termie.desktop
         let attrs = platform_window_attrs(attrs);
@@ -3763,7 +3781,7 @@ impl App {
             let p = &self.persisted;
             if let Some(r) = self.pw.renderer.as_mut() {
                 r.set_theme(boot_theme);
-                r.set_elevated(win::is_elevated());
+                r.set_elevated(win::is_elevated() || self.cli.admin_shell);
                 r.set_color_overrides(load_color_overrides());
                 r.set_cursor_style(p.cursor);
                 r.set_cursor_blink(p.cursor_blink);
@@ -5067,7 +5085,7 @@ impl App {
             .map(|t| format!("{} — termie", tab_label(t)))
             .unwrap_or_else(|| "termie".to_string());
         // an elevated window must say so everywhere it's named
-        let title = if win::is_elevated() { format!("{title} [admin]") } else { title };
+        let title = if self.elevated() { format!("{title} [admin]") } else { title };
         if self.last_title != title {
             if let Some(w) = &self.pw.window {
                 w.set_title(&title);
@@ -5684,24 +5702,46 @@ impl App {
                 self.redraw();
             }
             PaletteAction::AdminWindow => {
-                let mut args = String::new();
-                // a label with a quote would mangle the relaunch argv; fall
-                // back to the default shell rather than risk it
-                if let Some(s) = self.focused_shell().map(|s| s.label().to_string())
-                    && !s.contains('"')
+                #[cfg(windows)]
                 {
-                    args.push_str(&format!("--shell \"{s}\""));
+                    let mut args = String::new();
+                    // a label with a quote would mangle the relaunch argv; fall
+                    // back to the default shell rather than risk it
+                    if let Some(s) = self.focused_shell().map(|s| s.label().to_string())
+                        && !s.contains('"')
+                    {
+                        args.push_str(&format!("--shell \"{s}\""));
+                    }
+                    if let Some(d) = self.focused_cwd()
+                        && !d.contains('"')
+                    {
+                        // a trailing backslash (drive roots) would escape the
+                        // closing quote under argv rules; double it
+                        let d = if d.ends_with('\\') { format!("{d}\\") } else { d };
+                        args.push_str(&format!(" --cwd \"{d}\""));
+                    }
+                    if !win::launch_elevated(args.trim()) {
+                        self.show_notice("admin window cancelled");
+                    }
                 }
-                if let Some(d) = self.focused_cwd()
-                    && !d.contains('"')
+                #[cfg(not(windows))]
                 {
-                    // a trailing backslash (drive roots) would escape the
-                    // closing quote under argv rules; double it
-                    let d = if d.ends_with('\\') { format!("{d}\\") } else { d };
-                    args.push_str(&format!(" --cwd \"{d}\""));
-                }
-                if !win::launch_elevated(args.trim()) {
-                    self.show_notice("admin window cancelled");
+                    let command = linux_admin_command(program_in_path("pkexec"), program_in_path("sudo"));
+                    let launched = command.is_some_and(|command| {
+                        let mut args = Vec::new();
+                        if let Some(cwd) = self.focused_cwd() {
+                            args.extend(["--cwd".to_string(), cwd]);
+                        }
+                        args.push("--admin-shell".to_string());
+                        args.push("--".to_string());
+                        args.extend(command.iter().map(|arg| (*arg).to_string()));
+                        std::env::current_exe()
+                            .and_then(|exe| std::process::Command::new(exe).args(args).spawn())
+                            .is_ok()
+                    });
+                    if !launched {
+                        self.show_notice("pkexec or sudo is unavailable");
+                    }
                 }
                 self.redraw();
             }
@@ -7383,7 +7423,7 @@ impl App {
         ) {
             Ok(mut r) => {
                 r.set_theme(self.resolved_theme());
-                r.set_elevated(win::is_elevated());
+                r.set_elevated(self.elevated());
                 r
             }
             Err(_) => {
@@ -10509,8 +10549,19 @@ mod tests {
             Some(&["vim".to_string(), "a.txt".to_string()][..])
         );
         assert!(!cmd.is_bare());
+        let admin = p(&["--admin-shell", "--", "sudo", "-s"]);
+        assert!(admin.admin_shell);
+        assert_eq!(admin.command.as_deref(), Some(&["sudo".to_string(), "-s".to_string()][..]));
         // unknown flags are ignored, not misread as a cwd or command
         assert!(p(&["--frobnicate"]).is_bare());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_admin_window_prefers_polkit_and_falls_back_to_sudo() {
+        assert_eq!(linux_admin_command(true, true), Some(&["pkexec", "--keep-cwd"][..]));
+        assert_eq!(linux_admin_command(false, true), Some(&["sudo", "-s"][..]));
+        assert_eq!(linux_admin_command(false, false), None);
     }
 
     #[test]

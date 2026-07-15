@@ -8,7 +8,7 @@ A fast, lightweight GPU terminal multiplexer for Windows and Linux — tabs, spl
 - plugins: registry at [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins)
 - license: MIT OR Apache-2.0
 
-> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. Quake mode, Mica, admin relaunch, and the taskbar jump list are Windows-only.
+> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. Quake mode, Mica, and the taskbar jump list are Windows-only.
 
 ## features
 
@@ -21,6 +21,8 @@ Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser,
 Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG, cursor flow like kitty's, z-index stacking, scoped deletes, unicode placeholders so images survive tmux and scrollback) and sixel — `img2sixel`, `chafa`, `lsix`, and anything else that probes DA1 finds both — plus full-color emoji, all packed into a dedicated RGBA atlas beside the glyph cache. On Windows, installs ship a current ConPTY host (`conpty.dll` + `OpenConsole.exe`, MIT, from microsoft/terminal) beside the exe, because the ConPTY built into Windows strips sixel before a terminal ever sees it; on Linux the kernel pty passes every byte through untouched, so nothing extra is needed. IME composition, a screen-reader path via AccessKit, and session restore (tab + split layout) with crash recovery.
 
 Termie can be the **default terminal**: run "default terminal" from the palette once. On Windows 11, console apps launched from the run box, the start menu, or a double-clicked script open in a Termie window instead of the legacy console host. On Linux desktops that use `xdg-terminal-exec`, terminal launchers and `Terminal=true` desktop apps open in Termie. The same palette action turns it back off, restores the previous choice, and uninstalling removes Termie's selection.
+
+"New admin window" opens the focused directory with an elevated shell. Windows uses its UAC relaunch; Linux keeps the graphical process in the desktop session and elevates only the new PTY through Polkit, with `sudo` as the fallback.
 
 A command palette (`Ctrl+P`) for fuzzy access to every action, plus a searchable numbered tab switcher (`tab search` in the palette) for crowded windows. Seven built-in themes — three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord — a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. Windows also has an optional Quake-style drop-down (`quake_key`).
 
