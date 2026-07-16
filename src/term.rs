@@ -278,15 +278,8 @@ impl Terminal {
         self.g0 = Charset::Ascii;
         self.g1 = Charset::Ascii;
         self.gl = 0;
-        self.app_cursor_keys = false;
         self.bracketed_paste = false;
-        // drop mouse / focus / sync / kitty keys so a soft-resetting TUI can't
-        // leave the stream in a state that floods the next prompt with reports
-        self.mouse_proto = MouseProto::Off;
-        self.mouse_sgr = false;
-        self.focus_events = false;
-        self.sync_output = false;
-        self.kbd_stack = vec![0];
+        self.reset_interaction_modes();
         self.apply_sgr(&[&[0u16][..]]);
         self.grid.set_scroll_region(0, self.grid.rows - 1);
         self.grid.origin_mode = false;
@@ -481,19 +474,24 @@ impl Terminal {
             self.grid = primary;
         }
         self.using_alt = false;
-        // a fullscreen app just exited; drop the interaction modes it may have
-        // set but the shell never wants, so they can't bleed into the prompt
-        // (stray mouse reports, kitty-encoded keys, application arrow keys,
-        // a stuck DEC 2026 frame). bracketed paste is left alone — shells use it
+        self.reset_interaction_modes();
+    }
+
+    fn reset_interaction_modes(&mut self) {
         self.mouse_proto = MouseProto::Off;
         self.mouse_sgr = false;
         self.app_cursor_keys = false;
         self.kbd_stack = vec![0];
         self.sync_output = false;
-        // focus reporting is rarely wanted at a bare prompt; a TUI that needs
-        // it re-enables on the next entry, and leaving it on makes some hosts
-        // emit CSI I/O that land as garbage in line editors
         self.focus_events = false;
+    }
+
+    fn finish_command(&mut self) {
+        if self.using_alt {
+            self.leave_alt();
+        } else {
+            self.reset_interaction_modes();
+        }
     }
 
     fn set_mode(&mut self, private: bool, mode: u16, enable: bool) {
@@ -1136,10 +1134,9 @@ impl Perform for Terminal {
                 self.grid = Grid::new(rows, cols);
                 self.saved_primary = None;
                 self.using_alt = false;
-                self.app_cursor_keys = false;
                 self.bracketed_paste = false;
                 self.alt_scroll = true;
-                self.kbd_stack = vec![0];
+                self.reset_interaction_modes();
                 self.g0 = Charset::Ascii;
                 self.g1 = Charset::Ascii;
                 self.gl = 0;
@@ -1343,6 +1340,7 @@ impl Perform for Terminal {
                                 .get(2)
                                 .and_then(|c| std::str::from_utf8(c).ok())
                                 .and_then(|s| s.parse::<i32>().ok());
+                            self.finish_command();
                             // stamp the mark so the scrollbar can flag the
                             // failed command's spot in history
                             if !self.using_alt {
@@ -2132,6 +2130,35 @@ mod tests {
         feed(&mut t, b"\x1b]133;D;1\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
         assert!(!t.cmd_running);
         assert_eq!(t.cmd_done.take(), Some(Some(1)));
+    }
+
+    #[test]
+    fn osc133_command_done_recovers_modes_after_killed_tui() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"primary\x1b]133;C\x1b\\\x1b[?1049h\x1b[?1003;1006h\x1b[?1004h\x1b[?1h\x1b[>1u\x1b[?2026h");
+        assert!(t.using_alt);
+        assert_eq!(t.mouse_proto, MouseProto::Any);
+
+        feed(&mut t, b"\x1b]133;D;137\x1b\\");
+
+        assert!(!t.using_alt);
+        assert_eq!(t.grid.lines[0][0].c, 'p');
+        assert_eq!(t.mouse_proto, MouseProto::Off);
+        assert!(!t.mouse_sgr);
+        assert!(!t.focus_events);
+        assert!(!t.app_cursor_keys);
+        assert!(!t.sync_output);
+        assert_eq!(t.kbd_flags(), 0);
+        assert_eq!(t.cmd_done, Some(Some(137)));
+    }
+
+    #[test]
+    fn osc133_command_done_clears_inline_mouse_mode() {
+        let mut t = Terminal::new(4, 20);
+        feed(&mut t, b"\x1b]133;C\x1b\\\x1b[?1003;1006h\x1b]133;D;9\x1b\\");
+        assert!(!t.using_alt);
+        assert_eq!(t.mouse_proto, MouseProto::Off);
+        assert!(!t.mouse_sgr);
     }
 
     #[test]
