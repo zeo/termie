@@ -205,6 +205,7 @@ struct TabDrag {
     screen: Option<PhysicalPosition<i32>>,
     target: Option<(WindowId, usize)>,
     left_strip: bool,
+    left_window: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +226,7 @@ struct PaneDrag {
     screen: Option<PhysicalPosition<i32>>,
     target: Option<PaneDropTarget>,
     moved: bool,
+    left_window: bool,
 }
 
 /// a torn-off pane living in its own OS-decorated window. its pty reader still
@@ -3387,6 +3389,7 @@ fn parse_persisted(text: &str) -> Persisted {
 struct PaneWindow {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    a11y: Option<accesskit_winit::Adapter>,
     tabs: Vec<Tab>,
     active_tab: usize,
     layout_cache: Vec<(usize, Rect)>,
@@ -3412,6 +3415,7 @@ struct PaneWindow {
     last_git_cwd: Option<String>,
     // last pointer position within this window (mouse events carry no window id)
     cursor: PhysicalPosition<f64>,
+    cursor_icon: CursorIcon,
     // modal overlays carrying this window's own tab index, so a confirm/rename
     // raised here can only be resolved here (never targets another window's tab)
     confirm: Option<ConfirmState>,
@@ -3422,6 +3426,7 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
     PaneWindow {
         window,
         renderer,
+        a11y: None,
         tabs,
         active_tab: 0,
         layout_cache: Vec::new(),
@@ -3437,6 +3442,7 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         git: None,
         last_git_cwd: None,
         cursor: PhysicalPosition::new(0.0, 0.0),
+        cursor_icon: CursorIcon::Default,
         confirm: None,
         rename: None,
     }
@@ -3494,8 +3500,6 @@ struct App {
     /// regex mode for the find bar; remembered across open/close (toggled by
     /// the .* button or Alt+R while find is open)
     find_regex: bool,
-    /// accesskit adapter for the main window (screen-reader tree); None until boot
-    a11y: Option<accesskit_winit::Adapter>,
     /// the plugins marketplace overlay, when open
     market: Option<MarketState>,
     pressed: Option<Hot>,
@@ -3562,8 +3566,6 @@ struct App {
     /// motion is suppressed when the cell hasn't changed so any-event tracking
     /// can't flood a TUI's input buffer with identical CSI reports
     last_mouse_report: Option<(usize, u8, bool, bool, usize, usize, u8)>,
-    /// last OS pointer icon set, to avoid redundant set_cursor calls
-    cursor_icon: CursorIcon,
     /// url under the cursor while ctrl is held, to underline + open on click:
     /// (focused-pane viewport row, col_start, col_end exclusive)
     link: Option<(usize, usize, usize)>,
@@ -3680,7 +3682,6 @@ impl App {
             font_pick_orig: None,
             find: None,
             find_regex: false,
-            a11y: None,
             market: None,
             pressed: None,
             tab_drag: None,
@@ -3703,7 +3704,6 @@ impl App {
             broadcast: false,
             mouse_down: None,
             last_mouse_report: None,
-            cursor_icon: CursorIcon::Default,
             link: None,
             system_fonts_pending: true,
             ascii_warmed: false,
@@ -3905,7 +3905,7 @@ impl App {
         self.configure_renderer(&mut renderer);
         timing("renderer ready (gpu init)");
         window.set_ime_allowed(true);
-        self.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+        self.pw.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
             event_loop,
             &window,
             self.proxy.clone(),
@@ -4575,6 +4575,36 @@ impl App {
         apply(&mut self.pw);
         for pw in &mut self.satellites {
             apply(pw);
+        }
+    }
+
+    fn show_tab_drop(&mut self, target: Option<(WindowId, usize)>) {
+        let apply = |pw: &mut PaneWindow| {
+            let own = pw.window.as_ref().map(|window| window.id());
+            let index = target.filter(|(window, _)| own == Some(*window)).map(|(_, index)| index);
+            if let Some(renderer) = pw.renderer.as_mut() {
+                renderer.set_tab_drop(index);
+            }
+            if let Some(window) = pw.window.as_ref() {
+                window.request_redraw();
+            }
+        };
+        apply(&mut self.pw);
+        for pw in &mut self.satellites {
+            apply(pw);
+        }
+    }
+
+    fn reset_drag_cursors(&mut self) {
+        let reset = |pw: &mut PaneWindow| {
+            pw.cursor_icon = CursorIcon::Default;
+            if let Some(window) = pw.window.as_ref() {
+                window.set_cursor(CursorIcon::Default);
+            }
+        };
+        reset(&mut self.pw);
+        for pw in &mut self.satellites {
+            reset(pw);
         }
     }
 
@@ -5452,9 +5482,24 @@ impl App {
     /// push the current accessibility tree to the adapter — a cheap no-op when no
     /// assistive tech is attached (the flatten only runs while active)
     fn update_a11y(&mut self) {
-        if let Some(mut adapter) = self.a11y.take() {
+        if let Some(mut adapter) = self.pw.a11y.take() {
             adapter.update_if_active(|| self.build_a11y_update());
-            self.a11y = Some(adapter);
+            self.pw.a11y = Some(adapter);
+        }
+    }
+
+    fn update_window_a11y(&mut self, id: WindowId) {
+        if self.pw.window.as_ref().map(|window| window.id()) == Some(id) {
+            self.update_a11y();
+        } else if let Some(index) = self.satellite_for(id) {
+            self.with_window(index, |app| app.update_a11y());
+        }
+    }
+
+    fn update_all_a11y(&mut self) {
+        self.update_a11y();
+        for index in 0..self.satellites.len() {
+            self.with_window(index, |app| app.update_a11y());
         }
     }
 
@@ -6526,9 +6571,9 @@ impl App {
         Some(tab)
     }
 
-    fn take_tab_from_window(&mut self, source: WindowId, index: usize) -> Option<Tab> {
+    fn take_tab_from_window(&mut self, source: WindowId, index: usize, allow_main_empty: bool) -> Option<Tab> {
         let main = self.main_pw().window.as_ref().map(|w| w.id());
-        let allow_empty = main != Some(source);
+        let allow_empty = main != Some(source) || allow_main_empty;
         if self.pw.window.as_ref().map(|w| w.id()) == Some(source) {
             return self.remove_tab_for_transfer(index, allow_empty);
         }
@@ -6587,6 +6632,52 @@ impl App {
         self.satellites.iter().find_map(hit).or_else(|| hit(&self.pw))
     }
 
+    fn window_tab_count(&self, id: WindowId) -> Option<usize> {
+        self.pane_window_for(id).map(|pw| pw.tabs.len())
+    }
+
+    fn pane_count_for_window(&self, id: WindowId) -> Option<usize> {
+        self.pane_window_for(id).map(|pw| {
+            pw.tabs
+                .iter()
+                .filter_map(|tab| tab.root.as_ref())
+                .map(pane_count)
+                .sum()
+        })
+    }
+
+    fn pane_window_for(&self, id: WindowId) -> Option<&PaneWindow> {
+        self.satellites
+            .iter()
+            .chain(std::iter::once(&self.pw))
+            .find(|pw| pw.window.as_ref().map(|window| window.id()) == Some(id))
+    }
+
+    fn reposition_window(&self, id: WindowId, point: PhysicalPosition<i32>, grab: PhysicalPosition<f64>) {
+        let window = self
+            .pane_window_for(id)
+            .and_then(|pw| pw.window.as_ref());
+        if let Some(window) = window {
+            window.set_outer_position(PhysicalPosition::new(
+                point.x - grab.x.round() as i32,
+                point.y - grab.y.round() as i32,
+            ));
+            constrain_window_to_monitor(window);
+        }
+    }
+
+    fn cleanup_empty_windows(&mut self) {
+        if self.cur_sat.is_some() {
+            return;
+        }
+        if self.pw.tabs.is_empty()
+            && let Some(index) = self.satellites.iter().position(|window| !window.tabs.is_empty())
+        {
+            std::mem::swap(&mut self.pw, &mut self.satellites[index]);
+        }
+        self.satellites.retain(|window| !window.tabs.is_empty());
+    }
+
     fn open_tab_window(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -6600,6 +6691,7 @@ impl App {
                 .with_title("termie")
                 .with_window_icon(icon)
                 .with_decorations(false)
+                .with_visible(false)
                 .with_inner_size(LogicalSize::new(760.0, 480.0))
                 .with_min_inner_size(LogicalSize::new(560.0, 380.0)),
         );
@@ -6636,7 +6728,14 @@ impl App {
             Err(_) => return Some(tab),
         };
         self.configure_renderer(&mut renderer);
-        self.satellites.push(pane_window(Some(window), Some(renderer), vec![tab]));
+        let mut pw = pane_window(Some(window.clone()), Some(renderer), vec![tab]);
+        pw.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
+        ));
+        window.set_visible(true);
+        self.satellites.push(pw);
         let slot = self.satellites.len() - 1;
         self.with_window(slot, |app| {
             if let Some(renderer) = app.pw.renderer.as_mut() {
@@ -6653,18 +6752,34 @@ impl App {
         let Some(drag) = self.tab_drag.take() else {
             return;
         };
+        self.show_tab_drop(None);
+        self.reset_drag_cursors();
         if !drag.left_strip {
             return;
         }
         let target = drag
             .target
-            .or_else(|| drag.screen.and_then(|point| self.window_at_screen(point)));
+            .or_else(|| {
+                if drag.left_window {
+                    None
+                } else {
+                    drag.screen.and_then(|point| self.window_at_screen(point))
+                }
+            });
         if let Some((target, _)) = target
             && target == drag.source
         {
             return;
         }
-        let Some(tab) = self.take_tab_from_window(drag.source, drag.index) else {
+        if target.is_none()
+            && self.window_tab_count(drag.source) == Some(1)
+        {
+            if let Some(point) = drag.screen {
+                self.reposition_window(drag.source, point, drag.start);
+            }
+            return;
+        }
+        let Some(tab) = self.take_tab_from_window(drag.source, drag.index, target.is_some()) else {
             return;
         };
         if let Some((target, index)) = target {
@@ -6673,9 +6788,7 @@ impl App {
             self.insert_tab_into_window(drag.source, tab, drag.index);
             self.show_notice("couldn't open a new window");
         }
-        if self.cur_sat.is_none() {
-            self.satellites.retain(|window| !window.tabs.is_empty());
-        }
+        self.cleanup_empty_windows();
     }
 
     fn remove_pane_for_transfer(&mut self, tab_index: usize, pane_id: usize, allow_empty: bool) -> Option<Pane> {
@@ -6717,9 +6830,15 @@ impl App {
         pane
     }
 
-    fn take_pane_from_window(&mut self, source: WindowId, tab: usize, pane: usize) -> Option<Pane> {
+    fn take_pane_from_window(
+        &mut self,
+        source: WindowId,
+        tab: usize,
+        pane: usize,
+        allow_main_empty: bool,
+    ) -> Option<Pane> {
         let main = self.main_pw().window.as_ref().map(|window| window.id());
-        let allow_empty = main != Some(source);
+        let allow_empty = main != Some(source) || allow_main_empty;
         if self.pw.window.as_ref().map(|window| window.id()) == Some(source) {
             return self.remove_pane_for_transfer(tab, pane, allow_empty);
         }
@@ -6779,10 +6898,19 @@ impl App {
             return;
         };
         self.show_pane_drop(None);
+        self.reset_drag_cursors();
         if !drag.moved {
             return;
         }
-        let target = drag.target.or_else(|| drag.screen.and_then(|point| self.pane_drop_at_screen(point)));
+        let target = drag
+            .target
+            .or_else(|| {
+                if drag.left_window {
+                    None
+                } else {
+                    drag.screen.and_then(|point| self.pane_drop_at_screen(point))
+                }
+            });
         if let Some(target) = target
             && target.window == drag.source_window
             && target.tab == drag.source_tab
@@ -6790,7 +6918,20 @@ impl App {
         {
             return;
         }
-        let Some(pane) = self.take_pane_from_window(drag.source_window, drag.source_tab, drag.pane) else {
+        if target.is_none()
+            && self.pane_count_for_window(drag.source_window) == Some(1)
+        {
+            if let Some(point) = drag.screen {
+                self.reposition_window(drag.source_window, point, drag.start);
+            }
+            return;
+        }
+        let Some(pane) = self.take_pane_from_window(
+            drag.source_window,
+            drag.source_tab,
+            drag.pane,
+            target.is_some(),
+        ) else {
             return;
         };
         if let Some(target) = target {
@@ -6819,9 +6960,7 @@ impl App {
                 self.show_notice("couldn't open a new window");
             }
         }
-        if self.cur_sat.is_none() {
-            self.satellites.retain(|window| !window.tabs.is_empty());
-        }
+        self.cleanup_empty_windows();
     }
 
     fn shift_active_tab(&mut self, delta: i32) {
@@ -7908,6 +8047,7 @@ impl App {
         };
         let attrs = platform_window_attrs(Window::default_attributes()
             .with_title("termie — pane")
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(760.0, 480.0))
             .with_min_inner_size(LogicalSize::new(560.0, 380.0)));
         let window = match event_loop.create_window(attrs) {
@@ -7940,8 +8080,8 @@ impl App {
             }
         };
         self.configure_renderer(&mut renderer);
-        self.satellites.push(pane_window(
-            Some(window),
+        let mut pw = pane_window(
+            Some(window.clone()),
             Some(renderer),
             vec![Tab {
                 focused: pane.id,
@@ -7951,7 +8091,14 @@ impl App {
                 attention: false,
                 color: None,
             }],
+        );
+        pw.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
         ));
+        window.set_visible(true);
+        self.satellites.push(pw);
         // relayout + paint the new satellite via the swap-into-pw technique, then
         // relayout + repaint the main window (which just lost a pane)
         let idx = self.satellites.len() - 1;
@@ -8047,6 +8194,9 @@ impl App {
         }
         self.cur_sat = Some(idx);
         std::mem::swap(&mut self.pw, &mut self.satellites[idx]);
+        if let (Some(adapter), Some(window)) = (self.pw.a11y.as_mut(), self.pw.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
         match event {
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(size) => {
@@ -8157,6 +8307,8 @@ impl App {
             // hover/selection/scroll/context-menu/title-bar — via the swapped-in
             // self.pw (close button + close-tab stay window-scoped through cur_sat)
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
+            WindowEvent::CursorEntered { .. } => self.on_cursor_entered(),
+            WindowEvent::CursorLeft { .. } => self.on_cursor_left(),
             WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
             WindowEvent::MouseInput {
                 state, button, ..
@@ -8173,7 +8325,7 @@ impl App {
         if self.satellites.get(idx).is_some_and(|s| s.tabs.is_empty()) {
             self.satellites.remove(idx);
         }
-        self.satellites.retain(|window| !window.tabs.is_empty());
+        self.cleanup_empty_windows();
     }
 
     /// re-attach a loose pane as a new tab (used if a satellite window won't open)
@@ -8334,8 +8486,8 @@ impl App {
 
     /// set the OS pointer icon, skipping the call when it hasn't changed
     fn set_pointer(&mut self, icon: CursorIcon) {
-        if self.cursor_icon != icon {
-            self.cursor_icon = icon;
+        if self.pw.cursor_icon != icon {
+            self.pw.cursor_icon = icon;
             if let Some(w) = &self.pw.window {
                 w.set_cursor(icon);
             }
@@ -8350,11 +8502,57 @@ impl App {
     // doesn't linger over the window while it's unfocused
     fn release_held_input(&mut self) {
         self.mods = ModifiersState::empty();
-        // a drag in flight must not survive losing focus, or it would resume the
-        // next time the pointer moves over the window
+        // scroll-thumb state is window-local; tab and pane drags stay alive so
+        // they can cross into another termie window
         self.sb_drag = None;
         if self.link.take().is_some() {
             self.set_pointer(CursorIcon::Default);
+        }
+    }
+
+    fn on_cursor_left(&mut self) {
+        let Some(current) = self.pw.window.as_ref().map(|window| window.id()) else {
+            return;
+        };
+        let mut clear_tabs = false;
+        if let Some(drag) = self.tab_drag.as_mut()
+            && drag.source == current
+        {
+            drag.left_strip = true;
+            drag.left_window = true;
+            drag.target = None;
+            clear_tabs = true;
+        }
+        let mut clear_panes = false;
+        if let Some(drag) = self.pane_drag.as_mut()
+            && drag.source_window == current
+        {
+            drag.moved = true;
+            drag.left_window = true;
+            drag.target = None;
+            clear_panes = true;
+        }
+        if clear_tabs {
+            self.show_tab_drop(None);
+        }
+        if clear_panes {
+            self.show_pane_drop(None);
+        }
+    }
+
+    fn on_cursor_entered(&mut self) {
+        let Some(current) = self.pw.window.as_ref().map(|window| window.id()) else {
+            return;
+        };
+        if let Some(drag) = self.tab_drag.as_mut()
+            && drag.source == current
+        {
+            drag.left_window = false;
+        }
+        if let Some(drag) = self.pane_drag.as_mut()
+            && drag.source_window == current
+        {
+            drag.left_window = false;
         }
     }
 
@@ -8408,6 +8606,16 @@ impl App {
         // widths keep the pointer inside the moved tab, so this can't oscillate)
         if let Some(mut drag) = self.tab_drag {
             let current = self.pw.window.as_ref().map(|w| w.id());
+            let inside = self.pw.window.as_ref().is_some_and(|window| {
+                let size = window.inner_size();
+                position.x >= 0.0
+                    && position.y >= 0.0
+                    && position.x < size.width as f64
+                    && position.y < size.height as f64
+            });
+            if current == Some(drag.source) && inside {
+                drag.left_window = false;
+            }
             if let Some(window) = self.pw.window.as_ref() {
                 drag.screen = window.inner_position().ok().map(|origin| {
                     PhysicalPosition::new(
@@ -8431,7 +8639,10 @@ impl App {
                     .unwrap_or(self.pw.tabs.len());
                 drag.target = Some((current, index));
             } else if current == Some(drag.source) {
-                drag.target = None;
+                drag.target = drag
+                    .screen
+                    .and_then(|point| self.window_at_screen(point))
+                    .filter(|(window, _)| *window != drag.source);
             }
             if let Some(Hit::Button(Hot::Tab(j) | Hot::TabClose(j))) =
                 self.pw.renderer.as_ref().map(|r| r.hit_test(px, py))
@@ -8443,11 +8654,23 @@ impl App {
             } else if travelled > 12.0 {
                 drag.left_strip = true;
             }
+            self.show_tab_drop(drag.target);
+            self.set_pointer(CursorIcon::Grabbing);
             self.tab_drag = Some(drag);
             return;
         }
         if let Some(mut drag) = self.pane_drag {
             let current = self.pw.window.as_ref().map(|window| window.id());
+            let inside = self.pw.window.as_ref().is_some_and(|window| {
+                let size = window.inner_size();
+                position.x >= 0.0
+                    && position.y >= 0.0
+                    && position.x < size.width as f64
+                    && position.y < size.height as f64
+            });
+            if current == Some(drag.source_window) && inside {
+                drag.left_window = false;
+            }
             if current != Some(drag.source_window)
                 || (position.x - drag.start.x).abs() + (position.y - drag.start.y).abs() > 8.0
             {
@@ -8472,6 +8695,7 @@ impl App {
                     || target.pane != drag.pane
             });
             self.show_pane_drop(visual_target);
+            self.set_pointer(CursorIcon::Grabbing);
             self.pane_drag = Some(drag);
             return;
         }
@@ -8559,6 +8783,7 @@ impl App {
                 match dir {
                     Some(Dir::Vertical) => CursorIcon::EwResize,
                     Some(Dir::Horizontal) => CursorIcon::NsResize,
+                    None if self.pw.pane_mode && self.pane_at(px, py).is_some() => CursorIcon::Grab,
                     None => CursorIcon::Default,
                 }
             };
@@ -8892,6 +9117,7 @@ impl App {
                                         screen: None,
                                         target: None,
                                         moved: false,
+                                        left_window: false,
                                     });
                                 }
                                 self.focus_pane_at(cx, cy);
@@ -8981,6 +9207,7 @@ impl App {
                                         }),
                                         target: None,
                                         left_strip: false,
+                                        left_window: false,
                                     });
                                 }
                             }
@@ -9218,6 +9445,15 @@ impl App {
     fn handle_shortcut(&mut self, logical: &Key, text: Option<&str>, state: ElementState, event_loop: &ActiveEventLoop) -> bool {
         if state != ElementState::Pressed {
             return false;
+        }
+        if *logical == Key::Named(NamedKey::Escape)
+            && (self.tab_drag.take().is_some() || self.pane_drag.take().is_some())
+        {
+            self.show_tab_drop(None);
+            self.show_pane_drop(None);
+            self.reset_drag_cursors();
+            self.pressed = None;
+            return true;
         }
         // Esc closes an open pane context menu before anything else sees it
         if self.pw.pane_menu.is_some() && *logical == Key::Named(NamedKey::Escape) {
@@ -10084,7 +10320,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Err(e) => self.show_notice(&format!("update download failed: {e}")),
             },
             UserEvent::Accessibility(e) => match e.window_event {
-                accesskit_winit::WindowEvent::InitialTreeRequested => self.update_a11y(),
+                accesskit_winit::WindowEvent::InitialTreeRequested => self.update_window_a11y(e.window_id),
                 // read-only v1: the screen reader can't drive actions
                 accesskit_winit::WindowEvent::ActionRequested(_) => {}
                 accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
@@ -10101,7 +10337,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // feed the main window's events to the accesskit adapter (focus/bounds)
-        if let (Some(a), Some(w)) = (self.a11y.as_mut(), self.pw.window.as_ref()) {
+        if let (Some(a), Some(w)) = (self.pw.a11y.as_mut(), self.pw.window.as_ref()) {
             a.process_event(w, &event);
         }
         match event {
@@ -10152,6 +10388,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mods = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
+            WindowEvent::CursorEntered { .. } => self.on_cursor_entered(),
+            WindowEvent::CursorLeft { .. } => self.on_cursor_left(),
             WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
             WindowEvent::MouseInput {
                 state, button, ..
@@ -10239,7 +10477,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // refresh the screen-reader tree (no-op unless an assistive tech is on)
-        self.update_a11y();
+        self.update_all_a11y();
         // top up the warm pool once the window is up (one per tick, no spawn burst)
         if self.shown {
             self.warm_pool();

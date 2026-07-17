@@ -5,6 +5,7 @@
 ### Interface
 - **Tabs drag between Termie windows.** Pull a tab away from its strip to open it in a new window, or drop it on another window to move the live tab there. Its complete pane tree, running shells, title, color, zoom, and command status move with it.
 - **Pane mode now docks panes instead of swapping them.** Drag a pane toward any edge of another pane to place it left, right, above, or below. The highlighted half shows the result before release. The same drag works across Termie windows, and dropping on the desktop tears the live pane into its own window without restarting its shell.
+- **Window-edge dragging is reliable.** Leaving a source window is tracked independently from its last local cursor coordinate, destination tab strips show the exact insertion point, and each window owns its grab cursor and screen-reader adapter. A receiving window can now absorb the original window's final tab or pane; the emptied source closes and the receiver becomes the primary window.
 - **New windows belong to the running app.** `Ctrl+Shift+N` now creates a first-class in-process window in the focused shell and directory. Those windows can exchange tabs and close independently while one event loop keeps every PTY alive.
 
 ### Platform

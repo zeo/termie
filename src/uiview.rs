@@ -7,7 +7,8 @@
 use vte::Parser;
 
 use crate::render::{
-    self, ConfirmView, FindView, Hot, MarketRowView, MarketView, PaletteView, PaneMenuView, PaneView, RenameView,
+    self, ConfirmView, FindView, Hot, MarketRowView, MarketView, PaletteView, PaneDropSide,
+    PaneMenuView, PaneView, RenameView,
 };
 use crate::term::Terminal;
 
@@ -51,6 +52,9 @@ pub fn maybe_run() -> bool {
         "panemode" => {
             r.set_pane_mode(true);
             r.set_hovered(Some(Hot::PaneMode));
+        }
+        "tab-drop" => {
+            r.set_tab_drop(Some(1));
         }
         "menu" => {
             r.set_pane_menu(Some(PaneMenuView {
@@ -162,6 +166,10 @@ pub fn maybe_run() -> bool {
             (pad * 2.0 + cw, tb + pad, cw, content_h),
         ]
     };
+    if scene == "pane-drop" {
+        r.set_pane_mode(true);
+        r.set_pane_drop(Some((rects[1], PaneDropSide::Left)));
+    }
 
     let samples: [&[u8]; 2] = [
         b"\x1b[1;32m$\x1b[0m cargo build --release\r\n\x1b[2m   Compiling\x1b[0m termie v0.2.0\r\n\x1b[1;32m    Finished\x1b[0m `release` profile in 18.4s\r\n\x1b[1;32m$\x1b[0m cargo test\r\n\x1b[1;32m    Running\x1b[0m unittests src/main.rs\r\n\r\nrunning 165 tests\r\n\x1b[32m........................................\x1b[0m\r\n\x1b[32m..................\x1b[0m\x1b[33miiiii\x1b[0m\x1b[32m............\x1b[0m\r\n\r\ntest result: \x1b[1;32mok\x1b[0m. 160 passed; 0 failed; 5 ignored\r\n\r\n\x1b[1;32m$\x1b[0m cargo clippy --all-targets\r\n\x1b[1;32m    Finished\x1b[0m `dev` profile \xe2\x80\x94 no warnings\r\n\x1b[1;32m$\x1b[0m \x1b[7m \x1b[0m\r\n",

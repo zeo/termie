@@ -669,6 +669,7 @@ pub struct Renderer {
     gradient_key: (u32, u32, ThemeId),
     pane_mode: bool,
     pane_drop: Option<((f32, f32, f32, f32), PaneDropSide)>,
+    tab_drop: Option<usize>,
     mark_mode: bool,
     /// this process holds an admin token: a persistent shield chip on the
     /// status bar so an elevated window is never mistaken for a normal one
@@ -1369,6 +1370,7 @@ impl Renderer {
             settings_view: SettingsView::default(),
             pane_mode: false,
             pane_drop: None,
+            tab_drop: None,
             mark_mode: false,
             elevated: false,
             tabs: Vec::new(),
@@ -1641,6 +1643,10 @@ impl Renderer {
 
     pub fn set_pane_drop(&mut self, drop: Option<((f32, f32, f32, f32), PaneDropSide)>) {
         self.pane_drop = drop;
+    }
+
+    pub fn set_tab_drop(&mut self, index: Option<usize>) {
+        self.tab_drop = index;
     }
 
     pub fn set_elevated(&mut self, on: bool) {
@@ -3760,6 +3766,23 @@ impl Renderer {
             // a tinted active tab colors its rail too
             let rail = item.8.map(|ci| self.palette.ansi_color(ci)).unwrap_or(PAPER);
             Self::push_rect(&mut out, ux, self.title_bar_h - hair * 2.0, uw, hair * 2.0, rail, 1.0);
+        }
+        if let Some(index) = self.tab_drop {
+            let x = tab_items
+                .get(index)
+                .map(|tab| tab.1.0)
+                .or_else(|| tab_items.last().map(|tab| tab.1.0 + tab.1.2))
+                .unwrap_or(newtab_rect.0);
+            let marker_w = (3.0 * self.scale).round().max(hair * 2.0);
+            Self::push_rect(
+                &mut out,
+                x - marker_w / 2.0,
+                hair * 3.0,
+                marker_w,
+                self.title_bar_h - hair * 6.0,
+                PAPER,
+                1.0,
+            );
         }
 
         // new-tab button (nerd-font plus) and its profile-menu chevron; the two
