@@ -3938,7 +3938,6 @@ impl Renderer {
         let st_top = (sb_y + (self.status_bar_h - chrome_h) / 2.0).round();
         let wide = (0.14 * cw_c).max(1.0);
 
-        let mut sx = pad;
         let gap = (14.0 * self.scale).round();
         let scale = self.scale;
 
@@ -3950,29 +3949,86 @@ impl Renderer {
         if self.status_tabs.0 != self.status_sessions {
             self.status_tabs = (self.status_sessions, self.status_sessions.to_string());
         }
+        let draw_seg = |atlas: &mut GlyphAtlas,
+                        out: &mut Vec<Instance>,
+                        x,
+                        key,
+                        value,
+                        key_color,
+                        value_color| {
+            Self::seg(
+                atlas, out, x, st_top, key, value, track, wide, scale, key_color, value_color,
+            )
+        };
 
-        // left cluster: SIZE · ENC · GIT · TABS — seg borrows only the atlas, so
-        // the status strings can be passed by reference without per-frame clones
-        sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "SIZE", &self.status_size.2, track, wide, scale, RULE_2, TEXT_2);
-        sx += gap;
-        sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "ENC", "utf-8", track, wide, scale, RULE_2, MUTE);
-        if let Some(branch) = &self.status_git {
-            let truncated;
-            let b: &str = if branch.chars().count() > 24 {
-                truncated = branch.chars().take(23).collect::<String>() + "\u{2026}";
-                &truncated
-            } else {
-                branch
+        let left_end = if self.pane_mode {
+            let actions = [
+                ("DRAG", "dock"),
+                ("SHIFT+ARROWS", "resize"),
+                ("ARROWS", "focus"),
+                ("V/S", "split"),
+                ("X", "close"),
+                ("Z", "zoom"),
+                ("O", "popout"),
+            ];
+            let width = |renderer: &Self, key: &str, value: &str| {
+                renderer.text_w(FontId::Chrome, key, wide)
+                    + (7.0 * scale).round()
+                    + renderer.text_w(FontId::Chrome, value, track)
             };
+            let done_w = width(self, "ESC", "done");
+            let limit = w * 0.64;
+            let mut sx = pad;
+            for (key, value) in actions {
+                let action_w = width(self, key, value);
+                let action_gap = if sx > pad { gap } else { 0.0 };
+                if sx + action_gap + action_w + gap + done_w > limit {
+                    continue;
+                }
+                sx += action_gap;
+                sx = draw_seg(&mut self.atlas, &mut out, sx, key, value, PAPER, MUTE);
+            }
+            if sx > pad {
+                sx += gap;
+            }
+            draw_seg(&mut self.atlas, &mut out, sx, "ESC", "done", PAPER, MUTE)
+        } else {
+            // the normal status cluster keeps terminal state visible between modes
+            let mut sx = draw_seg(
+                &mut self.atlas, &mut out, pad, "SIZE", &self.status_size.2, RULE_2, TEXT_2,
+            );
             sx += gap;
-            sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "\u{f126}", b, track, wide, scale, RULE_2, TEXT_2);
-        }
-        if self.elevated {
+            sx = draw_seg(&mut self.atlas, &mut out, sx, "ENC", "utf-8", RULE_2, MUTE);
+            if let Some(branch) = &self.status_git {
+                let truncated;
+                let branch = if branch.chars().count() > 24 {
+                    truncated = branch.chars().take(23).collect::<String>() + "\u{2026}";
+                    &truncated
+                } else {
+                    branch
+                };
+                sx += gap;
+                sx = Self::seg(
+                    &mut self.atlas,
+                    &mut out,
+                    sx,
+                    st_top,
+                    "\u{f126}",
+                    branch,
+                    track,
+                    wide,
+                    scale,
+                    RULE_2,
+                    TEXT_2,
+                );
+            }
+            if self.elevated {
+                sx += gap;
+                sx = draw_seg(&mut self.atlas, &mut out, sx, "\u{f132}", "admin", PAPER, PAPER);
+            }
             sx += gap;
-            sx = Self::seg(&mut self.atlas, &mut out, sx, st_top, "\u{f132}", "admin", track, wide, scale, PAPER, PAPER);
-        }
-        sx += gap;
-        let left_end = Self::seg(&mut self.atlas, &mut out, sx, st_top, "TABS", &self.status_tabs.1, track, wide, scale, RULE_2, MUTE);
+            draw_seg(&mut self.atlas, &mut out, sx, "TABS", &self.status_tabs.1, RULE_2, MUTE)
+        };
 
         // right cluster (right→left): version · READY/PANE · clock. a live
         // program notification takes the READY and clock slots for its text,
@@ -4003,7 +4059,7 @@ impl Renderer {
             let (ready, ready_col) = if self.broadcast {
                 ("BROADCAST", PAPER)
             } else if self.pane_mode {
-                ("DOCK PANES", PAPER)
+                ("PANE MODE", PAPER)
             } else if self.mark_mode {
                 ("MARK MODE", PAPER)
             } else {
