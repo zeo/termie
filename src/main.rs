@@ -3748,8 +3748,8 @@ struct App {
     drive: Option<Drive>,
     /// window index that received the most recent synthetic pointer move
     drive_window: usize,
-    /// a drive assertion failed; returned as a nonzero process exit after cleanup
-    drive_failed: bool,
+    /// a drive step failed; returned as a nonzero process exit after cleanup
+    drive_error: Option<String>,
     #[cfg(debug_assertions)]
     bench_next: Option<Instant>,
     /// pool shells currently spawning on worker threads (not yet in `pool`)
@@ -3983,7 +3983,7 @@ impl App {
             theme_watch_spawned: false,
             drive: None,
             drive_window: 0,
-            drive_failed: false,
+            drive_error: None,
         }
     }
 
@@ -8790,8 +8790,9 @@ impl App {
                         self.drive_window = index;
                         self.with_window(index - 1, |app| app.inject_pointer(position));
                     } else {
-                        log::error!("--drive: pointer-window {index} is unavailable");
-                        self.drive_failed = true;
+                        let error = format!("--drive: pointer-window {index} is unavailable");
+                        log::error!("{error}");
+                        self.drive_error = Some(error);
                     }
                 }
                 DriveStep::Mouse(state) => {
@@ -8803,11 +8804,12 @@ impl App {
                         });
                         self.cleanup_empty_windows();
                     } else {
-                        log::error!(
+                        let error = format!(
                             "--drive: pointer window {} closed before mouse input",
                             self.drive_window
                         );
-                        self.drive_failed = true;
+                        log::error!("{error}");
+                        self.drive_error = Some(error);
                     }
                 }
                 DriveStep::Assert(metric, expected) => {
@@ -8851,10 +8853,11 @@ impl App {
                         let actual = actual
                             .map(|actual| actual.to_string())
                             .unwrap_or_else(|| "window unavailable".to_string());
-                        log::error!(
+                        let error = format!(
                             "--drive: {metric:?} assertion failed (expected {expected}, got {actual})"
                         );
-                        self.drive_failed = true;
+                        log::error!("{error}");
+                        self.drive_error = Some(error);
                     }
                 }
                 DriveStep::Exit => event_loop.exit(),
@@ -11840,8 +11843,8 @@ fn main() -> Result<()> {
         .drive
         .as_ref()
         .is_some_and(|drive| drive.next < drive.steps.len());
-    if app.drive_failed {
-        anyhow::bail!("--drive script failed");
+    if let Some(error) = app.drive_error {
+        anyhow::bail!(error);
     }
     if drive_incomplete {
         anyhow::bail!("--drive ended before completing its script");
