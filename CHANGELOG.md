@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Interface
+- **Drag handles explain themselves on hover.** Tabs now show a grab cursor and a responsive status hint for reordering, moving between windows, and pulling out into a new window. Hovering the app badge explains that it merges the complete tab set into another Termie window, with shorter copy when space is tight.
 - **Drag a complete Termie window into another.** The app badge is now a grab handle for the window's live tab set. Drop it on another Termie tab strip to merge every tab in order, keep the moved active tab selected, focus the receiver, and close the emptied source. The neighboring wordmark still moves the OS window normally.
 - **Cross-window dragging works on KDE Wayland.** Termie takes a short-lived geometry snapshot through KWin when a tab or pane drag begins, then uses it for live destination previews and drops across Termie windows. The helper unloads as soon as the drag resolves.
 - **Late font fallbacks replace missing-glyph boxes.** A symbol first painted before the deferred system-font scan no longer leaves a cached tofu box behind. Spinner marks and other symbols redraw from the installed fallback font as soon as it is available.

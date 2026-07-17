@@ -9511,7 +9511,10 @@ impl App {
                     Some(Dir::Horizontal) => CursorIcon::NsResize,
                     None
                         if self.pw.renderer.as_ref().is_some_and(|renderer| {
-                            matches!(renderer.hit_test(px, py), Hit::Button(Hot::WindowTabs))
+                            matches!(
+                                renderer.hit_test(px, py),
+                                Hit::Button(Hot::WindowTabs | Hot::Tab(_))
+                            )
                         }) =>
                     {
                         CursorIcon::Grab

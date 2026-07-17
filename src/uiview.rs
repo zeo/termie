@@ -49,6 +49,12 @@ pub fn maybe_run() -> bool {
         "gear" => {
             r.set_hovered(Some(Hot::Gear));
         }
+        "tab-hint" => {
+            r.set_hovered(Some(Hot::Tab(0)));
+        }
+        "window-hint" => {
+            r.set_hovered(Some(Hot::WindowTabs));
+        }
         "panemode" => {
             r.set_pane_mode(true);
             r.set_hovered(Some(Hot::PaneMode));

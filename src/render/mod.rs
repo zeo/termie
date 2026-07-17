@@ -124,6 +124,20 @@ pub enum Hot {
     PluginToggle(usize),
 }
 
+fn drag_hint_variants(hot: Option<Hot>) -> &'static [(&'static str, &'static str)] {
+    match hot {
+        Some(Hot::WindowTabs) => &[
+            ("DRAG BADGE", "merge all tabs into another window"),
+            ("DRAG BADGE", "merge all tabs"),
+        ],
+        Some(Hot::Tab(_)) => &[
+            ("DRAG TAB", "reorder \u{00b7} move between windows \u{00b7} pull out"),
+            ("DRAG TAB", "move \u{00b7} pull out"),
+        ],
+        _ => &[],
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneDropSide {
     Left,
@@ -4068,6 +4082,28 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, rx_n, st_top, &shown, PAPER, 1.0, track,
             );
+        } else if let Some(&(key, value)) = drag_hint_variants(self.hovered)
+            .iter()
+            .find(|&&(key, value)| {
+                let hint_w = self.text_w(FontId::Chrome, key, wide)
+                    + (7.0 * scale).round()
+                    + self.text_w(FontId::Chrome, value, track);
+                hint_w <= rx_ver - (16.0 * self.scale).round() - left_end - gap
+            })
+        {
+            let hint_w = self.text_w(FontId::Chrome, key, wide)
+                + (7.0 * scale).round()
+                + self.text_w(FontId::Chrome, value, track);
+            let rx_hint = rx_ver - (16.0 * self.scale).round() - hint_w;
+            let _ = draw_seg(
+                &mut self.atlas,
+                &mut out,
+                rx_hint,
+                key,
+                value,
+                PAPER,
+                MUTE,
+            );
         } else {
             let (ready, ready_col) = if self.broadcast {
                 ("BROADCAST", PAPER)
@@ -6355,6 +6391,20 @@ mod hit_tests {
         let mut p = std::env::temp_dir();
         p.push(format!("termie-hittest-{tag}-{}.png", std::process::id()));
         p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn drag_hints_stay_on_drag_handles() {
+        assert_eq!(
+            drag_hint_variants(Some(Hot::WindowTabs))[0],
+            ("DRAG BADGE", "merge all tabs into another window")
+        );
+        assert_eq!(
+            drag_hint_variants(Some(Hot::Tab(2)))[0],
+            ("DRAG TAB", "reorder \u{00b7} move between windows \u{00b7} pull out")
+        );
+        assert!(drag_hint_variants(Some(Hot::TabClose(2))).is_empty());
+        assert!(drag_hint_variants(Some(Hot::Gear)).is_empty());
     }
 
     #[test]
