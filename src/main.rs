@@ -107,6 +107,8 @@ enum UserEvent {
     Accessibility(accesskit_winit::Event),
     /// another ordinary launch joined this process and needs its own window
     Launch(instance::LaunchRequest),
+    #[cfg(target_os = "linux")]
+    KwinDragGeometry(win::KwinDragSnapshot),
     /// a default-terminal console session handed to this running instance
     #[cfg(windows)]
     Handoff(defterm::Handoff),
@@ -276,6 +278,24 @@ struct PaneDrag {
     moved: bool,
     left_window: bool,
     label: String,
+}
+
+#[cfg(target_os = "linux")]
+struct KwinDragProbe {
+    generation: u64,
+    tagged: Vec<(WindowId, String)>,
+    started: Instant,
+    script: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct KwinWindowGeometry {
+    window: WindowId,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
 impl PaneDrag {
@@ -2005,6 +2025,11 @@ fn drag_window_origin(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn kwin_drag_title(title: &str, index: usize) -> String {
+    format!("{title}\u{2063}\u{2063}\u{2063}{}", "\u{200b}".repeat(index + 1))
+}
+
 /// one scheduled `--drive` step
 #[derive(Clone)]
 enum DriveStep {
@@ -3677,6 +3702,14 @@ struct App {
     /// pane-mode drag state: a divider being resized (path) or a pane being moved
     drag_divider: Option<Vec<usize>>,
     pane_drag: Option<PaneDrag>,
+    #[cfg(target_os = "linux")]
+    kwin_drag_bridge: Option<win::KwinDragBridge>,
+    #[cfg(target_os = "linux")]
+    kwin_drag_probe: Option<KwinDragProbe>,
+    #[cfg(target_os = "linux")]
+    kwin_drag_geometry: Vec<KwinWindowGeometry>,
+    #[cfg(target_os = "linux")]
+    kwin_drag_generation: u64,
     /// quake drop-down currently summoned (always-on-top at screen top)
     #[cfg(any(windows, target_os = "linux"))]
     quake_shown: bool,
@@ -3779,6 +3812,8 @@ impl App {
         pty::set_profiles(with_wsl_profiles(p.profiles.clone(), win::wsl_distros()));
         let cli = parse_args(std::env::args().skip(1));
         let (keybindings, send_inputs, kb_ignored) = load_keybindings();
+        #[cfg(target_os = "linux")]
+        let kwin_drag_bridge = win::KwinDragBridge::new(proxy.clone());
         App {
             proxy,
             kitty_demo_pending: cli.kitty_demo,
@@ -3872,6 +3907,14 @@ impl App {
             shutting_down: false,
             drag_divider: None,
             pane_drag: None,
+            #[cfg(target_os = "linux")]
+            kwin_drag_bridge,
+            #[cfg(target_os = "linux")]
+            kwin_drag_probe: None,
+            #[cfg(target_os = "linux")]
+            kwin_drag_geometry: Vec::new(),
+            #[cfg(target_os = "linux")]
+            kwin_drag_generation: 0,
             #[cfg(any(windows, target_os = "linux"))]
             quake_shown: false,
             #[cfg(any(windows, target_os = "linux"))]
@@ -4721,6 +4764,74 @@ impl App {
                 })
         };
         self.satellites.iter().find_map(hit).or_else(|| hit(&self.pw))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kwin_drag_point(
+        &self,
+        source: WindowId,
+        local: PhysicalPosition<f64>,
+    ) -> Option<PhysicalPosition<f64>> {
+        let geometry = self.kwin_drag_geometry.iter().find(|geometry| geometry.window == source)?;
+        let scale = self
+            .pane_window_for(source)
+            .and_then(|pw| pw.window.as_ref())
+            .map(|window| window.scale_factor())?;
+        Some(PhysicalPosition::new(
+            geometry.x + local.x / scale,
+            geometry.y + local.y / scale,
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kwin_tab_drop_at(&self, point: PhysicalPosition<f64>) -> Option<(WindowId, usize)> {
+        for geometry in self.kwin_drag_geometry.iter().rev() {
+            if point.x < geometry.x
+                || point.y < geometry.y
+                || point.x >= geometry.x + geometry.w
+                || point.y >= geometry.y + geometry.h
+            {
+                continue;
+            }
+            let pw = self.pane_window_for(geometry.window)?;
+            let scale = pw.window.as_ref()?.scale_factor();
+            let x = ((point.x - geometry.x) * scale) as f32;
+            let y = ((point.y - geometry.y) * scale) as f32;
+            let index = pw
+                .renderer
+                .as_ref()
+                .and_then(|renderer| match renderer.hit_test(x, y) {
+                    Hit::Button(Hot::Tab(index) | Hot::TabClose(index)) => Some(index),
+                    _ => None,
+                })
+                .unwrap_or(pw.tabs.len());
+            return Some((geometry.window, index));
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kwin_pane_drop_at(&self, point: PhysicalPosition<f64>) -> Option<PaneDropDestination> {
+        for geometry in self.kwin_drag_geometry.iter().rev() {
+            if point.x < geometry.x
+                || point.y < geometry.y
+                || point.x >= geometry.x + geometry.w
+                || point.y >= geometry.y + geometry.h
+            {
+                continue;
+            }
+            let pw = self.pane_window_for(geometry.window)?;
+            let scale = pw.window.as_ref()?.scale_factor();
+            let x = ((point.x - geometry.x) * scale) as f32;
+            let y = ((point.y - geometry.y) * scale) as f32;
+            return Self::pane_drop_at(pw, x, y)
+                .map(PaneDropDestination::Dock)
+                .or_else(|| {
+                    Self::pane_tab_drop_at(pw, x, y)
+                        .map(|(window, index)| PaneDropDestination::Tab(window, index))
+                });
+        }
+        None
     }
 
     fn show_pane_drop(&mut self, target: Option<PaneDropTarget>) {
@@ -6835,6 +6946,123 @@ impl App {
             .find(|pw| pw.window.as_ref().map(|window| window.id()) == Some(id))
     }
 
+    #[cfg(target_os = "linux")]
+    fn pane_window_for_mut(&mut self, id: WindowId) -> Option<&mut PaneWindow> {
+        self.satellites
+            .iter_mut()
+            .chain(std::iter::once(&mut self.pw))
+            .find(|pw| pw.window.as_ref().map(|window| window.id()) == Some(id))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn begin_kwin_drag_probe(&mut self) {
+        if self.kwin_drag_bridge.is_none() {
+            return;
+        }
+        self.cancel_kwin_drag_probe();
+        self.kwin_drag_generation = self.kwin_drag_generation.wrapping_add(1);
+        let generation = self.kwin_drag_generation;
+        let mut tagged = Vec::new();
+        let tag = |pw: &mut PaneWindow, tagged: &mut Vec<(WindowId, String)>| {
+            if let Some(window) = pw.window.as_ref() {
+                let title = window.title();
+                window.set_title(&kwin_drag_title(&title, tagged.len()));
+                tagged.push((window.id(), title));
+            }
+        };
+        tag(&mut self.pw, &mut tagged);
+        for pw in &mut self.satellites {
+            tag(pw, &mut tagged);
+        }
+        self.kwin_drag_probe = Some(KwinDragProbe {
+            generation,
+            tagged,
+            started: Instant::now(),
+            script: None,
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_kwin_drag_probe(&mut self) {
+        let Some(probe) = self.kwin_drag_probe.as_ref() else {
+            return;
+        };
+        if probe.started.elapsed() >= Duration::from_secs(1) {
+            self.cancel_kwin_drag_probe();
+            return;
+        }
+        if probe.script.is_some() || probe.started.elapsed() < Duration::from_millis(20) {
+            return;
+        }
+        let generation = probe.generation;
+        let script = self.kwin_drag_bridge.as_ref().and_then(|bridge| bridge.request(generation));
+        if let Some(script) = script {
+            if let Some(probe) = self.kwin_drag_probe.as_mut() {
+                probe.script = Some(script);
+            }
+        } else {
+            self.cancel_kwin_drag_probe();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn accept_kwin_drag_geometry(&mut self, snapshot: win::KwinDragSnapshot) {
+        let Some(probe) = self.kwin_drag_probe.take() else {
+            return;
+        };
+        if let Some(script) = probe.script.as_deref() {
+            win::unload_kwin_script(script);
+        }
+        for (index, (window, title)) in probe.tagged.iter().enumerate() {
+            if let Some(window) = self
+                .pane_window_for_mut(*window)
+                .and_then(|pw| pw.window.as_ref())
+                .filter(|window| window.title() == kwin_drag_title(title, index))
+            {
+                window.set_title(title);
+            }
+        }
+        if snapshot.generation != probe.generation
+            || (self.tab_drag.is_none() && self.pane_drag.is_none())
+        {
+            return;
+        }
+        self.kwin_drag_geometry = snapshot
+            .windows
+            .into_iter()
+            .filter_map(|(index, x, y, w, h)| {
+                probe.tagged.get(index).map(|(window, _)| KwinWindowGeometry {
+                    window: *window,
+                    x,
+                    y,
+                    w,
+                    h,
+                })
+            })
+            .collect();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_kwin_drag_probe(&mut self) {
+        let Some(probe) = self.kwin_drag_probe.take() else {
+            self.kwin_drag_geometry.clear();
+            return;
+        };
+        if let Some(script) = probe.script.as_deref() {
+            win::unload_kwin_script(script);
+        }
+        for (index, (window, title)) in probe.tagged.into_iter().enumerate() {
+            if let Some(window) = self
+                .pane_window_for_mut(window)
+                .and_then(|pw| pw.window.as_ref())
+                .filter(|window| window.title() == kwin_drag_title(&title, index))
+            {
+                window.set_title(&title);
+            }
+        }
+        self.kwin_drag_geometry.clear();
+    }
+
     fn reposition_window(&self, id: WindowId, point: PhysicalPosition<i32>, grab: PhysicalPosition<f64>) {
         let window = self
             .pane_window_for(id)
@@ -7003,6 +7231,8 @@ impl App {
         let Some(drag) = self.tab_drag.take() else {
             return;
         };
+        #[cfg(target_os = "linux")]
+        self.cancel_kwin_drag_probe();
         self.show_tab_drop(None);
         self.show_drag_preview(None);
         self.reset_drag_cursors();
@@ -7159,6 +7389,8 @@ impl App {
         let Some(drag) = self.pane_drag.take() else {
             return;
         };
+        #[cfg(target_os = "linux")]
+        self.cancel_kwin_drag_probe();
         self.show_pane_drop(None);
         self.show_tab_drop(None);
         self.show_drag_preview(None);
@@ -7935,6 +8167,8 @@ impl App {
         if !on {
             self.drag_divider = None;
             self.pane_drag = None;
+            #[cfg(target_os = "linux")]
+            self.cancel_kwin_drag_probe();
             self.show_pane_drop(None);
             self.show_tab_drop(None);
         }
@@ -8899,6 +9133,13 @@ impl App {
                     .screen
                     .and_then(|point| self.window_at_screen(point))
                     .filter(|(window, _)| *window != drag.source);
+                #[cfg(target_os = "linux")]
+                if drag.target.is_none() {
+                    drag.target = self
+                        .kwin_drag_point(drag.source, position)
+                        .and_then(|point| self.kwin_tab_drop_at(point))
+                        .filter(|(window, _)| *window != drag.source);
+                }
             }
             if let Some(Hit::Button(Hot::Tab(j) | Hot::TabClose(j))) =
                 self.pw.renderer.as_ref().map(|r| r.hit_test(px, py))
@@ -8951,6 +9192,12 @@ impl App {
                 });
             if drag.target.is_none() {
                 drag.target = drag.screen.and_then(|point| self.pane_drop_at_screen(point));
+                #[cfg(target_os = "linux")]
+                if drag.target.is_none() {
+                    drag.target = self
+                        .kwin_drag_point(drag.source_window, position)
+                        .and_then(|point| self.kwin_pane_drop_at(point));
+                }
             }
             let pane_target = drag.target.and_then(|target| match target {
                 PaneDropDestination::Dock(target)
@@ -9404,6 +9651,8 @@ impl App {
                                         left_window: false,
                                         label,
                                     });
+                                    #[cfg(target_os = "linux")]
+                                    self.begin_kwin_drag_probe();
                                 }
                                 self.focus_pane_at(cx, cy);
                             }
@@ -9496,6 +9745,8 @@ impl App {
                                         left_window: false,
                                         label,
                                     });
+                                    #[cfg(target_os = "linux")]
+                                    self.begin_kwin_drag_probe();
                                 }
                             }
                         }
@@ -9740,6 +9991,8 @@ impl App {
             self.show_pane_drop(None);
             self.show_drag_preview(None);
             self.reset_drag_cursors();
+            #[cfg(target_os = "linux")]
+            self.cancel_kwin_drag_probe();
             self.pressed = None;
             return true;
         }
@@ -10502,6 +10755,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             },
             UserEvent::Launch(request) => self.open_launch_window(event_loop, request),
+            #[cfg(target_os = "linux")]
+            UserEvent::KwinDragGeometry(snapshot) => self.accept_kwin_drag_geometry(snapshot),
             UserEvent::Market(result) => {
                 // the remote catalog arrived (or failed): merge into the open overlay
                 if self.market.is_some() {
@@ -11028,6 +11283,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             self.redraw();
         }
+        #[cfg(target_os = "linux")]
+        self.poll_kwin_drag_probe();
         // only tick (~2 redraws/sec) when a blinking cursor is actually on screen;
         // otherwise stay event-driven so idle panes cost nothing. content changes
         // already request redraws from their own events (pty output, keys, resize)
@@ -11068,7 +11325,25 @@ impl ApplicationHandler<UserEvent> for App {
             (d.next < d.steps.len())
                 .then(|| d.steps[d.next].0.saturating_sub(started.elapsed()).as_millis() as u64 + 5)
         });
-        match main_ms.into_iter().chain(sat_ms).chain(notice_ms).chain(drive_ms).min() {
+        #[cfg(target_os = "linux")]
+        let kwin_ms = self.kwin_drag_probe.as_ref().map(|probe| {
+            let deadline = if probe.script.is_some() {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(20)
+            };
+            deadline.saturating_sub(probe.started.elapsed()).as_millis() as u64 + 1
+        });
+        #[cfg(not(target_os = "linux"))]
+        let kwin_ms: Option<u64> = None;
+        match main_ms
+            .into_iter()
+            .chain(sat_ms)
+            .chain(notice_ms)
+            .chain(drive_ms)
+            .chain(kwin_ms)
+            .min()
+        {
             Some(ms) => event_loop
                 .set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(ms))),
             None => event_loop.set_control_flow(ControlFlow::Wait),

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Interface
+- **Cross-window dragging works on KDE Wayland.** Termie takes a short-lived geometry snapshot through KWin when a tab or pane drag begins, then uses it for live destination previews and drops across Termie windows. The helper unloads as soon as the drag resolves.
 - **A completed drag lands where it was held.** Tearing out a tab or pane preserves the pointer's grab offset instead of placing the new window's corner under it. A successful tear-out or cross-window drop focuses the receiving window, and keyboard-created windows now use their intended cascade offset.
 - **Dragged tabs and panes stay attached to the pointer.** A compact payload chip follows every move with the real tab or pane label and flips around the pointer near window edges. Dock shading and tab insertion marks remain visible beneath it, so the payload and destination read together before release.
 - **Separate launches can combine again.** Starting Termie a second time opens another window in the existing app while preserving its requested directory, shell, command, or scripted layout. Those windows can exchange live tabs and panes because their PTYs share one event loop. Drive runs, elevated shells, and default-terminal handoffs stay isolated.

@@ -181,6 +181,112 @@ pub fn apply_backdrop(hwnd_handle: isize, on: bool) {
 pub fn apply_backdrop(_hwnd_handle: isize, _on: bool) {}
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq)]
+pub struct KwinDragSnapshot {
+    pub generation: u64,
+    pub windows: Vec<(usize, f64, f64, f64, f64)>,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kwin_drag_snapshot(payload: &str) -> Option<KwinDragSnapshot> {
+    let mut lines = payload.lines();
+    let generation = lines.next()?.parse().ok()?;
+    let mut windows = Vec::new();
+    for line in lines {
+        if windows.len() == 256 {
+            return None;
+        }
+        let mut fields = line.split(',');
+        let row = (
+            fields.next()?.parse().ok()?,
+            fields.next()?.parse().ok()?,
+            fields.next()?.parse().ok()?,
+            fields.next()?.parse().ok()?,
+            fields.next()?.parse().ok()?,
+        );
+        if fields.next().is_some()
+            || ![row.1, row.2, row.3, row.4].into_iter().all(f64::is_finite)
+            || row.3 <= 0.0
+            || row.4 <= 0.0
+        {
+            return None;
+        }
+        windows.push(row);
+    }
+    Some(KwinDragSnapshot { generation, windows })
+}
+
+#[cfg(target_os = "linux")]
+struct KwinDragSink {
+    proxy: winit::event_loop::EventLoopProxy<crate::UserEvent>,
+}
+
+#[cfg(target_os = "linux")]
+#[zbus::interface(name = "org.termie.Drag")]
+impl KwinDragSink {
+    fn geometry(&self, payload: &str) -> bool {
+        parse_kwin_drag_snapshot(payload)
+            .is_some_and(|snapshot| self.proxy.send_event(crate::UserEvent::KwinDragGeometry(snapshot)).is_ok())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct KwinDragBridge {
+    _connection: zbus::blocking::Connection,
+    service: String,
+}
+
+#[cfg(target_os = "linux")]
+impl KwinDragBridge {
+    pub fn new(proxy: winit::event_loop::EventLoopProxy<crate::UserEvent>) -> Option<Self> {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() || !is_kde_desktop() {
+            return None;
+        }
+        let service = format!("org.termie.Drag.p{}", std::process::id());
+        let connection = zbus::blocking::connection::Builder::session()
+            .ok()?
+            .name(service.as_str())
+            .ok()?
+            .serve_at("/org/termie/Drag", KwinDragSink { proxy })
+            .ok()?
+            .build()
+            .ok()?;
+        Some(Self { _connection: connection, service })
+    }
+
+    pub fn request(&self, generation: u64) -> Option<String> {
+        let pid = std::process::id();
+        let name = format!("termie-drag-geometry-{pid}-{generation}");
+        let script = kwin_drag_script(&self.service, pid, generation);
+        let (id, path) = load_kwin_script(&name, &script)?;
+        let ran = run_kwin_script(id);
+        let _ = std::fs::remove_file(path);
+        if ran {
+            Some(name)
+        } else {
+            unload_kwin_script(&name);
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kwin_drag_script(service: &str, pid: u32, generation: u64) -> String {
+    format!(
+        "const marker = '\\u2063\\u2063\\u2063';\nconst bit = '\\u200b';\nlet payload = '{generation}';\nconst windows = workspace.stackingOrder;\nfor (let i = 0; i < windows.length; i++) {{\n    const window = windows[i];\n    if (window.pid !== {pid}) continue;\n    const caption = window.caption;\n    const markerAt = caption.indexOf(marker);\n    if (markerAt < 0) continue;\n    let tagged = markerAt + marker.length;\n    let index = 0;\n    while (caption.charAt(tagged + index) === bit) index++;\n    if (index === 0) continue;\n    const geometry = window.clientGeometry;\n    payload += '\\n' + (index - 1) + ',' + geometry.x + ',' + geometry.y + ',' + geometry.width + ',' + geometry.height;\n}}\ncallDBus('{service}', '/org/termie/Drag', 'org.termie.Drag', 'Geometry', payload);\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn is_kde_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .split(':')
+        .any(|part| matches!(part, "kde" | "plasma"))
+}
+
+#[cfg(target_os = "linux")]
 fn kwin_keep_above_script(pid: u32, width: f64, height: f64, on: bool) -> String {
     kwin_window_script(pid, width, height, &format!("    target.keepAbove = {on};\n"))
 }
@@ -232,29 +338,29 @@ fn apply_kwin_window_script(
     purpose: &str,
     script: impl FnOnce(u32, f64, f64) -> String,
 ) -> bool {
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase();
-    if !desktop.split(':').any(|part| matches!(part, "kde" | "plasma")) {
+    if !is_kde_desktop() {
         return false;
     }
     let pid = std::process::id();
     let name = format!("termie-{purpose}-{pid}");
-    let Some(dir) = crate::cache_dir() else {
-        return false;
-    };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return false;
-    }
-    let path = dir.join(format!("{name}.js"));
     let size = window.inner_size();
     let scale = window.scale_factor();
-    if std::fs::write(
-        &path,
-        script(pid, size.width as f64 / scale, size.height as f64 / scale),
-    )
-    .is_err()
-    {
+    let script = script(pid, size.width as f64 / scale, size.height as f64 / scale);
+    let Some((id, path)) = load_kwin_script(&name, &script) else {
         return false;
-    }
+    };
+    let handled = run_kwin_script(id);
+    let _ = std::fs::remove_file(path);
+    unload_kwin_script(&name);
+    handled
+}
+
+#[cfg(target_os = "linux")]
+fn load_kwin_script(name: &str, script: &str) -> Option<(u32, std::path::PathBuf)> {
+    let dir = crate::cache_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{name}.js"));
+    std::fs::write(&path, script).ok()?;
     let load = std::process::Command::new("gdbus")
         .args([
             "call",
@@ -267,53 +373,69 @@ fn apply_kwin_window_script(
             "org.kde.kwin.Scripting.loadScript",
         ])
         .arg(&path)
-        .arg(&name)
+        .arg(name)
         .output();
     let id = load.ok().and_then(|output| {
-        output.status.success().then(|| String::from_utf8_lossy(&output.stdout)).and_then(|text| {
+        let id = output.status.success().then(|| String::from_utf8_lossy(&output.stdout)).and_then(|text| {
             text.split(|c: char| !c.is_ascii_digit() && c != '-')
                 .filter_map(|part| part.parse::<i32>().ok())
                 .next_back()
                 .and_then(|id| u32::try_from(id).ok())
-        })
+        });
+        if id.is_none() {
+            log::warn!(
+                "KWin rejected {name}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        id
     });
-    let handled = if let Some(id) = id {
-        let ran = std::process::Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.kde.KWin",
-                "--object-path",
-                &format!("/Scripting/Script{id}"),
-                "--method",
-                "org.kde.kwin.Script.run",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        let _ = std::process::Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.kde.KWin",
-                "--object-path",
-                "/Scripting",
-                "--method",
-                "org.kde.kwin.Scripting.unloadScript",
-                &name,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        ran
-    } else {
-        false
-    };
-    let _ = std::fs::remove_file(path);
-    handled
+    match id {
+        Some(id) => Some((id, path)),
+        None => {
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_kwin_script(id: u32) -> bool {
+    std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.KWin",
+            "--object-path",
+            &format!("/Scripting/Script{id}"),
+            "--method",
+            "org.kde.kwin.Script.run",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "linux")]
+pub fn unload_kwin_script(name: &str) {
+    let _ = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.KWin",
+            "--object-path",
+            "/Scripting",
+            "--method",
+            "org.kde.kwin.Scripting.unloadScript",
+            name,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1895,8 +2017,9 @@ pub fn explorer_dir_for(_hwnd: isize) -> Option<String> {
 mod tests {
     use super::{
         command_quote, desktop_with_profiles, kde_terminal_snapshot, kwin_hide_quake_script,
-        kwin_keep_above_script, kwin_quake_script, launcher_progress_properties,
-        parse_kde_terminal_snapshot, parse_portal_color_scheme, terminal_list_with_termie,
+        kwin_drag_script, kwin_keep_above_script, kwin_quake_script, launcher_progress_properties,
+        parse_kde_terminal_snapshot, parse_kwin_drag_snapshot, parse_portal_color_scheme,
+        terminal_list_with_termie,
     };
 
     #[test]
@@ -2004,5 +2127,22 @@ mod tests {
         assert!(script.contains("workspace.activeWindow = target"));
         assert!(script.contains("target.minimized = false"));
         assert!(kwin_hide_quake_script(42, 1000.0, 640.0).contains("target.minimized = true"));
+    }
+
+    #[test]
+    fn kwin_drag_geometry_script_and_payload_are_bounded() {
+        let script = kwin_drag_script("org.termie.Drag.p42", 42, 7);
+        assert!(script.contains("window.pid !== 42"));
+        assert!(script.contains("workspace.stackingOrder"));
+        assert!(script.contains("window.clientGeometry"));
+        assert!(script.contains("org.termie.Drag.p42"));
+
+        let snapshot = parse_kwin_drag_snapshot("7\n0,100,200,800,600\n1,-40,25,700.5,500")
+            .expect("valid geometry snapshot");
+        assert_eq!(snapshot.generation, 7);
+        assert_eq!(snapshot.windows.len(), 2);
+        assert!(parse_kwin_drag_snapshot("7\n0,0,0,0,100").is_none());
+        assert!(parse_kwin_drag_snapshot("7\n0,NaN,0,100,100").is_none());
+        assert!(parse_kwin_drag_snapshot("7\n0,0,0,100,100,extra").is_none());
     }
 }
