@@ -4016,6 +4016,47 @@ impl App {
         renderer.set_content_pt(settings.font_size);
     }
 
+    fn create_renderer(
+        &self,
+        event_loop: &ActiveEventLoop,
+        window: Arc<Window>,
+        satellite: bool,
+    ) -> Result<Renderer> {
+        #[cfg(debug_assertions)]
+        let mut renderer = if self.cli.drive.is_some()
+            && std::env::var_os("TERMIE_DRIVE_SURFACELESS").is_some()
+        {
+            let size = window.inner_size();
+            Renderer::new_headless(
+                size.width,
+                size.height,
+                CONTENT_PT,
+                CHROME_PT,
+                window.scale_factor() as f32,
+            )
+        } else {
+            Renderer::new(
+                window,
+                event_loop.owned_display_handle(),
+                CONTENT_PT,
+                CHROME_PT,
+                self.config.backend,
+                satellite,
+            )?
+        };
+        #[cfg(not(debug_assertions))]
+        let mut renderer = Renderer::new(
+            window,
+            event_loop.owned_display_handle(),
+            CONTENT_PT,
+            CHROME_PT,
+            self.config.backend,
+            satellite,
+        )?;
+        self.configure_renderer(&mut renderer);
+        Ok(renderer)
+    }
+
     fn boot(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         // start hidden; reveal after the first painted frame to avoid a white flash
         let (irgba, iw, ih) = win::app_icon();
@@ -4135,15 +4176,7 @@ impl App {
             self.spawn_pool_shell(80, 24);
         }
 
-        let mut renderer = Renderer::new(
-            window.clone(),
-            event_loop.owned_display_handle(),
-            CONTENT_PT,
-            CHROME_PT,
-            self.config.backend,
-            false,
-        )?;
-        self.configure_renderer(&mut renderer);
+        let renderer = self.create_renderer(event_loop, window.clone(), false)?;
         timing("renderer ready (gpu init)");
         window.set_ime_allowed(true);
         self.pw.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
@@ -7330,15 +7363,7 @@ impl App {
         if self.persisted.acrylic {
             window.set_blur(true);
         }
-        let mut renderer = Renderer::new(
-            window.clone(),
-            event_loop.owned_display_handle(),
-            CONTENT_PT,
-            CHROME_PT,
-            self.config.backend,
-            true,
-        )?;
-        self.configure_renderer(&mut renderer);
+        let renderer = self.create_renderer(event_loop, window.clone(), true)?;
         let mut pw = pane_window(Some(window.clone()), Some(renderer), Vec::new());
         pw.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
             event_loop,

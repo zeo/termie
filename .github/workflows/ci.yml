@@ -44,6 +44,7 @@ jobs:
         shell: powershell
         run: |
           $env:TERMIE_DRIVE_NOW = '1'
+          $env:TERMIE_DRIVE_SURFACELESS = '1'
           Get-ChildItem tests\drive\*.txt | Sort-Object Name | ForEach-Object {
             Write-Host "running $($_.Name)"
             & target\debug\termie.exe new-tab --shell cmd --drive $_.FullName
