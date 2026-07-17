@@ -123,6 +123,14 @@ pub enum Hot {
     PluginToggle(usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaneDropSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// a terminal to draw at a pixel rect within the window
 pub struct PaneView<'a> {
     pub term: &'a Terminal,
@@ -660,6 +668,7 @@ pub struct Renderer {
     gradient_cache: Vec<Instance>,
     gradient_key: (u32, u32, ThemeId),
     pane_mode: bool,
+    pane_drop: Option<((f32, f32, f32, f32), PaneDropSide)>,
     mark_mode: bool,
     /// this process holds an admin token: a persistent shield chip on the
     /// status bar so an elevated window is never mistaken for a normal one
@@ -1359,6 +1368,7 @@ impl Renderer {
             font_idx: 0,
             settings_view: SettingsView::default(),
             pane_mode: false,
+            pane_drop: None,
             mark_mode: false,
             elevated: false,
             tabs: Vec::new(),
@@ -1627,6 +1637,10 @@ impl Renderer {
 
     pub fn set_pane_mode(&mut self, on: bool) {
         self.pane_mode = on;
+    }
+
+    pub fn set_pane_drop(&mut self, drop: Option<((f32, f32, f32, f32), PaneDropSide)>) {
+        self.pane_drop = drop;
     }
 
     pub fn set_elevated(&mut self, on: bool) {
@@ -3585,6 +3599,16 @@ impl Renderer {
                 Self::push_rect(&mut out, rx + rw - d - pad, ry + pad, d, d, dot, da);
             }
         }
+        if let Some(((x, y, w, h), side)) = self.pane_drop {
+            let target = match side {
+                PaneDropSide::Left => (x, y, w / 2.0, h),
+                PaneDropSide::Right => (x + w / 2.0, y, w / 2.0, h),
+                PaneDropSide::Top => (x, y, w, h / 2.0),
+                PaneDropSide::Bottom => (x, y + h / 2.0, w, h / 2.0),
+            };
+            Self::push_rect(&mut out, target.0, target.1, target.2, target.3, PAPER, 0.16);
+            Self::stroke_rect_a(&mut out, target, hair * 2.0, PAPER, 0.9);
+        }
         // last use of pane_info — hand the buffer back so its capacity persists
         self.pane_scratch = pane_info;
 
@@ -3902,7 +3926,7 @@ impl Renderer {
             let (ready, ready_col) = if self.broadcast {
                 ("BROADCAST", PAPER)
             } else if self.pane_mode {
-                ("PANE MODE", PAPER)
+                ("DOCK PANES", PAPER)
             } else if self.mark_mode {
                 ("MARK MODE", PAPER)
             } else {

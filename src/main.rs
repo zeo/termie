@@ -40,7 +40,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
 
 use pty::{Pty, PtyMsg, ShellKind};
-use render::{Hit, Hot, PaneView, Renderer};
+use render::{Hit, Hot, PaneDropSide, PaneView, Renderer};
 use term::Terminal;
 
 const CONTENT_PT: f32 = 14.0;
@@ -205,6 +205,26 @@ struct TabDrag {
     screen: Option<PhysicalPosition<i32>>,
     target: Option<(WindowId, usize)>,
     left_strip: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PaneDropTarget {
+    window: WindowId,
+    tab: usize,
+    pane: usize,
+    side: PaneDropSide,
+    rect: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct PaneDrag {
+    source_window: WindowId,
+    source_tab: usize,
+    pane: usize,
+    start: PhysicalPosition<f64>,
+    screen: Option<PhysicalPosition<i32>>,
+    target: Option<PaneDropTarget>,
+    moved: bool,
 }
 
 /// a torn-off pane living in its own OS-decorated window. its pty reader still
@@ -1435,6 +1455,44 @@ fn split_pane(node: Node, id: usize, dir: Dir, new: &mut Option<Pane>) -> Node {
     }
 }
 
+fn insert_pane(node: Node, id: usize, pane: &mut Option<Pane>, side: PaneDropSide) -> Node {
+    match node {
+        Node::Leaf(target) => {
+            if target.id != id {
+                return Node::Leaf(target);
+            }
+            let Some(moved) = pane.take() else {
+                return Node::Leaf(target);
+            };
+            let (dir, first, second) = match side {
+                PaneDropSide::Left => (Dir::Vertical, Node::Leaf(moved), Node::Leaf(target)),
+                PaneDropSide::Right => (Dir::Vertical, Node::Leaf(target), Node::Leaf(moved)),
+                PaneDropSide::Top => (Dir::Horizontal, Node::Leaf(moved), Node::Leaf(target)),
+                PaneDropSide::Bottom => (Dir::Horizontal, Node::Leaf(target), Node::Leaf(moved)),
+            };
+            Node::Split { dir, ratio: 0.5, a: Box::new(first), b: Box::new(second) }
+        }
+        Node::Split { dir, ratio, a, b } => {
+            let a = insert_pane(*a, id, pane, side);
+            let b = if pane.is_some() { insert_pane(*b, id, pane, side) } else { *b };
+            Node::Split { dir, ratio, a: Box::new(a), b: Box::new(b) }
+        }
+    }
+}
+
+fn pane_drop_side(rect: Rect, x: f32, y: f32) -> PaneDropSide {
+    let (rx, ry, rw, rh) = rect;
+    let dx = (x - (rx + rw / 2.0)) / rw.max(1.0);
+    let dy = (y - (ry + rh / 2.0)) / rh.max(1.0);
+    if dx.abs() >= dy.abs() {
+        if dx < 0.0 { PaneDropSide::Left } else { PaneDropSide::Right }
+    } else if dy < 0.0 {
+        PaneDropSide::Top
+    } else {
+        PaneDropSide::Bottom
+    }
+}
+
 /// remove the leaf with `id`, collapsing its parent, and hand the pane back
 /// (alive — for tearing it off into its own window) via `out`
 fn extract_pane(node: Node, id: usize, out: &mut Option<Pane>) -> Option<Node> {
@@ -1590,35 +1648,6 @@ fn grow_focused(node: &mut Node, id: usize, dir: Dir, grow: bool, step: f32, don
             }
             in_a || in_b
         }
-    }
-}
-
-/// swap the panes of two distinct leaves (by id) in place
-fn swap_panes(node: &mut Node, a: usize, b: usize) {
-    if a == b {
-        return;
-    }
-    fn collect(n: &mut Node, a: usize, b: usize, pa: &mut *mut Pane, pb: &mut *mut Pane) {
-        match n {
-            Node::Leaf(p) => {
-                if p.id == a {
-                    *pa = p;
-                } else if p.id == b {
-                    *pb = p;
-                }
-            }
-            Node::Split { a: x, b: y, .. } => {
-                collect(x, a, b, pa, pb);
-                collect(y, a, b, pa, pb);
-            }
-        }
-    }
-    let mut pa: *mut Pane = std::ptr::null_mut();
-    let mut pb: *mut Pane = std::ptr::null_mut();
-    collect(node, a, b, &mut pa, &mut pb);
-    if !pa.is_null() && !pb.is_null() {
-        // safety: a != b and pane ids are unique, so pa/pb point to distinct Panes
-        unsafe { core::ptr::swap(pa, pb) };
     }
 }
 
@@ -3509,7 +3538,7 @@ struct App {
     shutting_down: bool,
     /// pane-mode drag state: a divider being resized (path) or a pane being moved
     drag_divider: Option<Vec<usize>>,
-    drag_pane: Option<usize>,
+    pane_drag: Option<PaneDrag>,
     /// quake drop-down currently summoned (always-on-top at screen top)
     #[cfg(any(windows, target_os = "linux"))]
     quake_shown: bool,
@@ -3708,7 +3737,7 @@ impl App {
             pending_warm: 0,
             shutting_down: false,
             drag_divider: None,
-            drag_pane: None,
+            pane_drag: None,
             #[cfg(any(windows, target_os = "linux"))]
             quake_shown: false,
             #[cfg(any(windows, target_os = "linux"))]
@@ -4500,6 +4529,53 @@ impl App {
             .iter()
             .find(|(_, (rx, ry, rw, rh))| x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh)
             .map(|(id, _)| *id)
+    }
+
+    fn pane_drop_at(pw: &PaneWindow, x: f32, y: f32) -> Option<PaneDropTarget> {
+        let window = pw.window.as_ref()?.id();
+        let (pane, rect) = pw
+            .layout_cache
+            .iter()
+            .find(|(_, (rx, ry, rw, rh))| x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh)?;
+        Some(PaneDropTarget {
+            window,
+            tab: pw.active_tab,
+            pane: *pane,
+            side: pane_drop_side(*rect, x, y),
+            rect: *rect,
+        })
+    }
+
+    fn pane_drop_at_screen(&self, point: PhysicalPosition<i32>) -> Option<PaneDropTarget> {
+        let hit = |pw: &PaneWindow| {
+            let window = pw.window.as_ref()?;
+            let origin = window.inner_position().ok()?;
+            let x = point.x - origin.x;
+            let y = point.y - origin.y;
+            let size = window.inner_size();
+            if x < 0 || y < 0 || x >= size.width as i32 || y >= size.height as i32 {
+                return None;
+            }
+            Self::pane_drop_at(pw, x as f32, y as f32)
+        };
+        self.satellites.iter().find_map(hit).or_else(|| hit(&self.pw))
+    }
+
+    fn show_pane_drop(&mut self, target: Option<PaneDropTarget>) {
+        let apply = |pw: &mut PaneWindow| {
+            let own = pw.window.as_ref().map(|window| window.id());
+            let drop = target.filter(|target| own == Some(target.window)).map(|target| (target.rect, target.side));
+            if let Some(renderer) = pw.renderer.as_mut() {
+                renderer.set_pane_drop(drop);
+            }
+            if let Some(window) = pw.window.as_ref() {
+                window.request_redraw();
+            }
+        };
+        apply(&mut self.pw);
+        for pw in &mut self.satellites {
+            apply(pw);
+        }
     }
 
     fn focused_grid(&self) -> Option<&crate::grid::Grid> {
@@ -6602,6 +6678,152 @@ impl App {
         }
     }
 
+    fn remove_pane_for_transfer(&mut self, tab_index: usize, pane_id: usize, allow_empty: bool) -> Option<Pane> {
+        let pane_total = self
+            .pw
+            .tabs
+            .get(tab_index)
+            .and_then(|tab| tab.root.as_ref())
+            .map(pane_count)?;
+        if pane_total == 1 && self.pw.tabs.len() == 1 && !allow_empty {
+            return None;
+        }
+        let before = self.focus_identity();
+        let tab = self.pw.tabs.get_mut(tab_index)?;
+        let root = tab.root.take()?;
+        let mut pane = None;
+        tab.root = extract_pane(root, pane_id, &mut pane);
+        pane.as_ref()?;
+        if let Some(root) = tab.root.as_ref() {
+            if tab.focused == pane_id {
+                tab.focused = first_leaf(root);
+            }
+            if tab.zoom == Some(pane_id) {
+                tab.zoom = None;
+            }
+        } else {
+            self.pw.tabs.remove(tab_index);
+            if self.pw.tabs.is_empty() {
+                self.pw.active_tab = 0;
+            } else {
+                self.pw.active_tab = self.pw.active_tab.min(self.pw.tabs.len() - 1);
+            }
+        }
+        if !self.pw.tabs.is_empty() {
+            self.relayout_all();
+            self.sync_tabs();
+            self.after_focus_context_change(before);
+        }
+        pane
+    }
+
+    fn take_pane_from_window(&mut self, source: WindowId, tab: usize, pane: usize) -> Option<Pane> {
+        let main = self.main_pw().window.as_ref().map(|window| window.id());
+        let allow_empty = main != Some(source);
+        if self.pw.window.as_ref().map(|window| window.id()) == Some(source) {
+            return self.remove_pane_for_transfer(tab, pane, allow_empty);
+        }
+        let slot = self.satellite_for(source)?;
+        let mut moved = None;
+        self.with_window(slot, |app| {
+            moved = app.remove_pane_for_transfer(tab, pane, allow_empty);
+        });
+        moved
+    }
+
+    fn insert_pane_here(&mut self, tab_index: usize, target: usize, pane: Pane, side: PaneDropSide) -> Option<Pane> {
+        let before = self.focus_identity();
+        let moved_id = pane.id;
+        let Some(tab) = self.pw.tabs.get_mut(tab_index) else {
+            return Some(pane);
+        };
+        let Some(root) = tab.root.take() else {
+            return Some(pane);
+        };
+        let mut pane = Some(pane);
+        tab.root = Some(insert_pane(root, target, &mut pane, side));
+        if pane.is_some() {
+            return pane;
+        }
+        tab.focused = moved_id;
+        tab.zoom = None;
+        self.pw.active_tab = tab_index;
+        self.relayout_all();
+        self.sync_tabs();
+        self.after_focus_context_change(before);
+        self.redraw();
+        None
+    }
+
+    fn insert_pane_into_window(&mut self, target: PaneDropTarget, pane: Pane) -> Option<Pane> {
+        if self.pw.window.as_ref().map(|window| window.id()) == Some(target.window) {
+            return self.insert_pane_here(target.tab, target.pane, pane, target.side);
+        }
+        let Some(slot) = self.satellite_for(target.window) else {
+            return Some(pane);
+        };
+        let mut pane = Some(pane);
+        self.with_window(slot, |app| {
+            pane = app.insert_pane_here(
+                target.tab,
+                target.pane,
+                pane.take().expect("pane transferred once"),
+                target.side,
+            );
+        });
+        pane
+    }
+
+    fn finish_pane_drag(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(drag) = self.pane_drag.take() else {
+            return;
+        };
+        self.show_pane_drop(None);
+        if !drag.moved {
+            return;
+        }
+        let target = drag.target.or_else(|| drag.screen.and_then(|point| self.pane_drop_at_screen(point)));
+        if let Some(target) = target
+            && target.window == drag.source_window
+            && target.tab == drag.source_tab
+            && target.pane == drag.pane
+        {
+            return;
+        }
+        let Some(pane) = self.take_pane_from_window(drag.source_window, drag.source_tab, drag.pane) else {
+            return;
+        };
+        if let Some(target) = target {
+            if let Some(pane) = self.insert_pane_into_window(target, pane) {
+                let fallback = Tab {
+                    focused: pane.id,
+                    root: Some(Node::Leaf(pane)),
+                    zoom: None,
+                    title: None,
+                    attention: false,
+                    color: None,
+                };
+                self.insert_tab_into_window(drag.source_window, fallback, drag.source_tab);
+            }
+        } else {
+            let tab = Tab {
+                focused: pane.id,
+                root: Some(Node::Leaf(pane)),
+                zoom: None,
+                title: None,
+                attention: false,
+                color: None,
+            };
+            if let Some(tab) = self.open_tab_window(event_loop, tab, drag.screen) {
+                self.insert_tab_into_window(drag.source_window, tab, drag.source_tab);
+                self.show_notice("couldn't open a new window");
+            }
+        }
+        if self.cur_sat.is_none() {
+            self.satellites.retain(|window| !window.tabs.is_empty());
+        }
+    }
+
     fn shift_active_tab(&mut self, delta: i32) {
         let to = self.pw.active_tab as i32 + delta;
         if to >= 0 && (to as usize) < self.pw.tabs.len() {
@@ -7280,6 +7502,11 @@ impl App {
 
     fn set_pane_mode(&mut self, on: bool) {
         self.pw.pane_mode = on;
+        if !on {
+            self.drag_divider = None;
+            self.pane_drag = None;
+            self.show_pane_drop(None);
+        }
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_pane_mode(on);
         }
@@ -8219,6 +8446,35 @@ impl App {
             self.tab_drag = Some(drag);
             return;
         }
+        if let Some(mut drag) = self.pane_drag {
+            let current = self.pw.window.as_ref().map(|window| window.id());
+            if current != Some(drag.source_window)
+                || (position.x - drag.start.x).abs() + (position.y - drag.start.y).abs() > 8.0
+            {
+                drag.moved = true;
+            }
+            if let Some(window) = self.pw.window.as_ref() {
+                drag.screen = window.inner_position().ok().map(|origin| {
+                    PhysicalPosition::new(
+                        origin.x + position.x.round() as i32,
+                        origin.y + position.y.round() as i32,
+                    )
+                });
+            }
+            let local = Self::pane_drop_at(&self.pw, px, py);
+            drag.target = local;
+            if drag.target.is_none() {
+                drag.target = drag.screen.and_then(|point| self.pane_drop_at_screen(point));
+            }
+            let visual_target = drag.target.filter(|target| {
+                target.window != drag.source_window
+                    || target.tab != drag.source_tab
+                    || target.pane != drag.pane
+            });
+            self.show_pane_drop(visual_target);
+            self.pane_drag = Some(drag);
+            return;
+        }
         // mouse-tracking motion (1002 drag / 1003 any-motion)
         if self.drag_divider.is_none() && !self.pw.settings_open && !self.mods.shift_key() {
             if let Some((btn, id)) = self.mouse_down {
@@ -8462,6 +8718,11 @@ impl App {
                     self.pressed = None;
                     return;
                 }
+                if state == ElementState::Released && self.pane_drag.is_some() {
+                    self.finish_pane_drag(event_loop);
+                    self.pressed = None;
+                    return;
+                }
                 // the marketplace is a full-page overlay: handle its clicks and
                 // consume the press so nothing falls through to the panes
                 if self.market.is_some() {
@@ -8606,8 +8867,7 @@ impl App {
                 if self.mark.is_some() && state == ElementState::Pressed {
                     self.set_mark_mode(false);
                 }
-                // pane mode: drag a divider to resize, or drag a pane onto another
-                // to swap them (instead of selecting text)
+                // pane mode: drag a divider to resize or place a pane beside another
                 if self.pw.pane_mode && !matches!(hit, Some(Hit::Button(_)) | Some(Hit::TitleBar) | Some(Hit::Resize(_))) {
                     match state {
                         ElementState::Pressed => {
@@ -8623,22 +8883,22 @@ impl App {
                             if let Some(p) = found {
                                 self.drag_divider = Some(p);
                             } else if let Some(id) = self.pane_at(cx, cy) {
-                                self.drag_pane = Some(id);
+                                if let Some(source_window) = self.pw.window.as_ref().map(|window| window.id()) {
+                                    self.pane_drag = Some(PaneDrag {
+                                        source_window,
+                                        source_tab: self.pw.active_tab,
+                                        pane: id,
+                                        start: self.pw.cursor,
+                                        screen: None,
+                                        target: None,
+                                        moved: false,
+                                    });
+                                }
                                 self.focus_pane_at(cx, cy);
                             }
                         }
                         ElementState::Released => {
-                            if self.drag_divider.take().is_none()
-                                && let Some(src) = self.drag_pane.take()
-                                    && let Some(dst) = self.pane_at(cx, cy)
-                                        && dst != src {
-                                            if let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()) {
-                                                swap_panes(root, src, dst);
-                                            }
-                                            self.relayout_all();
-                                            self.sync_tabs();
-                                            self.redraw();
-                                        }
+                            self.drag_divider = None;
                         }
                     }
                     return;
@@ -11343,19 +11603,6 @@ mod tests {
     }
 
     #[test]
-    fn swap_panes_exchanges_two_leaves_in_place() {
-        let mut tree = split(Dir::Vertical, 0.5, leaf(1), split(Dir::Horizontal, 0.5, leaf(2), leaf(3)));
-        swap_panes(&mut tree, 1, 3);
-        // structure is unchanged, but the payloads at the 1 and 3 slots traded
-        assert_eq!(ids(&tree), vec![3, 2, 1]);
-        // first_leaf follows the a-side spine, now holding the swapped-in pane 3
-        assert_eq!(first_leaf(&tree), 3);
-        // swapping an id with itself is a no-op
-        swap_panes(&mut tree, 2, 2);
-        assert_eq!(ids(&tree), vec![3, 2, 1]);
-    }
-
-    #[test]
     fn extract_pane_hands_back_the_pane_and_collapses_the_tree() {
         // pop pane 2 out: the remaining tree collapses like a close, but the
         // pane comes back alive (its pty isn't killed) for the new window
@@ -11374,6 +11621,42 @@ mod tests {
         let kept = extract_pane(leaf(9), 42, &mut popped).expect("kept");
         assert!(popped.is_none());
         assert_eq!(ids(&kept), vec![9]);
+    }
+
+    #[test]
+    fn insert_pane_places_the_leaf_on_each_requested_side() {
+        for (side, dir, expected) in [
+            (PaneDropSide::Left, Dir::Vertical, vec![2, 1]),
+            (PaneDropSide::Right, Dir::Vertical, vec![1, 2]),
+            (PaneDropSide::Top, Dir::Horizontal, vec![2, 1]),
+            (PaneDropSide::Bottom, Dir::Horizontal, vec![1, 2]),
+        ] {
+            let mut pane = Some(tp(2));
+            let tree = insert_pane(leaf(1), 1, &mut pane, side);
+            assert!(pane.is_none());
+            assert_eq!(ids(&tree), expected);
+            assert!(matches!(tree, Node::Split { dir: got, .. } if got == dir));
+        }
+    }
+
+    #[test]
+    fn pane_drop_side_uses_the_nearest_edge() {
+        let rect = (10.0, 20.0, 200.0, 100.0);
+        assert_eq!(pane_drop_side(rect, 12.0, 70.0), PaneDropSide::Left);
+        assert_eq!(pane_drop_side(rect, 208.0, 70.0), PaneDropSide::Right);
+        assert_eq!(pane_drop_side(rect, 110.0, 22.0), PaneDropSide::Top);
+        assert_eq!(pane_drop_side(rect, 110.0, 118.0), PaneDropSide::Bottom);
+    }
+
+    #[test]
+    fn pane_move_collapses_its_old_split_and_docks_live_leaf() {
+        let tree = split(Dir::Vertical, 0.5, leaf(1), split(Dir::Horizontal, 0.5, leaf(2), leaf(3)));
+        let mut moved = None;
+        let tree = extract_pane(tree, 2, &mut moved).expect("surviving tree");
+        let tree = insert_pane(tree, 1, &mut moved, PaneDropSide::Left);
+        assert!(moved.is_none());
+        assert_eq!(ids(&tree), vec![2, 1, 3]);
+        assert!(matches!(tree, Node::Split { dir: Dir::Vertical, .. }));
     }
 
     #[test]
