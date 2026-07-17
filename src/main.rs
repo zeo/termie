@@ -10,6 +10,7 @@ mod fxhash;
 mod image;
 mod grid;
 mod input;
+mod instance;
 mod plugin;
 mod pty;
 mod regex;
@@ -104,6 +105,8 @@ enum UserEvent {
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
+    /// another ordinary launch joined this process and needs its own window
+    Launch(instance::LaunchRequest),
     /// a default-terminal console session handed to this running instance
     #[cfg(windows)]
     Handoff(defterm::Handoff),
@@ -1872,9 +1875,8 @@ fn spawn_plugin(
 
 /// build a pane (pty + child + screen) without starting its reader thread.
 /// the slow part (process spawn) — safe to run off the main thread
-/// parsed command line. always-new-window means each launch is its own process,
-/// so this is per-process; a bare launch (no cwd/command) is what session
-/// restore keys off of
+/// parsed command line. a bare initial launch can restore the saved session;
+/// a bare launch forwarded into the running app opens one fresh window
 #[derive(Clone, Default)]
 struct CliArgs {
     cwd: Option<String>,
@@ -1952,6 +1954,40 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> CliArgs {
         }
     }
     out
+}
+
+fn launch_can_join(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        arg == "--drive"
+            || arg.starts_with("--drive=")
+            || arg == "--admin-shell"
+            || arg.eq_ignore_ascii_case("-embedding")
+            || arg.eq_ignore_ascii_case("/embedding")
+    })
+}
+
+fn resolve_launch_path(path: &str, base: Option<&str>) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    base.map(|base| std::path::Path::new(base).join(path).to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn resolve_layout_dirs(node: &mut session::NodeSnap, base: Option<&str>) {
+    match node {
+        session::NodeSnap::Leaf { cwd, .. } => {
+            *cwd = cwd
+                .as_deref()
+                .map(|cwd| resolve_launch_path(cwd, base))
+                .or_else(|| base.map(str::to_string));
+        }
+        session::NodeSnap::Split { a, b, .. } => {
+            resolve_layout_dirs(a, base);
+            resolve_layout_dirs(b, base);
+        }
+    }
 }
 
 /// one scheduled `--drive` step
@@ -6034,13 +6070,13 @@ impl App {
             PaletteAction::AdminWindow => {
                 #[cfg(windows)]
                 {
-                    let mut args = String::new();
+                    let mut args = String::from("--admin-shell");
                     // a label with a quote would mangle the relaunch argv; fall
                     // back to the default shell rather than risk it
                     if let Some(s) = self.focused_shell().map(|s| s.label().to_string())
                         && !s.contains('"')
                     {
-                        args.push_str(&format!("--shell \"{s}\""));
+                        args.push_str(&format!(" --shell \"{s}\""));
                     }
                     if let Some(d) = self.focused_cwd()
                         && !d.contains('"')
@@ -6859,6 +6895,69 @@ impl App {
             window.set_visible(true);
         }
         None
+    }
+
+    fn open_launch_window(&mut self, event_loop: &ActiveEventLoop, request: instance::LaunchRequest) {
+        let point = self.main_pw().window.as_ref().and_then(|window| {
+            window
+                .inner_position()
+                .ok()
+                .map(|origin| PhysicalPosition::new(origin.x + 48, origin.y + 48))
+        });
+        let pw = match self.create_satellite_window(event_loop, point) {
+            Ok(pw) => pw,
+            Err(error) => {
+                log::error!("forwarded launch window failed: {error:#}");
+                self.show_notice("couldn't open the requested window");
+                return;
+            }
+        };
+        let mut cli = parse_args(request.args.into_iter());
+        let base = request.process_cwd.as_deref();
+        if let Some(cwd) = cli.cwd.as_deref() {
+            cli.cwd = Some(resolve_launch_path(cwd, base));
+        }
+        for tab in &mut cli.tabs {
+            resolve_layout_dirs(&mut tab.root, base);
+        }
+
+        self.satellites.push(pw);
+        let slot = self.satellites.len() - 1;
+        self.with_window(slot, |app| {
+            if cli.tabs.is_empty() {
+                let cwd = if cli.is_bare() {
+                    request.launch_cwd
+                } else if cli.command.is_some() {
+                    cli.cwd.or(request.process_cwd)
+                } else {
+                    cli.cwd
+                };
+                let shell = cli.shell.as_deref().map(ShellKind::from_label);
+                let (cols, rows) = app.content_pane_size();
+                if let Ok(pane) = app.spawn_pane(cols, rows, cwd, shell, cli.command.as_deref()) {
+                    app.install_first_tab(pane);
+                }
+            } else {
+                app.restore_session(session::SessionFile {
+                    active_tab: 0,
+                    tabs: cli.tabs,
+                    window: None,
+                });
+            }
+            if let Some(renderer) = app.pw.renderer.as_mut() {
+                renderer.begin_reveal();
+            }
+            app.paint();
+        });
+        if self.satellites[slot].tabs.is_empty() {
+            self.satellites.remove(slot);
+            self.show_notice("couldn't start the requested shell");
+            return;
+        }
+        if let Some(window) = self.satellites[slot].window.as_ref() {
+            window.set_visible(true);
+            window.focus_window();
+        }
     }
 
     fn finish_tab_drag(&mut self, event_loop: &ActiveEventLoop) {
@@ -10331,6 +10430,7 @@ impl ApplicationHandler<UserEvent> for App {
                     log::info!("plugin {id} exited");
                 }
             },
+            UserEvent::Launch(request) => self.open_launch_window(event_loop, request),
             UserEvent::Market(result) => {
                 // the remote catalog arrived (or failed): merge into the open overlay
                 if self.market.is_some() {
@@ -10994,9 +11094,30 @@ fn main() -> Result<()> {
     if !is_embedding && win::defterm_registered() {
         defterm::init_process_security();
     }
+    let launch_args: Vec<String> = std::env::args().skip(1).collect();
+    let launch_server = if launch_can_join(&launch_args) && !win::is_elevated() {
+        let request = instance::LaunchRequest {
+            args: launch_args,
+            process_cwd: std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
+            launch_cwd: launch_cwd(win::foreground_window()),
+        };
+        match instance::claim(&request) {
+            instance::Claim::Primary(server) => Some(server),
+            instance::Claim::Forwarded => return Ok(()),
+            instance::Claim::Standalone => None,
+        }
+    } else {
+        None
+    };
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    if let Some(server) = launch_server {
+        let launch_proxy = proxy.clone();
+        server.start(move |request| launch_proxy.send_event(UserEvent::Launch(request)).is_ok());
+    }
     let mut app = App::new(proxy);
     #[cfg(windows)]
     {
@@ -11614,6 +11735,43 @@ mod tests {
         assert_eq!(admin.command.as_deref(), Some(&["sudo".to_string(), "-s".to_string()][..]));
         // unknown flags are ignored, not misread as a cwd or command
         assert!(p(&["--frobnicate"]).is_bare());
+    }
+
+    #[test]
+    fn only_interactive_launches_join_the_running_app() {
+        let args = |values: &[&str]| values.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(launch_can_join(&args(&[])));
+        assert!(launch_can_join(&args(&["--cwd", "work", "--shell", "bash"])));
+        assert!(!launch_can_join(&args(&["--drive", "steps.txt"])));
+        assert!(!launch_can_join(&args(&["--drive=steps.txt"])));
+        assert!(!launch_can_join(&args(&["--admin-shell"])));
+        assert!(!launch_can_join(&args(&["-Embedding"])));
+        assert!(!launch_can_join(&args(&["/EMBEDDING"])));
+    }
+
+    #[test]
+    fn forwarded_layout_dirs_resolve_from_the_launching_process() {
+        let base = std::path::Path::new("workspace").join("project");
+        let expected = base.join("child").to_string_lossy().into_owned();
+        let inherited = base.to_string_lossy().into_owned();
+        let mut root = session::NodeSnap::Split {
+            vertical: true,
+            ratio: 0.5,
+            a: Box::new(session::NodeSnap::Leaf {
+                cwd: Some("child".into()),
+                shell: "default".into(),
+            }),
+            b: Box::new(session::NodeSnap::Leaf {
+                cwd: None,
+                shell: "default".into(),
+            }),
+        };
+        resolve_layout_dirs(&mut root, Some(&inherited));
+        let session::NodeSnap::Split { a, b, .. } = root else {
+            panic!("expected split layout");
+        };
+        assert!(matches!(*a, session::NodeSnap::Leaf { cwd: Some(ref cwd), .. } if cwd == &expected));
+        assert!(matches!(*b, session::NodeSnap::Leaf { cwd: Some(ref cwd), .. } if cwd == &inherited));
     }
 
     #[cfg(not(windows))]

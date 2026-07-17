@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Interface
+- **Separate launches can combine again.** Starting Termie a second time opens another window in the existing app while preserving its requested directory, shell, command, or scripted layout. Those windows can exchange live tabs and panes because their PTYs share one event loop. Drive runs, elevated shells, and default-terminal handoffs stay isolated.
 - **Torn-out panes keep Termie's own window chrome.** Pane pop-out previously put an OS title bar around Termie's title bar and skipped part of the platform setup. Tab tear-out and pane tear-out now share the same hidden-first window setup, icon, backdrop, renderer settings, IME support, and screen-reader adapter.
 - **Tabs drag between Termie windows.** Pull a tab away from its strip to open it in a new window, or drop it on another window to move the live tab there. Its complete pane tree, running shells, title, color, zoom, and command status move with it.
 - **Pane mode now docks panes instead of swapping them.** Drag a pane toward any edge of another pane to place it left, right, above, or below. The highlighted half shows the result before release. Drop on a tab strip to turn the pane into a tab at the marked position. The same drag works across Termie windows, and dropping on the desktop tears the live pane into its own window without restarting its shell.
