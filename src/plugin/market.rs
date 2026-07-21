@@ -10,7 +10,8 @@
 //! can't traverse out or shadow another plugin.
 
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
 
 use super::json::Json;
 use super::manifest::{id_is_safe, Manifest};
@@ -19,6 +20,9 @@ use super::manifest::{id_is_safe, Manifest};
 /// the security model is trust-the-store (subprocess is not a sandbox)
 pub const INDEX_URL: &str =
     "https://raw.githubusercontent.com/zeo/termie-plugins/main/index.json";
+const MAX_INDEX_BYTES: usize = 1024 * 1024;
+const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 4096;
 /// the catalog repo + ref behind the raw URLs above. files under this prefix are
 /// fetched through `gh` (authenticated) so a private catalog works; everything
 /// else falls back to anonymous curl
@@ -122,17 +126,76 @@ fn archive_path_is_safe(path: &str) -> bool {
         && path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
 }
 
-fn validate_archive_listing(bytes: Vec<u8>) -> Result<(), String> {
+fn validate_archive_listing(bytes: Vec<u8>) -> Result<usize, String> {
     let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 paths")?;
-    if listing.lines().any(|path| !archive_path_is_safe(path)) {
-        return Err("archive contains an unsafe path".to_string());
+    let mut entries = 0;
+    for path in listing.lines() {
+        if !archive_path_is_safe(path) {
+            return Err("archive contains an unsafe path".to_string());
+        }
+        entries += 1;
+        if entries > MAX_ARCHIVE_ENTRIES {
+            return Err("archive contains too many entries".to_string());
+        }
     }
-    Ok(())
+    (entries > 0).then_some(entries).ok_or_else(|| "archive is empty".to_string())
+}
+
+#[cfg(any(windows, test))]
+fn validate_tar_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
+    let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 metadata")?;
+    let mut entries = 0;
+    for line in listing.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        entries += 1;
+        if !matches!(line.as_bytes().first(), Some(b'-' | b'd')) {
+            return Err("archive contains a link or special file".to_string());
+        }
+    }
+    (entries == expected)
+        .then_some(())
+        .ok_or_else(|| "archive metadata does not match its file list".to_string())
+}
+
+#[cfg(any(not(windows), test))]
+fn zipinfo_entry_kind(line: &str) -> Option<u8> {
+    let mut fields = line.split_ascii_whitespace();
+    let attributes = fields.next()?.as_bytes();
+    let version = fields.next()?;
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    fields.next()?;
+    attributes.first().copied()
+}
+
+#[cfg(any(not(windows), test))]
+fn validate_zipinfo_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
+    let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 metadata")?;
+    let mut entries = 0;
+    for kind in listing.lines().filter_map(zipinfo_entry_kind) {
+        entries += 1;
+        if !matches!(kind, b'-' | b'd') {
+            return Err("archive contains a link or special file".to_string());
+        }
+    }
+    (entries == expected)
+        .then_some(())
+        .ok_or_else(|| "archive metadata does not match its file list".to_string())
 }
 
 #[cfg(windows)]
 fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
     let listing = quiet_command("tar")
+        .env_remove("TAR_OPTIONS")
+        .env_remove("TAR_READER_OPTIONS")
         .arg("-tf")
         .arg(archive)
         .output()
@@ -140,8 +203,22 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
     if !listing.status.success() {
         return Err(format!("couldn't inspect archive: status {:?}", listing.status));
     }
-    validate_archive_listing(listing.stdout)?;
+    let entries = validate_archive_listing(listing.stdout)?;
+    let kinds = quiet_command("tar")
+        .env_remove("TAR_OPTIONS")
+        .env_remove("TAR_READER_OPTIONS")
+        .arg("-tvf")
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("couldn't inspect archive types: {e}"))?;
+    if !kinds.status.success() {
+        return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
+    }
+    validate_tar_types(kinds.stdout, entries)?;
     let status = quiet_command("tar")
+        .env_remove("TAR_OPTIONS")
+        .env_remove("TAR_READER_OPTIONS")
+        .args(["--no-same-owner", "--no-same-permissions"])
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -154,6 +231,8 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
     let listing = quiet_command("unzip")
+        .env_remove("ZIPINFO")
+        .env_remove("ZIPINFOOPT")
         .arg("-Z1")
         .arg(archive)
         .output()
@@ -161,8 +240,21 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
     if !listing.status.success() {
         return Err(format!("couldn't inspect archive: status {:?}", listing.status));
     }
-    validate_archive_listing(listing.stdout)?;
+    let entries = validate_archive_listing(listing.stdout)?;
+    let kinds = quiet_command("unzip")
+        .env_remove("ZIPINFO")
+        .env_remove("ZIPINFOOPT")
+        .args(["-Z", "-s"])
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("couldn't inspect archive types: {e}"))?;
+    if !kinds.status.success() {
+        return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
+    }
+    validate_zipinfo_types(kinds.stdout, entries)?;
     let status = quiet_command("unzip")
+        .env_remove("UNZIP")
+        .env_remove("UNZIPOPT")
         .arg("-qq")
         .arg(archive)
         .arg("-d")
@@ -186,30 +278,86 @@ fn reject_symlinks(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum BoundedOutputError {
+    Io(std::io::Error),
+    Limit,
+}
+
+fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>, BoundedOutputError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedOutputError::Io)?;
+    if bytes.len() > limit {
+        return Err(BoundedOutputError::Limit);
+    }
+    Ok(bytes)
+}
+
+fn bounded_output(command: &mut Command, limit: usize) -> Result<Output, BoundedOutputError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(BoundedOutputError::Io)?;
+    let stdout = child.stdout.take().expect("piped child stdout");
+    let mut stderr = child.stderr.take().expect("piped child stderr");
+    let stderr_task = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        {
+            let mut prefix = stderr.by_ref().take(64 * 1024);
+            prefix.read_to_end(&mut kept)?;
+        }
+        std::io::copy(&mut stderr, &mut std::io::sink())?;
+        Ok::<_, std::io::Error>(kept)
+    });
+
+    let stdout = match read_bounded(stdout, limit) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_task.join();
+            return Err(error);
+        }
+    };
+    let status = child.wait().map_err(BoundedOutputError::Io)?;
+    let stderr = stderr_task
+        .join()
+        .map_err(|_| BoundedOutputError::Io(std::io::Error::other("stderr reader panicked")))?
+        .map_err(BoundedOutputError::Io)?;
+    Ok(Output { status, stdout, stderr })
+}
+
 /// fetch raw bytes for a catalog URL. files under the catalog repo go through
 /// the GitHub CLI (`gh api … Accept: raw`) so a private repo works with the
 /// user's login; anything else — or a missing/unauthenticated gh — falls back
 /// to anonymous curl
-fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     let repo_path = url.strip_prefix(CATALOG_RAW_PREFIX);
     if let Some(path) = repo_path {
         let api = format!("repos/{CATALOG_REPO}/contents/{path}?ref={CATALOG_REF}");
-        match quiet_command("gh")
-            .args(["api", &api, "-H", "Accept: application/vnd.github.raw"])
-            .output()
-        {
+        let mut command = quiet_command("gh");
+        command.args(["api", &api, "-H", "Accept: application/vnd.github.raw"]);
+        match bounded_output(&mut command, limit) {
             Ok(o) if o.status.success() => return Ok(o.stdout),
             Ok(o) => log::warn!("gh fetch of {path} failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
-            Err(e) => log::warn!("gh unavailable ({e}); trying curl"),
+            Err(BoundedOutputError::Limit) => return Err(format!("response exceeds {limit} byte limit")),
+            Err(BoundedOutputError::Io(e)) => log::warn!("gh unavailable ({e}); trying curl"),
         }
     }
-    match quiet_command("curl").args(["-fsSL", "--max-time", "60", url]).output() {
+    let mut command = quiet_command("curl");
+    command.args(["-fsSL", "--max-time", "60", url]);
+    match bounded_output(&mut command, limit) {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(_) if repo_path.is_some() => {
             Err("couldn't reach the catalog — install the GitHub CLI and run `gh auth login`".to_string())
         }
         Ok(o) => Err(format!("fetch failed (curl exit {})", o.status.code().unwrap_or(-1))),
-        Err(e) => Err(format!("couldn't run curl: {e}")),
+        Err(BoundedOutputError::Limit) => Err(format!("response exceeds {limit} byte limit")),
+        Err(BoundedOutputError::Io(e)) => Err(format!("couldn't run curl: {e}")),
     }
 }
 
@@ -217,7 +365,7 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// empty if the catalog is), Err(reason) if the request itself failed — so the
 /// store can tell "empty" from "unreachable"
 pub fn fetch_index() -> Result<Vec<Entry>, String> {
-    let bytes = fetch_bytes(INDEX_URL)?;
+    let bytes = fetch_bytes(INDEX_URL, MAX_INDEX_BYTES)?;
     Ok(parse_index(&String::from_utf8_lossy(&bytes)))
 }
 
@@ -237,7 +385,8 @@ pub fn install(entry: &Entry, plugins_dir: &Path, temp_dir: &Path) -> Result<Man
     std::fs::create_dir_all(&unpack).map_err(|e| format!("unpack dir: {e}"))?;
 
     // download (authenticated via gh for the private catalog repo, else curl)
-    let bytes = fetch_bytes(&entry.url).map_err(|e| format!("download failed: {e}"))?;
+    let bytes = fetch_bytes(&entry.url, MAX_ARCHIVE_BYTES)
+        .map_err(|e| format!("download failed: {e}"))?;
     std::fs::write(&archive, &bytes).map_err(|e| format!("write archive: {e}"))?;
 
     unpack_archive(&archive, &unpack)?;
@@ -392,6 +541,54 @@ mod tests {
         assert!(!archive_path_is_safe("../plugin.json"));
         assert!(!archive_path_is_safe("plugin/../../outside"));
         assert!(!archive_path_is_safe("/tmp/plugin.json"));
+    }
+
+    #[test]
+    fn archive_metadata_allows_only_files_and_directories() {
+        let tar = b"drwxr-xr-x  0 owner group 0 Jan 1 00:00 plugin/\n-rw-r--r--  0 owner group 2 Jan 1 00:00 plugin/plugin.json\n";
+        assert!(validate_tar_types(tar.to_vec(), 2).is_ok());
+        assert!(validate_tar_types(tar.to_vec(), 1).is_err());
+        assert!(validate_tar_types(b"lrwxrwxrwx link -> ..\n".to_vec(), 1).is_err());
+
+        let zip = b"Archive: plugin.zip\ndrwxr-xr-x  3.0 unx 0 bx stor 21-Jul-26 12:00 plugin/\n-rw-r--r--  3.0 unx 2 tx defN 21-Jul-26 12:00 plugin/plugin.json\n2 files, 2 bytes uncompressed\n";
+        assert!(validate_zipinfo_types(zip.to_vec(), 2).is_ok());
+        assert!(validate_zipinfo_types(zip.to_vec(), 1).is_err());
+        let linked = b"lrwxrwxrwx  3.0 unx 2 bx stor 21-Jul-26 12:00 plugin/escape\n";
+        assert!(validate_zipinfo_types(linked.to_vec(), 1).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_refuses_the_first_byte_over_limit() {
+        assert_eq!(read_bounded(std::io::Cursor::new(b"abc"), 3).unwrap(), b"abc");
+        assert!(matches!(
+            read_bounded(std::io::Cursor::new(b"abcd"), 3),
+            Err(BoundedOutputError::Limit)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs zip and unzip installed"]
+    fn linux_rejects_a_zip_symlink_before_extraction() {
+        let base = temp_subdir("linked");
+        let package = base.join("plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("..", package.join("escape")).unwrap();
+        let status = std::process::Command::new("zip")
+            .current_dir(&base)
+            .args(["-qry", "plugin.zip", "plugin"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unpack = base.join("unpack");
+        std::fs::create_dir(&unpack).unwrap();
+        assert_eq!(
+            unpack_archive(&base.join("plugin.zip"), &unpack),
+            Err("archive contains a link or special file".to_string())
+        );
+        assert!(std::fs::read_dir(&unpack).unwrap().next().is_none());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
