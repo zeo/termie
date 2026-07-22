@@ -905,16 +905,16 @@ fn web_url_is_safe(url: &str) -> bool {
 /// re-checked here so only web links can ever be launched, never a file path
 /// or a custom protocol handler that could start an arbitrary app
 #[cfg(windows)]
-pub fn open_url(url: &str) {
+pub fn open_url(url: &str) -> bool {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
     if !web_url_is_safe(url) {
-        return;
+        return false;
     }
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
     let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
+    let result = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
@@ -922,22 +922,24 @@ pub fn open_url(url: &str) {
             PCWSTR::null(),
             PCWSTR::null(),
             SW_SHOWNORMAL,
-        );
-    }
+        )
+    };
+    result.0 as isize > 32
 }
 
 /// open an http(s) URL in the default browser via xdg-open. the scheme is
 /// re-checked here so only web links can ever be launched
 #[cfg(unix)]
-pub fn open_url(url: &str) {
+pub fn open_url(url: &str) -> bool {
     if !web_url_is_safe(url) {
-        return;
+        return false;
     }
-    let _ = std::process::Command::new("xdg-open")
+    std::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 /// small registry helpers for the default-terminal registration: read and
@@ -2123,7 +2125,7 @@ mod tests {
         kwin_hide_quake_script, kwin_drag_script, kwin_keep_above_script, kwin_quake_script,
         launcher_progress_properties, parse_kde_terminal_snapshot, parse_kwin_drag_snapshot,
         parse_portal_color_scheme, read_limited, read_monitor_line, terminal_list_with_termie,
-        web_url_is_safe, ClipboardRead, MAX_CLIPBOARD_TEXT_BYTES, MAX_DESKTOP_HELPER_OUTPUT_BYTES,
+        web_url_is_safe, open_url, ClipboardRead, MAX_CLIPBOARD_TEXT_BYTES, MAX_DESKTOP_HELPER_OUTPUT_BYTES,
     };
 
     #[test]
@@ -2150,6 +2152,7 @@ mod tests {
         assert!(!web_url_is_safe("https://example.com\nfile:///tmp/nope"));
         assert!(!web_url_is_safe("https://example.com/a b"));
         assert!(!web_url_is_safe("https:\\\\example.com"));
+        assert!(!open_url("file:///tmp/nope"));
     }
 
     #[test]

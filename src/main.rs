@@ -5626,12 +5626,13 @@ impl App {
                         std::thread::spawn(move || {
                             let _ = proxy.send_event(UserEvent::UpdateDownloaded(update::download(&u)));
                         });
-                    } else {
-                        win::open_url(&format!(
-                            "https://github.com/zeo/termie/releases/tag/v{}",
-                            u.version
-                        ));
+                    } else if win::open_url(&format!(
+                        "https://github.com/zeo/termie/releases/tag/v{}",
+                        u.version
+                    )) {
                         self.show_notice(&format!("release page for {} opened", u.version));
+                    } else {
+                        self.show_notice("couldn't open the release page");
                     }
                 }
             }
@@ -10219,7 +10220,9 @@ impl App {
                 // forwarding, so it works inside mouse-reporting apps too)
                 if state == ElementState::Pressed && self.mods.control_key()
                     && let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
-                        win::open_url(&url);
+                        if !win::open_url(&url) {
+                            self.show_notice("couldn't open browser");
+                        }
                         return;
                     }
                 // a click on a plugin dock widget notifies the owning plugin
