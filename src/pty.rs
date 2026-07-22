@@ -6,6 +6,18 @@ use std::thread;
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+const PTY_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const PTY_WRITE_QUEUE_CAP: usize = 64;
+
+fn queue_write(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, bytes: &[u8]) -> bool {
+    for chunk in bytes.chunks(PTY_WRITE_CHUNK_BYTES) {
+        if tx.try_send(chunk.to_vec()).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 fn systemd_scope_tools() -> Option<&'static (PathBuf, PathBuf)> {
     static TOOLS: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
@@ -249,7 +261,7 @@ pub struct Pty {
     // input goes through a dedicated writer thread: a child that stops reading
     // (paused pager, stopped process) fills the ConPTY input pipe, and a direct
     // write_all from the ui thread would freeze the whole window on a big paste
-    writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    writer_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     // reader is parked until start_reader() spawns the output thread; this lets
     // a pane be built off the main thread and only start emitting once registered
@@ -424,7 +436,7 @@ impl Pty {
 
         let reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
-        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE_CAP);
         thread::spawn(move || {
             // exits when the Pty drops (channel closes) or the pipe breaks
             while let Ok(chunk) = writer_rx.recv() {
@@ -481,8 +493,8 @@ impl Pty {
 
     /// queue bytes for the child; the writer thread does the blocking write, so
     /// input order is preserved and the ui thread never blocks on the pipe
-    pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer_tx.send(bytes.to_vec());
+    pub fn write(&mut self, bytes: &[u8]) -> bool {
+        queue_write(&self.writer_tx, bytes)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16, cell_w: u16, cell_h: u16) {
@@ -605,7 +617,7 @@ impl Pty {
     ) -> Pty {
         use std::fs::File;
         let mut writer = File::from(writer);
-        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE_CAP);
         thread::spawn(move || {
             while let Ok(chunk) = writer_rx.recv() {
                 if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
@@ -759,7 +771,7 @@ impl Pty {
     /// a no-op pty for tests: build a Pane without spawning a real shell
     pub(crate) fn null() -> Pty {
         // the receiver is dropped, so writes are discarded without a thread
-        let (writer_tx, _) = std::sync::mpsc::channel();
+        let (writer_tx, _) = std::sync::mpsc::sync_channel(PTY_WRITE_QUEUE_CAP);
         Pty {
             master: Box::new(null_pty::NullMaster),
             writer_tx,
@@ -850,6 +862,14 @@ mod null_pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_queue_is_bounded_and_chunks_input() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        assert!(!queue_write(&tx, &vec![b'x'; PTY_WRITE_CHUNK_BYTES * 3]));
+        assert_eq!(rx.recv().unwrap().len(), PTY_WRITE_CHUNK_BYTES);
+        assert_eq!(rx.recv().unwrap().len(), PTY_WRITE_CHUNK_BYTES);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

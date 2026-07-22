@@ -5501,13 +5501,18 @@ impl App {
 
     /// write already-encoded paste bytes to a pane by id
     fn send_paste_bytes(&mut self, pane: usize, bytes: &[u8]) {
-        if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
+        let queued = if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
             && let Some(p) = find_pane_mut(root, pane)
         {
             // pasting is input: snap a history-scrolled view to the bottom
             p.term.grid.view_offset = 0;
-            p.pty.write(bytes);
+            p.pty.write(bytes)
+        } else {
+            true
+        };
+        if !queued {
+            self.show_notice("pane input queue is full");
         }
     }
 
