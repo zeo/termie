@@ -52,14 +52,19 @@ impl Drop for Sandboxed {
 }
 
 fn bubblewrap() -> io::Result<PathBuf> {
-    let Some(path) = std::env::var_os("PATH") else {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "bubblewrap is not installed"));
-    };
-    for dir in std::env::split_paths(&path) {
-        if !dir.is_absolute() {
-            continue;
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join("bwrap");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
-        let candidate = dir.join("bwrap");
+    }
+    for dir in ["/usr/bin", "/bin"] {
+        let candidate = Path::new(dir).join("bwrap");
         if candidate.is_file() {
             return Ok(candidate);
         }
