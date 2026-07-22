@@ -18,10 +18,6 @@ use std::time::{Duration, Instant};
 use super::json::Json;
 use super::manifest::{id_is_safe, Manifest};
 
-/// the marketplace index URL. a plain JSON catalog (see `Entry`); curated, since
-/// the security model is trust-the-store (subprocess is not a sandbox)
-pub const INDEX_URL: &str =
-    "https://raw.githubusercontent.com/zeo/termie-plugins/main/index.json";
 const MAX_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
@@ -29,12 +25,13 @@ const MAX_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARCHIVE_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
-/// the catalog repo + ref behind the raw URLs above. files under this prefix are
-/// fetched through `gh` (authenticated) so a private catalog works; everything
-/// else falls back to anonymous curl
+/// the catalog repo and ref behind authenticated GitHub CLI fetches
 const CATALOG_REPO: &str = "zeo/termie-plugins";
 const CATALOG_REF: &str = "main";
-const CATALOG_RAW_PREFIX: &str = "https://raw.githubusercontent.com/zeo/termie-plugins/main/";
+
+fn catalog_raw_url(path: &str) -> String {
+    format!("https://raw.githubusercontent.com/{CATALOG_REPO}/{CATALOG_REF}/{path}")
+}
 
 /// one catalog entry from the remote index
 #[derive(Clone, Debug, PartialEq)]
@@ -535,7 +532,8 @@ fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     if !marketplace_url_is_safe(url) {
         return Err("marketplace URL must be an absolute HTTPS URL".to_string());
     }
-    let repo_path = url.strip_prefix(CATALOG_RAW_PREFIX);
+    let catalog_raw_prefix = catalog_raw_url("");
+    let repo_path = url.strip_prefix(&catalog_raw_prefix);
     if let Some(path) = repo_path {
         let api = format!("repos/{CATALOG_REPO}/contents/{path}?ref={CATALOG_REF}");
         let mut command = quiet_command("gh");
@@ -576,7 +574,7 @@ fn read_manifest(path: &Path) -> Result<String, String> {
 /// empty if the catalog is), Err(reason) if the request itself failed — so the
 /// store can tell "empty" from "unreachable"
 pub fn fetch_index() -> Result<Vec<Entry>, String> {
-    let bytes = fetch_bytes(INDEX_URL, MAX_INDEX_BYTES)?;
+    let bytes = fetch_bytes(&catalog_raw_url("index.json"), MAX_INDEX_BYTES)?;
     Ok(parse_index(&String::from_utf8_lossy(&bytes)))
 }
 
@@ -731,6 +729,18 @@ mod tests {
         assert_eq!(e[0].permissions, vec!["write_pty".to_string()]);
         assert_eq!(e[1].id, "relay");
         assert!(e[1].permissions.is_empty());
+    }
+
+    #[test]
+    fn catalog_urls_share_the_named_repository_and_ref() {
+        assert_eq!(
+            catalog_raw_url("index.json"),
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/index.json"
+        );
+        assert_eq!(
+            catalog_raw_url("plugins/pet.zip"),
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/plugins/pet.zip"
+        );
     }
 
     #[test]
