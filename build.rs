@@ -22,6 +22,7 @@ fn main() {
         // doesn't add a second manifest that would clash with the one above.
         println!("cargo:rerun-if-changed=app.rc");
         println!("cargo:rerun-if-changed=assets/icon.ico");
-        embed_resource::compile("app.rc", embed_resource::NONE);
+        #[allow(clippy::let_unit_value)]
+        let _ = embed_resource::compile("app.rc", embed_resource::NONE);
     }
 }
