@@ -690,7 +690,6 @@ fn resolve_shell_cached(kind: ShellKind) -> String {
 fn find_in_path(exe: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
-        #[cfg(windows)]
         if !dir.is_absolute() {
             continue;
         }
