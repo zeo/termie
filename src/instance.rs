@@ -182,8 +182,16 @@ fn linux_peer_is_user(stream: &std::os::unix::net::UnixStream) -> io::Result<boo
 
 #[cfg(target_os = "linux")]
 fn configure_linux_stream(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(LAUNCH_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(LAUNCH_IO_TIMEOUT))
+    configure_linux_stream_with_timeout(stream, LAUNCH_IO_TIMEOUT)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_stream_with_timeout(
+    stream: &std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
 }
 
 #[cfg(target_os = "linux")]
@@ -395,5 +403,18 @@ mod tests {
         configure_linux_stream(&stream).unwrap();
         assert_eq!(stream.read_timeout().unwrap(), Some(LAUNCH_IO_TIMEOUT));
         assert_eq!(stream.write_timeout().unwrap(), Some(LAUNCH_IO_TIMEOUT));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_linux_launch_request_times_out() {
+        use std::time::{Duration, Instant};
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        configure_linux_stream_with_timeout(&reader, Duration::from_millis(25)).unwrap();
+        writer.write_all(&8u32.to_le_bytes()).unwrap();
+        let started = Instant::now();
+        assert!(read_request(&mut reader).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
