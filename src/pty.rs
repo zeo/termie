@@ -690,12 +690,34 @@ fn resolve_shell_cached(kind: ShellKind) -> String {
 fn find_in_path(exe: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
+        #[cfg(windows)]
+        if !dir.is_absolute() {
+            continue;
+        }
         let candidate = dir.join(exe);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn system_executable(exe: &str) -> String {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buf = vec![0; 32_768];
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if len > 0 && len < buf.len() {
+        return PathBuf::from(String::from_utf16_lossy(&buf[..len]))
+            .join(exe)
+            .to_string_lossy()
+            .into_owned();
+    }
+    PathBuf::from(r"C:\Windows\System32")
+        .join(exe)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// resolve a shell kind to an executable path, falling back to whatever is
@@ -706,7 +728,7 @@ fn resolve_shell(kind: ShellKind) -> String {
         find_in_path("pwsh.exe")
             .or_else(|| find_in_path("powershell.exe"))
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "cmd.exe".to_string())
+            .unwrap_or_else(|| system_executable("cmd.exe"))
     };
     match kind {
         ShellKind::Auto => auto(),
@@ -718,10 +740,10 @@ fn resolve_shell(kind: ShellKind) -> String {
             .unwrap_or_else(auto),
         ShellKind::Cmd => find_in_path("cmd.exe")
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "cmd.exe".to_string()),
+            .unwrap_or_else(|| system_executable("cmd.exe")),
         ShellKind::Wsl => find_in_path("wsl.exe")
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "wsl.exe".to_string()),
+            .unwrap_or_else(|| system_executable("wsl.exe")),
         // only reached when a profile vanished from config or has an empty
         // command line; fall back like Auto does — and for the shells that only
         // exist on unix, which a cross-OS session snapshot can still name
