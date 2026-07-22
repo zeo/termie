@@ -5537,6 +5537,7 @@ impl Renderer {
     /// texture so the full chrome (tab strip, buttons, menus, panes) can be
     /// rendered to a PNG without a window. compiled out of release
     #[cfg(any(test, debug_assertions))]
+    #[cfg_attr(all(test, not(debug_assertions)), allow(dead_code))]
     pub fn new_headless(width: u32, height: u32, content_pt: f32, chrome_pt: f32, scale: f32) -> Renderer {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
         desc.backends = wgpu::Backends::all();
