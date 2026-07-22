@@ -26,6 +26,7 @@ const MAX_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARCHIVE_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 /// the catalog repo + ref behind the raw URLs above. files under this prefix are
@@ -240,17 +241,24 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
         return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
     }
     validate_tar_types(kinds.stdout, entries)?;
-    let status = quiet_command("tar")
+    let mut extract = quiet_command("tar");
+    extract
         .env_remove("TAR_OPTIONS")
         .env_remove("TAR_READER_OPTIONS")
         .args(["--no-same-owner", "--no-same-permissions"])
         .arg("-xf")
         .arg(archive)
         .arg("-C")
-        .arg(unpack)
-        .status()
-        .map_err(|e| format!("couldn't run tar: {e}"))?;
-    status.success().then_some(()).ok_or_else(|| format!("unpack failed: status {status:?}"))
+        .arg(unpack);
+    let output = bounded_output(&mut extract, MAX_ARCHIVE_EXTRACT_OUTPUT_BYTES).map_err(|error| match error {
+        BoundedOutputError::Io(error) => format!("couldn't run tar: {error}"),
+        BoundedOutputError::Limit => "archive extraction output exceeds the 64 KiB limit".to_string(),
+    })?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("unpack failed: status {:?}", output.status))
 }
 
 #[cfg(not(windows))]
@@ -277,16 +285,23 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
         return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
     }
     validate_zipinfo_types(kinds.stdout, entries)?;
-    let status = quiet_command("unzip")
+    let mut extract = quiet_command("unzip");
+    extract
         .env_remove("UNZIP")
         .env_remove("UNZIPOPT")
         .arg("-qq")
         .arg(archive)
         .arg("-d")
-        .arg(unpack)
-        .status()
-        .map_err(|e| format!("couldn't run unzip: {e}"))?;
-    status.success().then_some(()).ok_or_else(|| format!("unpack failed: status {status:?}"))
+        .arg(unpack);
+    let output = bounded_output(&mut extract, MAX_ARCHIVE_EXTRACT_OUTPUT_BYTES).map_err(|error| match error {
+        BoundedOutputError::Io(error) => format!("couldn't run unzip: {error}"),
+        BoundedOutputError::Limit => "archive extraction output exceeds the 64 KiB limit".to_string(),
+    })?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("unpack failed: status {:?}", output.status))
 }
 
 fn reject_symlinks(dir: &Path) -> Result<(), String> {

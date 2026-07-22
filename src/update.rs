@@ -17,6 +17,8 @@ const MAX_UPDATE_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_UPDATE_ARCHIVE_ENTRIES: usize = 4096;
 #[cfg(target_os = "linux")]
+const MAX_UPDATE_ARCHIVE_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_UPDATE_INSTALLER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 fn update_curl() -> std::process::Command {
@@ -330,14 +332,17 @@ fn install_linux_archive(
     }
     validate_update_archive_types(kinds.stdout, entries)?;
     let dir = archive.parent().ok_or("invalid update path")?;
-    let status = quiet_command("/bin/tar")
+    let mut extract = quiet_command("/bin/tar");
+    extract
         .args(["--no-same-owner", "--no-same-permissions", "-xzf"])
         .arg(archive)
         .arg("-C")
-        .arg(dir)
-        .status()
-        .map_err(|e| format!("couldn't unpack update: {e}"))?;
-    if !status.success() {
+        .arg(dir);
+    let output = bounded_output(&mut extract, MAX_UPDATE_ARCHIVE_EXTRACT_OUTPUT_BYTES).map_err(|error| match error {
+        BoundedOutputError::Io(error) => format!("couldn't unpack update: {error}"),
+        BoundedOutputError::Limit => "update archive extraction output exceeds the 64 KiB limit".to_string(),
+    })?;
+    if !output.status.success() {
         return Err("couldn't unpack update".into());
     }
     let unpacked = dir.join(root);
