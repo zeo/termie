@@ -357,6 +357,7 @@ pub struct Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         self.writer_queue.close();
+        let _ = self.child.kill();
     }
 }
 
@@ -968,6 +969,57 @@ mod null_pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portable_pty::{ChildKiller, ExitStatus};
+    use std::io::Result as IoResult;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct TrackingChild(Arc<AtomicBool>);
+
+    impl ChildKiller for TrackingChild {
+        fn kill(&mut self) -> IoResult<()> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(TrackingChild(self.0.clone()))
+        }
+    }
+
+    impl Child for TrackingChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn dropping_pty_closes_input_and_terminates_child() {
+        let killed = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(InputQueue::new());
+        let pty = Pty {
+            master: Box::new(null_pty::NullMaster),
+            writer_queue: queue.clone(),
+            child: Box::new(TrackingChild(killed.clone())),
+            reader: None,
+        };
+        drop(pty);
+        assert!(killed.load(Ordering::Acquire));
+        assert!(!queue_write(&queue, b"input"));
+    }
 
     #[test]
     fn writer_queue_rejects_a_full_input_without_queuing_a_prefix() {
