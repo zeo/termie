@@ -51,7 +51,7 @@ microbench = []
 
 [build-dependencies]
 embed-manifest = "1.5.0"
-embed-resource = "2.5"
+embed-resource = "3.0"
 
 [profile.release]
 opt-level = 3
