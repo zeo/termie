@@ -538,15 +538,15 @@ fn remove_msi(product: &str) {
     // survive a successful native install
     let msiexec = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
-        .map(|root| root.join("System32").join("msiexec.exe"));
-    let Some(msiexec) = msiexec.filter(|path| path.is_file()) else {
-        return;
-    };
-    let _ = std::process::Command::new(msiexec)
-        .args(["/x", product, "/qn", "/norestart"])
-        .status();
-    if find_machine_msi().as_deref() == Some(product) {
-        elevated_msiexec_uninstall(product);
+        .map(|root| root.join("System32").join("msiexec.exe"))
+        .filter(|path| path.is_file());
+    if let Some(msiexec) = msiexec.as_ref() {
+        let _ = std::process::Command::new(msiexec)
+            .args(["/x", product, "/qn", "/norestart"])
+            .status();
+        if find_machine_msi().as_deref() == Some(product) {
+            elevated_msiexec_uninstall(product, msiexec);
+        }
     }
     // msiexec can leave the tree or the all-users shortcut when a prior
     // uninstall was interrupted; scrub whatever remains so Search only
@@ -554,14 +554,14 @@ fn remove_msi(product: &str) {
     scrub_machine_msi_leftovers();
 }
 
-fn elevated_msiexec_uninstall(product: &str) {
+fn elevated_msiexec_uninstall(product: &str, msiexec: &Path) {
     use windows::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
     use windows::Win32::Foundation::CloseHandle;
 
-    let file = wide("msiexec.exe");
+    let file = wide(&msiexec.to_string_lossy());
     let params = wide(&format!("/x {product} /qn /norestart"));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
