@@ -23,6 +23,7 @@ pub const INDEX_URL: &str =
 const MAX_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// the catalog repo + ref behind the raw URLs above. files under this prefix are
 /// fetched through `gh` (authenticated) so a private catalog works; everything
@@ -208,24 +209,24 @@ fn validate_zipinfo_types(bytes: Vec<u8>, expected: usize) -> Result<(), String>
 
 #[cfg(windows)]
 fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
-    let listing = quiet_command("tar")
+    let mut listing = quiet_command("tar");
+    listing
         .env_remove("TAR_OPTIONS")
         .env_remove("TAR_READER_OPTIONS")
         .arg("-tf")
-        .arg(archive)
-        .output()
-        .map_err(|e| format!("couldn't inspect archive: {e}"))?;
+        .arg(archive);
+    let listing = bounded_archive_metadata(&mut listing)?;
     if !listing.status.success() {
         return Err(format!("couldn't inspect archive: status {:?}", listing.status));
     }
     let entries = validate_archive_listing(listing.stdout)?;
-    let kinds = quiet_command("tar")
+    let mut kinds = quiet_command("tar");
+    kinds
         .env_remove("TAR_OPTIONS")
         .env_remove("TAR_READER_OPTIONS")
         .arg("-tvf")
-        .arg(archive)
-        .output()
-        .map_err(|e| format!("couldn't inspect archive types: {e}"))?;
+        .arg(archive);
+    let kinds = bounded_archive_metadata(&mut kinds)?;
     if !kinds.status.success() {
         return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
     }
@@ -245,24 +246,24 @@ fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn unpack_archive(archive: &Path, unpack: &Path) -> Result<(), String> {
-    let listing = quiet_command("unzip")
+    let mut listing = quiet_command("unzip");
+    listing
         .env_remove("ZIPINFO")
         .env_remove("ZIPINFOOPT")
         .arg("-Z1")
-        .arg(archive)
-        .output()
-        .map_err(|e| format!("couldn't run unzip: {e}"))?;
+        .arg(archive);
+    let listing = bounded_archive_metadata(&mut listing)?;
     if !listing.status.success() {
         return Err(format!("couldn't inspect archive: status {:?}", listing.status));
     }
     let entries = validate_archive_listing(listing.stdout)?;
-    let kinds = quiet_command("unzip")
+    let mut kinds = quiet_command("unzip");
+    kinds
         .env_remove("ZIPINFO")
         .env_remove("ZIPINFOOPT")
         .args(["-Z", "-s"])
-        .arg(archive)
-        .output()
-        .map_err(|e| format!("couldn't inspect archive types: {e}"))?;
+        .arg(archive);
+    let kinds = bounded_archive_metadata(&mut kinds)?;
     if !kinds.status.success() {
         return Err(format!("couldn't inspect archive types: status {:?}", kinds.status));
     }
@@ -344,6 +345,13 @@ pub(crate) fn bounded_output(command: &mut Command, limit: usize) -> Result<Outp
         .map_err(|_| BoundedOutputError::Io(std::io::Error::other("stderr reader panicked")))?
         .map_err(BoundedOutputError::Io)?;
     Ok(Output { status, stdout, stderr })
+}
+
+fn bounded_archive_metadata(command: &mut Command) -> Result<Output, String> {
+    bounded_output(command, MAX_ARCHIVE_LISTING_BYTES).map_err(|error| match error {
+        BoundedOutputError::Io(error) => format!("couldn't inspect archive: {error}"),
+        BoundedOutputError::Limit => "archive metadata exceeds the 16 MiB limit".to_string(),
+    })
 }
 
 /// fetch raw bytes for a catalog URL. files under the catalog repo go through
@@ -618,6 +626,17 @@ mod tests {
         assert!(matches!(
             read_bounded(std::io::Cursor::new(b"abcd"), 3),
             Err(BoundedOutputError::Limit)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_metadata_output_is_bounded() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 16777217 /dev/zero"]);
+        assert!(matches!(
+            bounded_archive_metadata(&mut command),
+            Err(message) if message == "archive metadata exceeds the 16 MiB limit"
         ));
     }
 
