@@ -276,6 +276,38 @@ fn open_pipe() -> io::Result<std::fs::File> {
 }
 
 #[cfg(windows)]
+struct PipeSecurity(windows::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(self.0.0)));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pipe_security() -> io::Result<PipeSecurity> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+
+    let sddl: Vec<u16> = "D:P(A;;GRGW;;;OW)".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    Ok(PipeSecurity(descriptor))
+}
+
+#[cfg(windows)]
 fn create_pipe(first: bool) -> io::Result<WinPipe> {
     use std::os::windows::io::FromRawHandle;
     use windows::Win32::Storage::FileSystem::{
@@ -285,6 +317,7 @@ fn create_pipe(first: bool) -> io::Result<WinPipe> {
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::core::PCWSTR;
 
     let name: Vec<u16> = pipe_name().encode_utf16().chain(std::iter::once(0)).collect();
@@ -292,6 +325,12 @@ fn create_pipe(first: bool) -> io::Result<WinPipe> {
         PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED
     } else {
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+    };
+    let security = pipe_security()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security.0.0,
+        bInheritHandle: false.into(),
     };
     let handle = unsafe {
         CreateNamedPipeW(
@@ -302,7 +341,7 @@ fn create_pipe(first: bool) -> io::Result<WinPipe> {
             4096,
             4096,
             50,
-            None,
+            Some(&attributes),
         )
     };
     if handle.is_invalid() {
