@@ -3,6 +3,17 @@
 //! windows, XDG/wayland/x11 equivalents on unix, and an honest no-op where
 //! the concept doesn't exist on the other side (UAC, WSL)
 
+#[cfg(not(windows))]
+use crate::plugin::market::{bounded_output, quiet_command};
+
+#[cfg(not(windows))]
+const MAX_DESKTOP_HELPER_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[cfg(not(windows))]
+fn desktop_helper_output(command: &mut std::process::Command) -> Option<std::process::Output> {
+    bounded_output(command, MAX_DESKTOP_HELPER_OUTPUT_BYTES).ok()
+}
+
 /// suppress the OS "application was unable to start correctly" / crash dialogs
 /// for this process and the children it spawns. without this, a pre-warmed pool
 /// pwsh that loses its ConPTY during termie's exit pops a 0xc0000142 dialog.
@@ -86,8 +97,8 @@ fn parse_portal_color_scheme(text: &str) -> Option<bool> {
 
 #[cfg(not(windows))]
 fn system_theme_is_dark() -> Option<bool> {
-    let output = std::process::Command::new("gdbus")
-        .args([
+    let mut command = quiet_command("gdbus");
+    command.args([
             "call",
             "--timeout",
             "2",
@@ -100,9 +111,8 @@ fn system_theme_is_dark() -> Option<bool> {
             "org.freedesktop.portal.Settings.Read",
             "org.freedesktop.appearance",
             "color-scheme",
-        ])
-        .output()
-        .ok()?;
+        ]);
+    let output = desktop_helper_output(&mut command)?;
     output
         .status
         .success()
@@ -111,13 +121,46 @@ fn system_theme_is_dark() -> Option<bool> {
 }
 
 #[cfg(not(windows))]
+fn discard_monitor_line(reader: &mut impl std::io::BufRead) -> std::io::Result<()> {
+    loop {
+        let bytes = reader.fill_buf()?;
+        let Some(newline) = bytes.iter().position(|&byte| byte == b'\n') else {
+            let len = bytes.len();
+            if len == 0 {
+                return Ok(());
+            }
+            reader.consume(len);
+            continue;
+        };
+        reader.consume(newline + 1);
+        return Ok(());
+    }
+}
+
+#[cfg(not(windows))]
+fn read_monitor_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead, Read};
+
+    let mut line = String::new();
+    let mut chunk = reader.by_ref().take(MAX_DESKTOP_HELPER_OUTPUT_BYTES as u64);
+    let read = chunk.read_line(&mut line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if read == MAX_DESKTOP_HELPER_OUTPUT_BYTES && !line.ends_with('\n') {
+        discard_monitor_line(reader)?;
+        line.clear();
+    }
+    Ok(Some(line))
+}
+
+#[cfg(not(windows))]
 pub fn watch_system_theme(on_change: impl Fn(Option<bool>) + Send + 'static) {
     std::thread::spawn(move || {
-        use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         on_change(system_theme_is_dark());
-        let mut command = std::process::Command::new("gdbus");
+        let mut command = quiet_command("gdbus");
         command
             .args([
                 "monitor",
@@ -143,7 +186,8 @@ pub fn watch_system_theme(on_change: impl Fn(Option<bool>) + Send + 'static) {
         let Some(stdout) = child.stdout.take() else {
             return;
         };
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        let mut reader = std::io::BufReader::new(stdout);
+        while let Ok(Some(line)) = read_monitor_line(&mut reader) {
             if line.contains("color-scheme") {
                 on_change(system_theme_is_dark());
             }
@@ -361,8 +405,8 @@ fn load_kwin_script(name: &str, script: &str) -> Option<(u32, std::path::PathBuf
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{name}.js"));
     std::fs::write(&path, script).ok()?;
-    let load = std::process::Command::new("gdbus")
-        .args([
+    let mut command = quiet_command("gdbus");
+    command.args([
             "call",
             "--session",
             "--dest",
@@ -373,9 +417,8 @@ fn load_kwin_script(name: &str, script: &str) -> Option<(u32, std::path::PathBuf
             "org.kde.kwin.Scripting.loadScript",
         ])
         .arg(&path)
-        .arg(name)
-        .output();
-    let id = load.ok().and_then(|output| {
+        .arg(name);
+    let id = desktop_helper_output(&mut command).and_then(|output| {
         let id = output.status.success().then(|| String::from_utf8_lossy(&output.stdout)).and_then(|text| {
             text.split(|c: char| !c.is_ascii_digit() && c != '-')
                 .filter_map(|part| part.parse::<i32>().ok())
@@ -1148,8 +1191,8 @@ fn kde_desktop() -> bool {
 #[cfg(target_os = "linux")]
 fn kde_terminal_value(key: &str) -> Option<String> {
     const MISSING: &str = "termie-kconfig-missing-7a19f20d";
-    let output = std::process::Command::new("kreadconfig6")
-        .args([
+    let mut command = quiet_command("kreadconfig6");
+    command.args([
             "--file",
             "kdeglobals",
             "--group",
@@ -1158,9 +1201,8 @@ fn kde_terminal_value(key: &str) -> Option<String> {
             key,
             "--default",
             MISSING,
-        ])
-        .output()
-        .ok()?;
+        ]);
+    let output = desktop_helper_output(&mut command)?;
     if !output.status.success() {
         return None;
     }
@@ -2043,7 +2085,7 @@ mod tests {
         command_quote, desktop_with_profiles, kde_terminal_snapshot, kwin_hide_quake_script,
         kwin_drag_script, kwin_keep_above_script, kwin_quake_script, launcher_progress_properties,
         parse_kde_terminal_snapshot, parse_kwin_drag_snapshot, parse_portal_color_scheme,
-        read_limited, terminal_list_with_termie,
+        read_limited, read_monitor_line, terminal_list_with_termie, MAX_DESKTOP_HELPER_OUTPUT_BYTES,
     };
 
     #[test]
@@ -2057,6 +2099,17 @@ mod tests {
     fn integration_reader_rejects_the_first_byte_over_limit() {
         assert_eq!(read_limited(std::io::Cursor::new(b"abc"), 3).expect("read"), Some(b"abc".to_vec()));
         assert_eq!(read_limited(std::io::Cursor::new(b"abcd"), 3).expect("read"), None);
+    }
+
+    #[test]
+    fn theme_monitor_discards_oversized_events() {
+        let mut bytes = vec![b'x'; MAX_DESKTOP_HELPER_OUTPUT_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"color-scheme changed\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+        assert_eq!(read_monitor_line(&mut reader).expect("read"), Some(String::new()));
+        let next = read_monitor_line(&mut reader).expect("read").expect("next line");
+        assert!(next.contains("color-scheme"));
     }
 
     #[test]
