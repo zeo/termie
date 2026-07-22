@@ -7,6 +7,11 @@
 use crate::plugin::json::Json;
 
 const VERSION: u32 = 1;
+const MAX_RESTORED_TABS: usize = 64;
+const MAX_RESTORED_PANES: usize = 128;
+const MAX_RESTORED_SHELL_BYTES: usize = 128;
+const MAX_RESTORED_CWD_BYTES: usize = 32 * 1024;
+const MAX_RESTORED_TITLE_BYTES: usize = 1024;
 
 pub struct SessionFile {
     pub active_tab: usize,
@@ -70,11 +75,13 @@ impl SessionFile {
     /// back to a single fresh shell
     pub fn parse(text: &str) -> Option<SessionFile> {
         let v = Json::parse(text)?;
+        let mut panes_left = MAX_RESTORED_PANES;
         let tabs: Vec<TabSnap> = v
             .get("tabs")
             .and_then(Json::as_array)?
             .iter()
-            .filter_map(TabSnap::from_json)
+            .take(MAX_RESTORED_TABS)
+            .filter_map(|tab| TabSnap::from_json(tab, &mut panes_left))
             .collect();
         if tabs.is_empty() {
             return None;
@@ -123,10 +130,16 @@ impl TabSnap {
         Json::Obj(pairs.into_iter().collect())
     }
 
-    fn from_json(v: &Json) -> Option<TabSnap> {
+    fn from_json(v: &Json, panes_left: &mut usize) -> Option<TabSnap> {
         let focused_leaf = v.get("focused_leaf").and_then(Json::as_f64).unwrap_or(0.0) as usize;
-        let root = NodeSnap::from_json(v.get("root")?)?;
-        let title = v.get("title").and_then(Json::as_str).map(str::to_string);
+        let mut remaining = *panes_left;
+        let root = NodeSnap::from_json(v.get("root")?, &mut remaining)?;
+        *panes_left = remaining;
+        let title = v
+            .get("title")
+            .and_then(Json::as_str)
+            .filter(|title| title.len() <= MAX_RESTORED_TITLE_BYTES)
+            .map(str::to_string);
         let color = v
             .get("color")
             .and_then(Json::as_f64)
@@ -160,17 +173,28 @@ impl NodeSnap {
         }
     }
 
-    fn from_json(v: &Json) -> Option<NodeSnap> {
+    fn from_json(v: &Json, panes_left: &mut usize) -> Option<NodeSnap> {
         match v.get_str("kind")? {
-            "leaf" => Some(NodeSnap::Leaf {
-                cwd: v.get("cwd").and_then(Json::as_str).map(str::to_string),
-                shell: v.get_str("shell").unwrap_or("auto").to_string(),
-            }),
+            "leaf" => {
+                *panes_left = panes_left.checked_sub(1)?;
+                Some(NodeSnap::Leaf {
+                    cwd: v
+                        .get("cwd")
+                        .and_then(Json::as_str)
+                        .filter(|cwd| cwd.len() <= MAX_RESTORED_CWD_BYTES)
+                        .map(str::to_string),
+                    shell: v
+                        .get_str("shell")
+                        .filter(|shell| shell.len() <= MAX_RESTORED_SHELL_BYTES)
+                        .unwrap_or("auto")
+                        .to_string(),
+                })
+            }
             "split" => Some(NodeSnap::Split {
                 vertical: v.get_str("dir").unwrap_or("v") == "v",
                 ratio: (v.get("ratio").and_then(Json::as_f64).unwrap_or(0.5) as f32).clamp(0.05, 0.95),
-                a: Box::new(NodeSnap::from_json(v.get("a")?)?),
-                b: Box::new(NodeSnap::from_json(v.get("b")?)?),
+                a: Box::new(NodeSnap::from_json(v.get("a")?, panes_left)?),
+                b: Box::new(NodeSnap::from_json(v.get("b")?, panes_left)?),
             }),
             _ => None,
         }
@@ -252,5 +276,45 @@ mod tests {
         assert!(SessionFile::parse(r#"{"tabs":[]}"#).is_none());
         // a split missing a child is rejected (whole tab dropped -> empty -> None)
         assert!(SessionFile::parse(r#"{"tabs":[{"root":{"kind":"split","dir":"v","ratio":0.5,"a":{"kind":"leaf","shell":"pwsh"}}}]}"#).is_none());
+    }
+
+    #[test]
+    fn caps_restored_tabs_and_panes() {
+        let leaf = r#"{"root":{"kind":"leaf"}}"#;
+        let tabs = std::iter::repeat_n(leaf, MAX_RESTORED_TABS + 1).collect::<Vec<_>>().join(",");
+        let session = SessionFile::parse(&format!(r#"{{"tabs":[{tabs}]}}"#)).expect("parse tabs");
+        assert_eq!(session.tabs.len(), MAX_RESTORED_TABS);
+
+        fn split_tree(depth: usize) -> String {
+            if depth == 0 {
+                return r#"{"kind":"leaf"}"#.to_string();
+            }
+            let child = split_tree(depth - 1);
+            format!(r#"{{"kind":"split","a":{child},"b":{child}}}"#)
+        }
+
+        let root = split_tree(6);
+        let tabs = format!(r#"{{"root":{root}}},{{"root":{root}}},{{"root":{root}}}"#);
+        let session = SessionFile::parse(&format!(r#"{{"tabs":[{tabs}]}}"#)).expect("parse panes");
+        assert_eq!(session.tabs.len(), 2);
+    }
+
+    #[test]
+    fn drops_oversized_optional_session_fields() {
+        let title = "t".repeat(MAX_RESTORED_TITLE_BYTES + 1);
+        let cwd = "c".repeat(MAX_RESTORED_CWD_BYTES + 1);
+        let shell = "s".repeat(MAX_RESTORED_SHELL_BYTES + 1);
+        let text = format!(
+            r#"{{"tabs":[{{"title":"{title}","root":{{"kind":"leaf","cwd":"{cwd}","shell":"{shell}"}}}}]}}"#
+        );
+        let session = SessionFile::parse(&text).expect("parse");
+        assert_eq!(session.tabs[0].title, None);
+        match &session.tabs[0].root {
+            NodeSnap::Leaf { cwd, shell } => {
+                assert_eq!(cwd, &None);
+                assert_eq!(shell, "auto");
+            }
+            _ => panic!("expected leaf"),
+        }
     }
 }
