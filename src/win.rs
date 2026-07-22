@@ -716,7 +716,7 @@ pub fn update_jumplist(tasks: &[(String, String)]) {
     let Some(desktop) = installed_desktop_path(&exe) else {
         return;
     };
-    let Ok(contents) = std::fs::read_to_string(&desktop) else {
+    let Ok(Some(contents)) = read_integration_text(&desktop) else {
         return;
     };
     let updated = desktop_with_profiles(&contents, tasks, &exe.to_string_lossy());
@@ -1033,6 +1033,24 @@ pub fn unregister_defterm() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+const MAX_LINUX_INTEGRATION_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_limited(reader: impl std::io::Read, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn read_integration_text(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    Ok(read_limited(file, MAX_LINUX_INTEGRATION_BYTES)?.and_then(|bytes| String::from_utf8(bytes).ok()))
+}
+
+#[cfg(target_os = "linux")]
 fn terminal_list_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -1069,8 +1087,9 @@ fn xdg_defterm_registered() -> bool {
     let Some(path) = terminal_list_path() else {
         return false;
     };
-    std::fs::read_to_string(path)
+    read_integration_text(&path)
         .ok()
+        .flatten()
         .is_some_and(|contents| {
             contents.lines().map(str::trim).find(|line| {
                 !line.is_empty()
@@ -1087,8 +1106,9 @@ fn set_xdg_default_terminal(enabled: bool) -> bool {
     let Some(path) = terminal_list_path() else {
         return false;
     };
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
+    let contents = match read_integration_text(&path) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => return false,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => return false,
     };
@@ -1238,13 +1258,17 @@ fn save_kde_terminal_snapshot(application: Option<&str>, service: Option<&str>) 
 #[cfg(target_os = "linux")]
 fn restore_kde_default_terminal() -> bool {
     let path = kde_terminal_snapshot_path();
-    let previous = match path.as_ref().map(std::fs::read) {
-        Some(Ok(snapshot)) => {
+    let previous = match path.as_ref().map(|path| {
+        let file = std::fs::File::open(path)?;
+        read_limited(file, MAX_LINUX_INTEGRATION_BYTES)
+    }) {
+        Some(Ok(Some(snapshot))) => {
             let Some(previous) = parse_kde_terminal_snapshot(&snapshot) else {
                 return false;
             };
             previous
         }
+        Some(Ok(None)) => return false,
         Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => return false,
         _ => (None, None),
     };
@@ -2019,7 +2043,7 @@ mod tests {
         command_quote, desktop_with_profiles, kde_terminal_snapshot, kwin_hide_quake_script,
         kwin_drag_script, kwin_keep_above_script, kwin_quake_script, launcher_progress_properties,
         parse_kde_terminal_snapshot, parse_kwin_drag_snapshot, parse_portal_color_scheme,
-        terminal_list_with_termie,
+        read_limited, terminal_list_with_termie,
     };
 
     #[test]
@@ -2027,6 +2051,12 @@ mod tests {
         assert_eq!(parse_portal_color_scheme("(<<uint32 1>>,)"), Some(true));
         assert_eq!(parse_portal_color_scheme("(<uint32 2>,)"), Some(false));
         assert_eq!(parse_portal_color_scheme("(<uint32 0>,)"), None);
+    }
+
+    #[test]
+    fn integration_reader_rejects_the_first_byte_over_limit() {
+        assert_eq!(read_limited(std::io::Cursor::new(b"abc"), 3).expect("read"), Some(b"abc".to_vec()));
+        assert_eq!(read_limited(std::io::Cursor::new(b"abcd"), 3).expect("read"), None);
     }
 
     #[test]
