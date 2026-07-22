@@ -3156,12 +3156,28 @@ fn user_dir(env_name: &str, fallback: &str) -> Option<std::path::PathBuf> {
         .map(|p| p.join("termie"))
 }
 
+#[cfg(windows)]
+fn known_folder(id: &windows::core::GUID) -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()? };
+    let folder = unsafe { path.to_string() }.ok().map(std::path::PathBuf::from);
+    unsafe {
+        CoTaskMemFree(Some(path.0.cast()));
+    }
+    folder
+}
+
 /// termie's per-user configuration directory
 pub fn app_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        let base = std::env::var_os("APPDATA")?;
-        Some(std::path::PathBuf::from(base).join("termie"))
+        use windows::Win32::UI::Shell::FOLDERID_RoamingAppData;
+
+        known_folder(&FOLDERID_RoamingAppData)
+            .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from).filter(|path| path.is_absolute()))
+            .map(|path| path.join("termie"))
     }
     #[cfg(not(windows))]
     {
