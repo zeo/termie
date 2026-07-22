@@ -58,6 +58,7 @@ const MAX_LOCAL_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_PLUGINS: usize = 128;
 const MAX_PENDING_PTY_OUTPUT_EVENTS: usize = 64;
 const MAX_PENDING_PLUGIN_EVENTS: usize = 16;
+const MAX_PENDING_LAUNCH_EVENTS: usize = 16;
 
 struct EventBudget {
     limit: usize,
@@ -164,7 +165,7 @@ enum UserEvent {
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
     /// another ordinary launch joined this process and needs its own window
-    Launch(instance::LaunchRequest),
+    Launch { request: instance::LaunchRequest, _permit: EventPermit },
     #[cfg(target_os = "linux")]
     KwinDragGeometry(win::KwinDragSnapshot),
     /// a default-terminal console session handed to this running instance
@@ -11288,7 +11289,7 @@ impl ApplicationHandler<UserEvent> for App {
                     log::info!("plugin {id} exited");
                 }
             },
-            UserEvent::Launch(request) => self.open_launch_window(event_loop, request),
+            UserEvent::Launch { request, _permit } => self.open_launch_window(event_loop, request),
             #[cfg(target_os = "linux")]
             UserEvent::KwinDragGeometry(snapshot) => self.accept_kwin_drag_geometry(snapshot),
             UserEvent::Market(result) => {
@@ -11999,7 +12000,11 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     if let Some(server) = launch_server {
         let launch_proxy = proxy.clone();
-        server.start(move |request| launch_proxy.send_event(UserEvent::Launch(request)).is_ok());
+        let launch_budget = EventBudget::new(MAX_PENDING_LAUNCH_EVENTS);
+        server.start(move |request| {
+            let permit = launch_budget.acquire();
+            launch_proxy.send_event(UserEvent::Launch { request, _permit: permit }).is_ok()
+        });
     }
     let mut app = App::new(proxy);
     #[cfg(windows)]
