@@ -142,6 +142,12 @@ fn marketplace_url_is_safe(url: &str) -> bool {
     !authority.is_empty() && !authority.contains('@')
 }
 
+fn marketplace_curl() -> Command {
+    let mut command = quiet_command("curl");
+    command.args(["-q", "--globoff", "--proto", "=https", "--proto-redir", "=https"]);
+    command
+}
+
 fn validate_archive_listing(bytes: Vec<u8>) -> Result<usize, String> {
     let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 paths")?;
     let mut entries = 0;
@@ -374,8 +380,8 @@ fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
             Err(BoundedOutputError::Io(e)) => log::warn!("gh unavailable ({e}); trying curl"),
         }
     }
-    let mut command = quiet_command("curl");
-    command.args(["-q", "--globoff", "-fsSL", "--max-time", "60", "--", url]);
+    let mut command = marketplace_curl();
+    command.args(["-fsSL", "--max-time", "60", "--", url]);
     match bounded_output(&mut command, limit) {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(_) if repo_path.is_some() => {
@@ -595,6 +601,29 @@ mod tests {
         ] {
             assert!(!marketplace_url_is_safe(url), "{url:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn marketplace_curl_rejects_non_https_redirects() {
+        let args: Vec<_> = marketplace_curl()
+            .args(["-fsSL", "--", "https://plugins.example/pet.zip"])
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-q",
+                "--globoff",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "-fsSL",
+                "--",
+                "https://plugins.example/pet.zip"
+            ]
+        );
     }
 
     #[test]
