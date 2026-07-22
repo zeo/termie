@@ -447,7 +447,8 @@ fn load_kwin_script(name: &str, script: &str) -> Option<(u32, std::path::PathBuf
 
 #[cfg(target_os = "linux")]
 fn run_kwin_script(id: u32) -> bool {
-    std::process::Command::new("gdbus")
+    let mut command = std::process::Command::new("gdbus");
+    command
         .args([
             "call",
             "--timeout",
@@ -461,14 +462,14 @@ fn run_kwin_script(id: u32) -> bool {
             "org.kde.kwin.Script.run",
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(std::process::Stdio::null());
+    desktop_helper_status(&mut command).is_some_and(|status| status.success())
 }
 
 #[cfg(target_os = "linux")]
 pub fn unload_kwin_script(name: &str) {
-    let _ = std::process::Command::new("gdbus")
+    let mut command = std::process::Command::new("gdbus");
+    command
         .args([
             "call",
             "--timeout",
@@ -483,8 +484,8 @@ pub fn unload_kwin_script(name: &str) {
             name,
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let _ = desktop_helper_status(&mut command);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -555,7 +556,8 @@ fn launcher_progress_properties(state: u8, pct: u8) -> String {
 
 #[cfg(target_os = "linux")]
 fn emit_launcher_update(properties: &str) {
-    let _ = std::process::Command::new("gdbus")
+    let mut command = std::process::Command::new("gdbus");
+    command
         .args([
             "emit",
             "--session",
@@ -568,8 +570,8 @@ fn emit_launcher_update(properties: &str) {
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let _ = desktop_helper_status(&mut command);
 }
 
 #[cfg(target_os = "linux")]
