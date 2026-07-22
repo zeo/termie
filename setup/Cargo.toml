@@ -11,7 +11,7 @@ name = "termie-setup"
 path = "src/main.rs"
 
 [dependencies]
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -31,7 +31,7 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [build-dependencies]
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 embed-manifest = "1.5.0"
 embed-resource = "2.5"
 
