@@ -29,7 +29,7 @@ mod microbench;
 
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -56,6 +56,35 @@ const MAX_WARM_FAILS: usize = 10;
 const MAX_STARTUP_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_PLUGINS: usize = 128;
+const MAX_PENDING_PTY_OUTPUT_EVENTS: usize = 64;
+
+struct PtyOutputBudget {
+    pending: Mutex<usize>,
+    drained: Condvar,
+}
+
+struct PtyOutputPermit {
+    budget: Arc<PtyOutputBudget>,
+}
+
+impl PtyOutputBudget {
+    fn acquire(self: &Arc<Self>) -> PtyOutputPermit {
+        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *pending >= MAX_PENDING_PTY_OUTPUT_EVENTS {
+            pending = self.drained.wait(pending).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *pending += 1;
+        PtyOutputPermit { budget: Arc::clone(self) }
+    }
+}
+
+impl Drop for PtyOutputPermit {
+    fn drop(&mut self) {
+        let mut pending = self.budget.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = pending.saturating_sub(1);
+        self.budget.drained.notify_one();
+    }
+}
 
 type Rect = (f32, f32, f32, f32);
 
@@ -100,7 +129,7 @@ fn satellite_window_attrs(icon: Option<winit::window::Icon>) -> WindowAttributes
 }
 
 enum UserEvent {
-    Pty { id: usize, bytes: Vec<u8> },
+    Pty { id: usize, bytes: Vec<u8>, _permit: PtyOutputPermit },
     Exited { id: usize },
     /// a pool shell finished spawning on a worker thread (None = spawn failed)
     PaneReady(Option<Box<Pane>>),
@@ -4380,9 +4409,14 @@ impl App {
     fn start_reader(&self, pane: &mut Pane) {
         let proxy = self.proxy.clone();
         let id = pane.id;
+        let budget = Arc::new(PtyOutputBudget {
+            pending: Mutex::new(0),
+            drained: Condvar::new(),
+        });
         pane.pty.start_reader(move |msg| match msg {
             PtyMsg::Output(b) => {
-                let _ = proxy.send_event(UserEvent::Pty { id, bytes: b });
+                let permit = budget.acquire();
+                let _ = proxy.send_event(UserEvent::Pty { id, bytes: b, _permit: permit });
             }
             PtyMsg::Exited => {
                 let _ = proxy.send_event(UserEvent::Exited { id });
@@ -10828,7 +10862,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
         match ev {
-            UserEvent::Pty { id, bytes } => {
+            UserEvent::Pty { id, bytes, _permit } => {
                 let mut responses: Option<Vec<u8>> = None;
                 let mut clip: Option<String> = None;
                 let mut color_reqs: Vec<term::ColorReq> = Vec::new();
@@ -11980,6 +12014,24 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_output_backpressure_releases_after_event_handling() {
+        let budget = Arc::new(PtyOutputBudget {
+            pending: Mutex::new(0),
+            drained: Condvar::new(),
+        });
+        let mut permits: Vec<_> = (0..MAX_PENDING_PTY_OUTPUT_EVENTS).map(|_| budget.acquire()).collect();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let waiting_budget = Arc::clone(&budget);
+        let worker = std::thread::spawn(move || {
+            tx.send(waiting_budget.acquire()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(permits.pop());
+        drop(rx.recv_timeout(Duration::from_secs(1)).expect("release one output slot"));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn discovered_plugins_have_a_stable_order() {
