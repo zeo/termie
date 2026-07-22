@@ -49,6 +49,22 @@ impl Proc {
     }
 }
 
+fn discard_line(reader: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let bytes = reader.fill_buf()?;
+        let Some(newline) = bytes.iter().position(|&byte| byte == b'\n') else {
+            let len = bytes.len();
+            if len == 0 {
+                return Ok(());
+            }
+            reader.consume(len);
+            continue;
+        };
+        reader.consume(newline + 1);
+        return Ok(());
+    }
+}
+
 /// a running plugin process. dropping or calling kill() stops it. the App
 /// tracks plugins by their Vec index, so no id is stored here; `id` is only
 /// used to label this plugin's log lines from the reader thread
@@ -138,8 +154,10 @@ impl Plugin {
                     Ok(n) => {
                         if n as u64 >= MAX_LINE_LIMIT && !line.ends_with('\n') {
                             log::warn!("plugin {id}: line exceeds maximum length limit, discarding line");
-                            let mut drop_buf = Vec::new();
-                            let _ = reader.read_until(b'\n', &mut drop_buf);
+                            if discard_line(&mut reader).is_err() {
+                                on_msg(PluginMsg::Exited);
+                                break;
+                            }
                             continue;
                         }
                         if line.trim().is_empty() {
@@ -218,5 +236,14 @@ mod tests {
 
         let second = rx.recv_timeout(Duration::from_millis(500)).expect("recv second");
         assert!(matches!(second, PluginMsg::Exited));
+    }
+
+    #[test]
+    fn discarding_a_line_preserves_the_next_line() {
+        let mut reader = BufReader::new(std::io::Cursor::new(b"discard this\nkeep this\n"));
+        discard_line(&mut reader).expect("discard line");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read next line");
+        assert_eq!(line, "keep this\n");
     }
 }
