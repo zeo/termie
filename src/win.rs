@@ -779,12 +779,15 @@ pub fn update_jumplist(tasks: &[(String, String)]) {
         return;
     }
     if let Some(dir) = desktop.parent() {
-        let _ = std::process::Command::new("update-desktop-database")
-            .arg(dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("update-desktop-database")
+                .arg(dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
     }
 }
 
