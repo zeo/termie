@@ -117,7 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: system deps
         run: |
-          if command -v pkg-config >/dev/null && pkg-config --exists wayland-client xkbcommon x11 && command -v bwrap unzip zip >/dev/null; then
+          if command -v pkg-config >/dev/null && pkg-config --exists wayland-client xkbcommon x11 && command -v bwrap >/dev/null && command -v unzip >/dev/null && command -v zip >/dev/null; then
             exit 0
           fi
           apt_options=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
