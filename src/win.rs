@@ -1258,9 +1258,25 @@ fn write_kde_terminal_value(key: &str, value: Option<&str>) -> bool {
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(std::process::Stdio::null());
+    desktop_helper_status(&mut command).is_some_and(|status| status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_helper_status(command: &mut std::process::Command) -> Option<std::process::ExitStatus> {
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2127,6 +2143,8 @@ pub fn explorer_dir_for(_hwnd: isize) -> Option<String> {
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::desktop_helper_status;
     use super::{
         bounded_clipboard_text, command_quote, desktop_with_profiles, kde_terminal_snapshot,
         kwin_hide_quake_script, kwin_drag_script, kwin_keep_above_script, kwin_quake_script,
@@ -2140,6 +2158,16 @@ mod tests {
         assert_eq!(parse_portal_color_scheme("(<<uint32 1>>,)"), Some(true));
         assert_eq!(parse_portal_color_scheme("(<uint32 2>,)"), Some(false));
         assert_eq!(parse_portal_color_scheme("(<uint32 0>,)"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_helper_status_kills_a_hung_process() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("5");
+        let started = std::time::Instant::now();
+        assert!(desktop_helper_status(&mut command).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[test]
