@@ -1,21 +1,79 @@
 use std::env;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 const PTY_WRITE_CHUNK_BYTES: usize = 64 * 1024;
-const PTY_WRITE_QUEUE_CAP: usize = 64;
+const MAX_PTY_WRITE_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PTY_WRITE_QUEUE_ITEMS: usize = 64;
 
-fn queue_write(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, bytes: &[u8]) -> bool {
-    for chunk in bytes.chunks(PTY_WRITE_CHUNK_BYTES) {
-        if tx.try_send(chunk.to_vec()).is_err() {
-            return false;
+struct InputQueue {
+    state: Mutex<InputQueueState>,
+    ready: Condvar,
+}
+
+struct InputQueueState {
+    pending: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl InputQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InputQueueState {
+                pending: std::collections::VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
         }
     }
-    true
+
+    fn try_push(&self, bytes: &[u8]) -> bool {
+        if bytes.len() > MAX_PTY_WRITE_QUEUE_BYTES {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed
+            || state.pending.len() == MAX_PTY_WRITE_QUEUE_ITEMS
+            || state.bytes > MAX_PTY_WRITE_QUEUE_BYTES - bytes.len()
+        {
+            return false;
+        }
+        state.bytes += bytes.len();
+        state.pending.push_back(bytes.to_vec());
+        self.ready.notify_one();
+        true
+    }
+
+    fn pop(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(bytes) = state.pending.pop_front() {
+                state.bytes -= bytes.len();
+                return Some(bytes);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        self.ready.notify_one();
+    }
+}
+
+fn queue_write(queue: &InputQueue, bytes: &[u8]) -> bool {
+    queue.try_push(bytes)
 }
 
 #[cfg(target_os = "linux")]
@@ -261,11 +319,17 @@ pub struct Pty {
     // input goes through a dedicated writer thread: a child that stops reading
     // (paused pager, stopped process) fills the ConPTY input pipe, and a direct
     // write_all from the ui thread would freeze the whole window on a big paste
-    writer_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    writer_queue: Arc<InputQueue>,
     child: Box<dyn Child + Send + Sync>,
     // reader is parked until start_reader() spawns the output thread; this lets
     // a pane be built off the main thread and only start emitting once registered
     reader: Option<Box<dyn std::io::Read + Send>>,
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        self.writer_queue.close();
+    }
 }
 
 impl Pty {
@@ -436,11 +500,13 @@ impl Pty {
 
         let reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
-        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE_CAP);
+        let writer_queue = Arc::new(InputQueue::new());
+        let writer_work = Arc::clone(&writer_queue);
         thread::spawn(move || {
-            // exits when the Pty drops (channel closes) or the pipe breaks
-            while let Ok(chunk) = writer_rx.recv() {
-                if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+            // exits when the pty drops or the pipe breaks
+            while let Some(bytes) = writer_work.pop() {
+                let wrote = bytes.chunks(PTY_WRITE_CHUNK_BYTES).all(|chunk| writer.write_all(chunk).is_ok());
+                if !wrote || writer.flush().is_err() {
                     break;
                 }
             }
@@ -448,7 +514,7 @@ impl Pty {
 
         Ok(Pty {
             master: pair.master,
-            writer_tx,
+            writer_queue,
             child,
             reader: Some(reader),
         })
@@ -494,7 +560,7 @@ impl Pty {
     /// queue bytes for the child; the writer thread does the blocking write, so
     /// input order is preserved and the ui thread never blocks on the pipe
     pub fn write(&mut self, bytes: &[u8]) -> bool {
-        queue_write(&self.writer_tx, bytes)
+        queue_write(&self.writer_queue, bytes)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16, cell_w: u16, cell_h: u16) {
@@ -617,17 +683,19 @@ impl Pty {
     ) -> Pty {
         use std::fs::File;
         let mut writer = File::from(writer);
-        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE_CAP);
+        let writer_queue = Arc::new(InputQueue::new());
+        let writer_work = Arc::clone(&writer_queue);
         thread::spawn(move || {
-            while let Ok(chunk) = writer_rx.recv() {
-                if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+            while let Some(bytes) = writer_work.pop() {
+                let wrote = bytes.chunks(PTY_WRITE_CHUNK_BYTES).all(|chunk| writer.write_all(chunk).is_ok());
+                if !wrote || writer.flush().is_err() {
                     break;
                 }
             }
         });
         Pty {
             master: Box::new(handoff_pty::HandoffMaster::new(signal, reference, server)),
-            writer_tx,
+            writer_queue,
             child: Box::new(handoff_pty::HandoffChild::new(client)),
             reader: Some(Box::new(File::from(reader))),
         }
@@ -770,11 +838,10 @@ mod handoff_pty {
 impl Pty {
     /// a no-op pty for tests: build a Pane without spawning a real shell
     pub(crate) fn null() -> Pty {
-        // the receiver is dropped, so writes are discarded without a thread
-        let (writer_tx, _) = std::sync::mpsc::sync_channel(PTY_WRITE_QUEUE_CAP);
+        let writer_queue = Arc::new(InputQueue::new());
         Pty {
             master: Box::new(null_pty::NullMaster),
-            writer_tx,
+            writer_queue,
             child: Box::new(null_pty::NullChild),
             reader: None,
         }
@@ -864,11 +931,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn writer_queue_is_bounded_and_chunks_input() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(2);
-        assert!(!queue_write(&tx, &vec![b'x'; PTY_WRITE_CHUNK_BYTES * 3]));
-        assert_eq!(rx.recv().unwrap().len(), PTY_WRITE_CHUNK_BYTES);
-        assert_eq!(rx.recv().unwrap().len(), PTY_WRITE_CHUNK_BYTES);
+    fn writer_queue_rejects_a_full_input_without_queuing_a_prefix() {
+        let queue = InputQueue::new();
+        let input = vec![b'x'; MAX_PTY_WRITE_QUEUE_BYTES];
+        assert!(queue_write(&queue, &input));
+        assert!(!queue_write(&queue, b"y"));
+        assert_eq!(queue.pop(), Some(input));
+        queue.close();
+        assert_eq!(queue.pop(), None);
     }
 
     #[cfg(target_os = "linux")]
