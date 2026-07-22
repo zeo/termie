@@ -81,7 +81,7 @@ jobs:
           Copy-Item setup\target\release\termie-setup.exe "dist\termie-$ver-setup.exe"
 
       - name: attach to the release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             dist/termie-*-setup.exe
@@ -142,7 +142,7 @@ jobs:
           install -m755 packaging/linux/install.sh packaging/linux/uninstall.sh "dist/$root/"
           tar -C dist -czf "dist/$root.tar.gz" "$root"
       - name: attach to the release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: dist/termie-*-linux-x86_64.tar.gz
           fail_on_unmatched_files: true
