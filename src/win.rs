@@ -448,6 +448,8 @@ fn run_kwin_script(id: u32) -> bool {
     std::process::Command::new("gdbus")
         .args([
             "call",
+            "--timeout",
+            "2",
             "--session",
             "--dest",
             "org.kde.KWin",
@@ -467,6 +469,8 @@ pub fn unload_kwin_script(name: &str) {
     let _ = std::process::Command::new("gdbus")
         .args([
             "call",
+            "--timeout",
+            "2",
             "--session",
             "--dest",
             "org.kde.KWin",
