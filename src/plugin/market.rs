@@ -23,6 +23,7 @@ pub const INDEX_URL: &str =
 const MAX_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// the catalog repo + ref behind the raw URLs above. files under this prefix are
 /// fetched through `gh` (authenticated) so a private catalog works; everything
 /// else falls back to anonymous curl
@@ -378,6 +379,18 @@ fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     }
 }
 
+fn read_manifest(path: &Path) -> Result<String, String> {
+    let manifest_bytes = read_bounded(
+        std::fs::File::open(path).map_err(|e| format!("manifest: {e}"))?,
+        MAX_MANIFEST_BYTES,
+    )
+    .map_err(|error| match error {
+        BoundedOutputError::Io(error) => format!("manifest: {error}"),
+        BoundedOutputError::Limit => format!("manifest exceeds the {} KiB limit", MAX_MANIFEST_BYTES / 1024),
+    })?;
+    String::from_utf8(manifest_bytes).map_err(|_| "manifest is not UTF-8".to_string())
+}
+
 /// fetch + parse the catalog index. Ok(entries) on a successful fetch (possibly
 /// empty if the catalog is), Err(reason) if the request itself failed — so the
 /// store can tell "empty" from "unreachable"
@@ -412,7 +425,7 @@ pub fn install(entry: &Entry, plugins_dir: &Path, temp_dir: &Path) -> Result<Man
     // the archive may wrap its files in a top dir; find the dir containing
     // plugin.json (the archive root or exactly one nested dir)
     let root = find_manifest_root(&unpack).ok_or("archive has no plugin.json")?;
-    let text = std::fs::read_to_string(root.join("plugin.json")).map_err(|e| format!("manifest: {e}"))?;
+    let text = read_manifest(&root.join("plugin.json"))?;
     let manifest = Manifest::parse(&text, &entry.id)
         .ok_or_else(|| format!("manifest invalid or id != {:?}", entry.id))?;
 
@@ -606,6 +619,18 @@ mod tests {
             read_bounded(std::io::Cursor::new(b"abcd"), 3),
             Err(BoundedOutputError::Limit)
         ));
+    }
+
+    #[test]
+    fn manifest_reader_rejects_oversized_files() {
+        let base = temp_subdir("manifest-size");
+        let manifest = base.join("plugin.json");
+        std::fs::write(&manifest, vec![b'x'; MAX_MANIFEST_BYTES + 1]).unwrap();
+        assert_eq!(
+            read_manifest(&manifest),
+            Err("manifest exceeds the 64 KiB limit".to_string())
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(target_os = "linux")]
