@@ -274,17 +274,35 @@ fn close_all(handles: &[HANDLE]) {
     }
 }
 
-/// build a command line: the quoted program followed by quoted args
+fn push_quoted_arg(line: &mut String, arg: &str) {
+    line.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                line.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                line.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                line.extend(std::iter::repeat_n('\\', backslashes));
+                line.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    line.extend(std::iter::repeat_n('\\', backslashes * 2));
+    line.push('"');
+}
+
+/// build a command line that the C runtime parses back into the original argv
 fn build_cmdline(program: &Path, args: &[String]) -> Vec<u16> {
     let mut s = String::new();
-    s.push('"');
-    s.push_str(&program.to_string_lossy());
-    s.push('"');
+    push_quoted_arg(&mut s, &program.to_string_lossy());
     for a in args {
         s.push(' ');
-        s.push('"');
-        s.push_str(&a.replace('"', "\\\""));
-        s.push('"');
+        push_quoted_arg(&mut s, a);
     }
     wide(&s)
 }
@@ -328,9 +346,12 @@ mod tests {
 
     #[test]
     fn cmdline_quotes_program_and_args() {
-        let line = build_cmdline(Path::new("C:\\a b\\p.exe"), &["--x".into(), "y z".into()]);
+        let line = build_cmdline(
+            Path::new("C:\\a b\\p.exe"),
+            &["--x".into(), "y z".into(), "quote\"here".into(), "tail\\".into()],
+        );
         let s = String::from_utf16(&line[..line.len() - 1]).unwrap();
-        assert_eq!(s, "\"C:\\a b\\p.exe\" \"--x\" \"y z\"");
+        assert_eq!(s, "\"C:\\a b\\p.exe\" \"--x\" \"y z\" \"quote\\\"here\" \"tail\\\\\"");
     }
 
     // a real end-to-end launch: confirms a spawned child's token actually reports
