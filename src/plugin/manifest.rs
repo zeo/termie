@@ -4,6 +4,7 @@
 //! plugins directory (no `..`, no separators, no absolute paths)
 
 use super::json::Json;
+use std::path::{Component, Path};
 
 /// a validated plugin manifest. construct via `parse`, which rejects anything
 /// unsafe or malformed rather than producing a half-valid value
@@ -37,6 +38,22 @@ pub fn id_is_safe(id: &str) -> bool {
 /// manifest are dropped (not an error) so future permissions degrade gracefully
 pub const KNOWN_PERMISSIONS: &[&str] = &["read_output", "write_pty", "network"];
 
+fn entry_command_is_safe(cmd: &str) -> bool {
+    let path = Path::new(cmd);
+    if path.is_absolute() {
+        return true;
+    }
+    let mut has_name = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_name = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    has_name
+}
+
 impl Manifest {
     /// parse + validate a manifest from `plugin.json` text. `dir_name` is the
     /// containing directory's name, used as the id fallback and cross-checked
@@ -59,7 +76,7 @@ impl Manifest {
 
         let entry = json.get("entry")?;
         let cmd = entry.get_str("cmd")?.to_string();
-        if cmd.is_empty() {
+        if !entry_command_is_safe(&cmd) {
             return None;
         }
         let args = entry
@@ -146,5 +163,17 @@ mod tests {
     fn requires_entry_cmd() {
         assert!(Manifest::parse(r#"{"id":"p"}"#, "p").is_none());
         assert!(Manifest::parse(r#"{"id":"p","entry":{}}"#, "p").is_none());
+    }
+
+    #[test]
+    fn relative_entry_command_cannot_escape_its_plugin_directory() {
+        for cmd in ["../outside", "bin/../../outside", ".", "./"] {
+            let text = format!(r#"{{"id":"pet","entry":{{"cmd":"{cmd}"}}}}"#);
+            assert!(Manifest::parse(&text, "pet").is_none(), "{cmd:?} should be rejected");
+        }
+        for cmd in ["pet.exe", "bin/pet", "./bin/pet"] {
+            let text = format!(r#"{{"id":"pet","entry":{{"cmd":"{cmd}"}}}}"#);
+            assert!(Manifest::parse(&text, "pet").is_some(), "{cmd:?} should be accepted");
+        }
     }
 }
