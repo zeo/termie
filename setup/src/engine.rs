@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW,
@@ -14,8 +14,9 @@ use windows::Win32::System::Registry::{
     KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE,
     REG_SZ, REG_VALUE_TYPE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+use windows::Win32::UI::{
+    Shell::{FOLDERID_Desktop, FOLDERID_LocalAppData, FOLDERID_Programs, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+    WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE},
 };
 
 use crate::payload;
@@ -46,9 +47,26 @@ fn system_executable(name: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len])).join(name))
 }
 
+fn known_folder(id: &GUID) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+
+    let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()? };
+    let folder = unsafe { path.to_string() }.ok().map(PathBuf::from);
+    unsafe {
+        CoTaskMemFree(Some(path.0.cast()));
+    }
+    folder
+}
+
+fn env_folder(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
 pub fn install_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
-    PathBuf::from(base).join("Programs").join("termie")
+    let base = known_folder(&FOLDERID_LocalAppData)
+        .or_else(|| env_folder("LOCALAPPDATA"))
+        .expect("LocalAppData");
+    base.join("Programs").join("termie")
 }
 
 pub fn exe_path() -> PathBuf {
@@ -324,15 +342,16 @@ fn remove_from_path(dir: &Path) {
 // ---- shortcuts ---------------------------------------------------------------
 
 fn start_menu_lnk() -> PathBuf {
-    let base = std::env::var_os("APPDATA").expect("APPDATA");
-    PathBuf::from(base)
-        .join("Microsoft\\Windows\\Start Menu\\Programs")
-        .join("termie.lnk")
+    let base = known_folder(&FOLDERID_Programs)
+        .or_else(|| env_folder("APPDATA").map(|path| path.join("Microsoft\\Windows\\Start Menu\\Programs")))
+        .expect("Programs");
+    base.join("termie.lnk")
 }
 
 fn desktop_lnk() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")?;
-    Some(PathBuf::from(home).join("Desktop").join("termie.lnk"))
+    known_folder(&FOLDERID_Desktop)
+        .or_else(|| env_folder("USERPROFILE").map(|path| path.join("Desktop")))
+        .map(|path| path.join("termie.lnk"))
 }
 
 fn write_shortcut(lnk: &Path, target: &Path, workdir: &Path) -> Result<(), String> {
