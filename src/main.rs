@@ -27,6 +27,8 @@ mod uiview;
 #[cfg(feature = "microbench")]
 mod microbench;
 
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,8 +53,20 @@ const POOL_TARGET: usize = 3;
 /// stop respawning after this many consecutive shell-spawn failures so a broken
 /// shell can't peg a CPU core; the window then stays up (logged) instead
 const MAX_WARM_FAILS: usize = 10;
+const MAX_STARTUP_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_LOCAL_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 
 type Rect = (f32, f32, f32, f32);
+
+fn read_text(reader: impl Read, limit: usize) -> Option<String> {
+    let mut text = String::new();
+    reader.take(limit as u64 + 1).read_to_string(&mut text).ok()?;
+    (text.len() <= limit).then_some(text)
+}
+
+fn read_text_file(path: &Path, limit: usize) -> Option<String> {
+    read_text(std::fs::File::open(path).ok()?, limit)
+}
 
 fn wheel_uses_local_scrollback(using_alt: bool, has_scrollback: bool) -> bool {
     !using_alt || has_scrollback
@@ -965,7 +979,7 @@ fn load_color_overrides() -> Vec<(String, color::Rgb)> {
         return out;
     };
     let path = dir.join("colors.conf");
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_text_file(&path, MAX_STARTUP_TEXT_BYTES) else {
         return out;
     };
     for line in text.lines() {
@@ -1438,7 +1452,7 @@ fn load_keybindings() -> (Vec<(ModifiersState, Key, PaletteAction)>, Vec<String>
         return (out, sends, 0);
     };
     let path = dir.join("keybindings.conf");
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_text_file(&path, MAX_STARTUP_TEXT_BYTES) else {
         return (out, sends, 0);
     };
     let ignored = apply_keybindings_conf(&text, &mut out, &mut sends);
@@ -1499,7 +1513,6 @@ fn write_keybindings_template_if_absent() {
 /// reads at most a few hundred bytes of .git/HEAD and caps the walk depth so a
 /// hostile cwd / oversized HEAD can't hang or OOM the UI thread
 fn git_branch(cwd: Option<&str>) -> Option<String> {
-    use std::io::Read;
     let mut dir = std::path::PathBuf::from(cwd_path(cwd)?);
     for _ in 0..64 {
         let head = dir.join(".git").join("HEAD");
@@ -1847,7 +1860,7 @@ fn discover_plugins() -> Vec<Discovered> {
         let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Ok(text) = std::fs::read_to_string(dir.join("plugin.json")) else {
+        let Some(text) = read_text_file(&dir.join("plugin.json"), MAX_LOCAL_PLUGIN_MANIFEST_BYTES) else {
             continue;
         };
         let Some(manifest) = plugin::Manifest::parse(&text, dir_name) else {
@@ -3245,7 +3258,7 @@ fn load_plugin_states() -> std::collections::HashMap<String, PluginState> {
     let Some(path) = plugins_cfg_path() else {
         return map;
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_text_file(&path, MAX_STARTUP_TEXT_BYTES) else {
         return map;
     };
     for line in text.lines() {
@@ -3432,7 +3445,7 @@ fn load_persisted() -> Persisted {
     let Some(path) = config_path() else {
         return Persisted::default();
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_text_file(&path, MAX_STARTUP_TEXT_BYTES) else {
         return Persisted::default();
     };
     parse_persisted(&text)
@@ -4083,7 +4096,7 @@ impl App {
         // tab tree is restored below
         let restored = if self.config.restore_on_launch {
             session_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| read_text_file(&p, MAX_STARTUP_TEXT_BYTES))
                 .and_then(|t| session::SessionFile::parse(&t))
         } else {
             None
@@ -4164,8 +4177,8 @@ impl App {
             window.set_blur(true);
         }
         if let Some(path) = self.cli.drive.clone() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
+            match read_text_file(Path::new(&path), MAX_STARTUP_TEXT_BYTES) {
+                Some(text) => {
                     let steps = parse_drive_script(&text);
                     if steps.is_empty() {
                         log::warn!("--drive: no runnable steps in {path}");
@@ -4178,7 +4191,7 @@ impl App {
                         self.pw.focused = true;
                     }
                 }
-                Err(e) => log::warn!("--drive: couldn't read {path}: {e}"),
+                None => log::warn!("--drive: couldn't read {path}"),
             }
         }
 
@@ -11927,6 +11940,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_reader_refuses_the_first_byte_over_limit() {
+        assert_eq!(read_text(std::io::Cursor::new(b"abc"), 3), Some("abc".to_string()));
+        assert_eq!(read_text(std::io::Cursor::new(b"abcd"), 3), None);
+    }
 
     #[test]
     fn wheel_prefers_an_alternate_screens_existing_scrollback() {
