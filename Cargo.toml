@@ -15,7 +15,7 @@ rust-version = "1.89"
 accesskit = "0.24"
 accesskit_winit = "0.33"
 anyhow = "1.0.103"
-bytemuck = { version = "1.25.0", features = ["derive"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
 cosmic-text = { version = "0.19.0", default-features = false, features = ["std", "swash"] }
 log = "0.4.30"
 png = "0.18"
@@ -42,7 +42,7 @@ copypasta = "0.10.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # direct access to the portal connection already carried by accesskit
-zbus = { version = "5.17.0", default-features = false, features = ["async-io", "blocking-api"] }
+zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [features]
 # private cpu microbenchmark harness (`--microbench`); compiled out by default so
@@ -51,7 +51,7 @@ microbench = []
 
 [build-dependencies]
 embed-manifest = "1.5.0"
-embed-resource = "2.5"
+embed-resource = "3.0"
 
 [profile.release]
 opt-level = 3

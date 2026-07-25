@@ -15,7 +15,7 @@ fn main() {
     let icon = Path::new("../assets/icon.ico");
     if icon.exists() {
         println!("cargo:rerun-if-changed=../assets/icon.ico");
-        embed_resource::compile_for_everything("icon.rc", embed_resource::NONE);
+        let _ = embed_resource::compile_for_everything("icon.rc", embed_resource::NONE);
     }
 
     println!("cargo:rerun-if-env-changed=TERMIE_PAYLOAD_DIR");
