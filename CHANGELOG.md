@@ -3,6 +3,8 @@
 ## 0.5.0 - 2026-07-18
 
 ### Interface
+- **Locations can be bookmarked.** Save or remove the focused directory from the command palette or a tab's context menu. Every bookmark becomes a fuzzy-searchable `open bookmark` action and persists in the user config.
+- **The font picker only offers terminal-ready faces.** Symbol fonts, style-only families, missing ASCII faces, fallback impostors, and broken fixed-width metrics stay out of the list. A live specimen strip makes `0O`, `1l`, brackets, and operators easy to judge before committing.
 - **Screen readers can operate the title bar.** The accessibility tree now includes the live tab list, new-tab controls, pane splits, pane mode, settings, minimize, maximize, and close. Tabs keep stable identities while they reorder or move between windows, and every exposed control runs through the same action path as a click.
 - **Drag handles explain themselves on hover.** Tabs now show a grab cursor and a responsive status hint for reordering, moving between windows, and pulling out into a new window. Hovering the app badge explains that it merges the complete tab set into another Termie window, with shorter copy when space is tight.
 - **Drag a complete Termie window into another.** The app badge is now a grab handle for the window's live tab set. Drop it on another Termie tab strip to merge every tab in order, keep the moved active tab selected, focus the receiver, and close the emptied source. The neighboring wordmark still moves the OS window normally.

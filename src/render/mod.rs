@@ -212,8 +212,16 @@ pub struct PaneMenuView {
 pub const PANE_MENU_ITEMS: [&str; 6] =
     ["copy", "split vertical", "split horizontal", "pop out to window", "close pane", "paste"];
 
-pub const TAB_MENU_ITEMS: [&str; 7] =
-    ["rename", "duplicate", "color", "move left", "move right", "close", "close others"];
+pub const TAB_MENU_ITEMS: [&str; 8] = [
+    "rename",
+    "duplicate",
+    "bookmark location",
+    "color",
+    "move left",
+    "move right",
+    "close",
+    "close others",
+];
 
 /// rows of the per-tab color menu; index n > 0 is ansi palette color n
 pub const TAB_COLOR_ITEMS: [&str; 7] = ["none", "red", "green", "yellow", "blue", "magenta", "cyan"];
@@ -1294,7 +1302,7 @@ impl Renderer {
         surface: Option<wgpu::Surface<'static>>,
         format: wgpu::TextureFormat,
         config: wgpu::SurfaceConfiguration,
-        atlas: GlyphAtlas,
+        mut atlas: GlyphAtlas,
         scale: f32,
         content_pt: f32,
         chrome_pt: f32,
@@ -1302,7 +1310,7 @@ impl Renderer {
     ) -> Renderer {
         // the bundled default plus any common monospace families present on the
         // system (initially just the bundled one — system fonts load lazily)
-        let fonts = Self::detect_fonts(&atlas);
+        let fonts = Self::detect_fonts(&mut atlas);
 
         let GpuResources {
             uniform_buffer,
@@ -1946,12 +1954,12 @@ impl Renderer {
 
     /// every installed monospace family, for the font picker (empty until the
     /// system-font scan has run)
-    pub fn monospace_families(&self) -> Vec<String> {
+    pub fn monospace_families(&mut self) -> Vec<String> {
         self.atlas.monospace_families()
     }
 
     /// the bundled default plus any common monospace families present in the db
-    fn detect_fonts(atlas: &GlyphAtlas) -> Vec<&'static str> {
+    fn detect_fonts(atlas: &mut GlyphAtlas) -> Vec<&'static str> {
         let mut fonts: Vec<&'static str> = vec![atlas.content_family()];
         for cand in [
             "Cascadia Code",
@@ -1961,7 +1969,10 @@ impl Renderer {
             "Lucida Console",
             "Courier New",
         ] {
-            if !fonts.iter().any(|f| f.eq_ignore_ascii_case(cand)) && atlas.has_family(cand) {
+            if !fonts.iter().any(|f| f.eq_ignore_ascii_case(cand))
+                && atlas.has_family(cand)
+                && atlas.terminal_ready_family(cand)
+            {
                 fonts.push(cand);
             }
         }
@@ -1986,7 +1997,7 @@ impl Renderer {
         // newly loaded fallback font, so drop those tofu entries
         self.atlas.invalidate_missing();
         let cur = self.fonts[self.font_idx];
-        self.fonts = Self::detect_fonts(&self.atlas);
+        self.fonts = Self::detect_fonts(&mut self.atlas);
         self.font_idx = self.fonts.iter().position(|f| *f == cur).unwrap_or(0);
         true
     }
@@ -4733,7 +4744,8 @@ impl Renderer {
         let bx = ((w - bw) / 2.0).round();
         let by = (self.title_bar_h + 70.0 * s).round();
         let row_h = chrome_h + 14.0 * s;
-        let rows = items.len().max(1) as f32 + 1.0;
+        let font_preview = pv.scope == "fonts";
+        let rows = items.len().max(1) as f32 + 1.0 + f32::from(font_preview);
         let bh = row_h * rows + 8.0 * s;
         // remember the box + row pitch + window offset so clicks can land on
         // entries and resolve to absolute list indices
@@ -4767,6 +4779,26 @@ impl Renderer {
             let ty = (ry + (row_h - chrome_h) / 2.0).round();
             let col = if is_sel { PAPER } else { TEXT_2 };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, lbl, col, 1.0, track);
+        }
+        if font_preview {
+            let py = by + row_h * (items.len().max(1) as f32 + 1.0);
+            Self::push_rect(out, bx, py, bw, hair, RULE_2, 1.0);
+            let sample = "Aa  0O  1l  {} []  -> !=";
+            let sample_w = self.text_w(FontId::Content, sample, 0.0);
+            let content_h = self.atlas.metrics(FontId::Content).cell_h;
+            let sx = (bx + (bw - sample_w) / 2.0).round();
+            let sy = (py + (row_h - content_h) / 2.0).round();
+            let _ = Self::draw_text(
+                &mut self.atlas,
+                out,
+                FontId::Content,
+                sx,
+                sy,
+                sample,
+                PAPER,
+                1.0,
+                0.0,
+            );
         }
         // more rows exist above/below the window: a dim count in the box corner
         if total > items.len() {

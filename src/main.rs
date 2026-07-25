@@ -469,6 +469,10 @@ fn sel_view_span(g: &grid::Grid, s: &Sel) -> Option<render::SelSpan> {
 enum PaletteAction {
     NewTab,
     NewTabHere,
+    /// save or remove the focused pane's working directory
+    ToggleBookmark,
+    /// open a saved working directory in a new tab
+    OpenBookmark(usize),
     /// new tab with the focused pane's shell and cwd (Windows Terminal's Ctrl+Shift+D)
     DuplicateTab,
     NewShell(ShellKind),
@@ -548,6 +552,7 @@ enum PaletteAction {
 const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("new tab", PaletteAction::NewTab),
     ("new tab here", PaletteAction::NewTabHere),
+    ("bookmark current location", PaletteAction::ToggleBookmark),
     ("duplicate tab", PaletteAction::DuplicateTab),
     ("new tab: pwsh", PaletteAction::NewShell(ShellKind::Pwsh)),
     #[cfg(windows)]
@@ -686,6 +691,39 @@ const MAX_CUSTOM_PROFILES: usize = 128;
 const MAX_PROFILE_ENV: usize = 64;
 const MAX_PROFILE_RAW_LINES: usize = 8192;
 const MAX_SHELL_THEMES: usize = 256;
+const MAX_BOOKMARKS: usize = 64;
+
+fn location_key(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let mut key = path.replace('\\', "/").to_ascii_lowercase();
+        while key.ends_with('/') && key.len() > 1 && !(key.len() == 3 && key.as_bytes()[1] == b':') {
+            key.pop();
+        }
+        key
+    }
+    #[cfg(not(windows))]
+    {
+        let mut key = path.to_string();
+        while key.ends_with('/') && key.len() > 1 {
+            key.pop();
+        }
+        key
+    }
+}
+
+fn same_location(a: &str, b: &str) -> bool {
+    location_key(a) == location_key(b)
+}
+
+fn bookmark_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
 
 /// the profile named `name` in `profiles`, created empty if new, so config lines
 /// (argv, .cwd, .env.<VAR>) can arrive in any order and accumulate onto it
@@ -724,6 +762,7 @@ fn new_tab_menu_entries() -> Vec<(String, ShellKind)> {
     rows
 }
 
+#[cfg(test)]
 fn palette_filter(query: &str) -> Vec<(&'static str, PaletteAction)> {
     if query.trim().is_empty() {
         return all_palette_actions().to_vec();
@@ -2979,6 +3018,8 @@ struct Persisted {
     /// known host name (e.g. ghostty) only for apps that refuse the kitty
     /// keyboard protocol unless the name is on their allowlist
     term_program: String,
+    /// working directories saved from the command palette or tab menu
+    bookmarks: Vec<String>,
 }
 
 impl Default for Persisted {
@@ -3022,6 +3063,7 @@ impl Default for Persisted {
             latency_hud: false,
             update_check: true,
             term_program: String::from("termie"),
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -3724,6 +3766,14 @@ fn parse_persisted(text: &str) -> Persisted {
                 // empty falls back to the default at spawn time
                 if !v.is_empty() {
                     p.term_program = v.to_string();
+                }
+            }
+            "bookmark" => {
+                if !v.is_empty()
+                    && p.bookmarks.len() < MAX_BOOKMARKS
+                    && !p.bookmarks.iter().any(|path| same_location(path, v))
+                {
+                    p.bookmarks.push(v.to_string());
                 }
             }
             other => {
@@ -5278,10 +5328,33 @@ impl App {
 
     fn palette_choices(&self, mode: PaletteMode, query: &str) -> Vec<(String, PaletteAction)> {
         match mode {
-            PaletteMode::Commands => palette_filter(query)
-                .into_iter()
-                .map(|(label, action)| (label.to_string(), action))
-                .collect(),
+            PaletteMode::Commands => {
+                let mut rows: Vec<(String, PaletteAction)> = all_palette_actions()
+                    .iter()
+                    .map(|(label, action)| (label.to_string(), *action))
+                    .collect();
+                rows.extend(self.persisted.bookmarks.iter().enumerate().map(|(i, path)| {
+                    (
+                        format!("open bookmark: {}  {}", bookmark_name(path), path),
+                        PaletteAction::OpenBookmark(i),
+                    )
+                }));
+                let query = query.trim();
+                if query.is_empty() {
+                    return rows;
+                }
+                let mut scored: Vec<(i32, String, PaletteAction)> = rows
+                    .into_iter()
+                    .filter_map(|(label, action)| {
+                        fuzzy_score(query, &label).map(|score| (score, label, action))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                scored
+                    .into_iter()
+                    .map(|(_, label, action)| (label, action))
+                    .collect()
+            }
             PaletteMode::Tabs => {
                 let labels: Vec<String> = self.pw.tabs.iter().map(tab_label).collect();
                 tab_filter(query, &labels)
@@ -5831,7 +5904,19 @@ impl App {
         let pane_menu_view = self.pw.pane_menu.as_ref().map(|m| {
             let items: Vec<String> = match m.target {
                 MenuTarget::Pane => render::PANE_MENU_ITEMS.iter().map(|s| s.to_string()).collect(),
-                MenuTarget::Tab(_) => render::TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect(),
+                MenuTarget::Tab(t) => {
+                    let marked = self.tab_cwd(t).is_some_and(|path| self.is_bookmarked(&path));
+                    render::TAB_MENU_ITEMS
+                        .iter()
+                        .map(|s| {
+                            if *s == "bookmark location" && marked {
+                                "remove bookmark".to_string()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .collect()
+                }
                 MenuTarget::TabColor(t) => {
                     let current = tab_color_of(t);
                     render::TAB_COLOR_ITEMS
@@ -6333,6 +6418,40 @@ impl App {
         cwd_path(p.term.cwd.as_deref())
     }
 
+    fn tab_cwd(&self, tab: usize) -> Option<String> {
+        let tab = self.pw.tabs.get(tab)?;
+        let pane = find_pane(tab.root.as_ref()?, tab.focused)?;
+        cwd_path(pane.term.cwd.as_deref())
+    }
+
+    fn is_bookmarked(&self, path: &str) -> bool {
+        self.persisted
+            .bookmarks
+            .iter()
+            .any(|saved| same_location(saved, path))
+    }
+
+    fn toggle_bookmark(&mut self, path: String) {
+        let name = bookmark_name(&path);
+        if let Some(i) = self
+            .persisted
+            .bookmarks
+            .iter()
+            .position(|saved| same_location(saved, &path))
+        {
+            self.persisted.bookmarks.remove(i);
+            self.show_notice(&format!("removed bookmark: {name}"));
+        } else if self.persisted.bookmarks.len() >= MAX_BOOKMARKS {
+            self.show_notice("bookmark limit reached");
+            return;
+        } else {
+            self.persisted.bookmarks.push(path);
+            self.show_notice(&format!("bookmarked: {name}"));
+        }
+        self.save_config();
+        self.redraw();
+    }
+
     /// the shell kind the focused pane was spawned with
     fn focused_shell(&self) -> Option<ShellKind> {
         let id = self.active_focused_id()?;
@@ -6607,6 +6726,18 @@ impl App {
             PaletteAction::NewTabHere => {
                 let cwd = self.focused_cwd();
                 self.new_tab_cwd(cwd, None);
+            }
+            PaletteAction::ToggleBookmark => {
+                if let Some(cwd) = self.focused_cwd() {
+                    self.toggle_bookmark(cwd);
+                } else {
+                    self.show_notice("this pane has no known location");
+                }
+            }
+            PaletteAction::OpenBookmark(i) => {
+                if let Some(path) = self.persisted.bookmarks.get(i).cloned() {
+                    self.new_tab_cwd(Some(path), None);
+                }
             }
             PaletteAction::DuplicateTab => {
                 let cwd = self.focused_cwd();
@@ -8484,6 +8615,9 @@ impl App {
             // render with their own theme
             let _ = writeln!(s, "theme.{name}={}", id.name());
         }
+        for path in &self.persisted.bookmarks {
+            let _ = writeln!(s, "bookmark={path}");
+        }
         if self.persisted.term_program != "termie" {
             // default is termie; only persist an override so the file stays short
             let _ = writeln!(s, "term_program={}", self.persisted.term_program);
@@ -8884,7 +9018,8 @@ impl App {
     /// run a context-menu item. pane items index render::PANE_MENU_ITEMS
     /// (0 copy, 1 split vertical, 2 split horizontal, 3 pop out, 4 close pane,
     /// 5 paste; copy no-ops with no selection); tab items index TAB_MENU_ITEMS
-    /// (0 rename, 1 duplicate, 2 move left, 3 move right, 4 close, 5 close others)
+    /// (0 rename, 1 duplicate, 2 bookmark, 3 color, 4 move left, 5 move right,
+    /// 6 close, 7 close others)
     fn pane_menu_action(&mut self, target: MenuTarget, idx: usize, at: (f32, f32), event_loop: &ActiveEventLoop) {
         match target {
             MenuTarget::Pane => match idx {
@@ -8916,16 +9051,23 @@ impl App {
                     let (cwd, shell) = ctx.map_or((None, None), |(c, s)| (c, Some(s)));
                     self.new_tab_cwd(cwd, shell);
                 }
-                // swap the menu for the swatch list, anchored where it was
                 2 => {
+                    if let Some(cwd) = self.tab_cwd(i) {
+                        self.toggle_bookmark(cwd);
+                    } else {
+                        self.show_notice("this tab has no known location");
+                    }
+                }
+                // swap the menu for the swatch list, anchored where it was
+                3 => {
                     self.pw.pane_menu =
                         Some(PaneMenu { x: at.0, y: at.1, hovered: None, target: MenuTarget::TabColor(i) });
                     self.redraw();
                 }
-                3 => self.move_tab(i, i.saturating_sub(1)),
-                4 => self.move_tab(i, i + 1),
-                5 => self.close_tab(i, event_loop),
-                6 => self.close_others(i),
+                4 => self.move_tab(i, i.saturating_sub(1)),
+                5 => self.move_tab(i, i + 1),
+                6 => self.close_tab(i, event_loop),
+                7 => self.close_others(i),
                 _ => {}
             },
             MenuTarget::TabColor(i) => {
@@ -13334,6 +13476,23 @@ mod tests {
         assert!(r.iter().all(|(l, _)| fuzzy_score("split", l).is_some()));
         assert!(r.first().map(|(l, _)| l.starts_with("split")).unwrap_or(false));
         assert_eq!(palette_filter("").len(), all_palette_actions().len());
+    }
+
+    #[test]
+    fn bookmarks_parse_once_and_keep_roots_distinct() {
+        let parsed = parse_persisted(
+            "bookmark=C:\\work\\termie\nbookmark=c:/work/termie/\nbookmark=/\nbookmark=\n",
+        );
+        #[cfg(windows)]
+        assert_eq!(parsed.bookmarks, ["C:\\work\\termie", "/"]);
+        #[cfg(not(windows))]
+        assert_eq!(
+            parsed.bookmarks,
+            ["C:\\work\\termie", "c:/work/termie/", "/"]
+        );
+        assert!(!same_location("/", ""));
+        #[cfg(windows)]
+        assert_eq!(bookmark_name("C:\\work\\termie"), "termie");
     }
 
     #[test]

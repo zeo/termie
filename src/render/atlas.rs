@@ -193,7 +193,7 @@ impl GlyphAtlas {
 
     /// every installed monospace family name, sorted and de-duplicated —
     /// what the font picker offers. only meaningful after load_system_fonts
-    pub fn monospace_families(&self) -> Vec<String> {
+    pub fn monospace_families(&mut self) -> Vec<String> {
         let mut names: Vec<String> = self
             .font_system
             .db()
@@ -205,7 +205,68 @@ impl GlyphAtlas {
             .collect();
         names.sort_by_key(|n| n.to_ascii_lowercase());
         names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        names.retain(|name| self.terminal_ready_family(name));
         names
+    }
+
+    pub(crate) fn terminal_ready_family(&mut self, name: &str) -> bool {
+        use cosmic_text::fontdb::{Family as DbFamily, Query, Stretch};
+
+        let lower = name.to_ascii_lowercase();
+        if ["emoji", "icons", "symbol", "wingdings", "webdings", "mdl2"]
+            .iter()
+            .any(|term| lower.contains(term))
+        {
+            return false;
+        }
+
+        let families = [DbFamily::Name(name)];
+        let query = Query {
+            families: &families,
+            weight: cosmic_text::fontdb::Weight::NORMAL,
+            stretch: Stretch::Normal,
+            style: cosmic_text::fontdb::Style::Normal,
+        };
+        let Some(face_id) = self.font_system.db().query(&query) else {
+            return false;
+        };
+        let Some(face) = self.font_system.db().face(face_id) else {
+            return false;
+        };
+        if !face.monospaced
+            || face.style != cosmic_text::fontdb::Style::Normal
+            || !(250..=550).contains(&face.weight.0)
+        {
+            return false;
+        }
+
+        self.buffer
+            .set_metrics(Metrics::new(self.content.px, self.content.line_height));
+        let attrs = Attrs::new()
+            .family(Family::Name(name))
+            .weight(Weight::NORMAL);
+        const SAMPLE: &str = "Aa0O1lMW@#{}[]";
+        self.buffer
+            .set_text(SAMPLE, &attrs, Shaping::Advanced, None);
+        self.buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        let Some(run) = self.buffer.layout_runs().next() else {
+            return false;
+        };
+        if run.glyphs.len() != SAMPLE.chars().count() {
+            return false;
+        }
+        let mut widths = run.glyphs.iter().map(|glyph| glyph.w);
+        let Some(first) = widths.next() else {
+            return false;
+        };
+        first >= self.content.px * 0.35
+            && first <= self.content.px * 0.9
+            && widths.all(|width| (width - first).abs() < 0.05)
+            && run
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.font_id == face_id && glyph.glyph_id != 0)
     }
 
     /// scan system fonts into the db on first call (deferred off the startup
@@ -1103,6 +1164,14 @@ fn to_alpha(data: &[u8], w: usize, h: usize, content: SwashContent) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_font_is_terminal_ready() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
+        let family = atlas.content_family().to_string();
+        assert!(atlas.terminal_ready_family(&family));
+        assert!(!atlas.terminal_ready_family("Segoe UI Symbol"));
+    }
 
     #[test]
     fn missing_symbol_recovers_after_system_font_scan() {
