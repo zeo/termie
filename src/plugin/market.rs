@@ -1,8 +1,7 @@
 //! plugin marketplace: a curated remote index of installable plugins plus the
 //! local install/remove plumbing. archive work uses the OS ZIP extractor.
-//! catalog + plugin downloads go through the GitHub CLI (`gh`) when
-//! the file lives in the catalog repo, so a private catalog works with the
-//! user's existing login, and fall back to anonymous `curl` for a public host.
+//! catalog and plugin downloads are pinned to one catalog commit. they use the
+//! GitHub CLI when available and fall back to anonymous `curl`.
 //!
 //! security: downloaded archives are unpacked into a fresh temp dir and the
 //! resulting `plugin.json` is validated (id safe + matches the catalog id)
@@ -20,14 +19,15 @@ use super::manifest::{id_is_safe, Manifest};
 
 const MAX_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ARCHIVE_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARCHIVE_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
-/// the catalog repo and ref behind authenticated GitHub CLI fetches
+/// the catalog repo and immutable commit behind every marketplace fetch
 const CATALOG_REPO: &str = "zeo/termie-plugins";
-const CATALOG_REF: &str = "main";
+const CATALOG_REF: &str = "6b21244e584bc344d21fdafcc3300264dea58364";
 
 fn catalog_raw_url(path: &str) -> String {
     format!("https://raw.githubusercontent.com/{CATALOG_REPO}/{CATALOG_REF}/{path}")
@@ -58,8 +58,12 @@ pub fn parse_index(text: &str) -> Vec<Entry> {
     arr.iter()
         .filter_map(|e| {
             let id = e.get_str("id")?.to_string();
-            let url = e.get_str("url").unwrap_or("").to_string();
-            if !id_is_safe(&id) || !marketplace_url_is_safe(&url) {
+            let url = e.get_str("url").unwrap_or("");
+            if !marketplace_url_is_safe(url) {
+                return None;
+            }
+            let path = catalog_repo_path(url)?;
+            if !id_is_safe(&id) {
                 return None;
             }
             Some(Entry {
@@ -67,7 +71,7 @@ pub fn parse_index(text: &str) -> Vec<Entry> {
                 name: e.get_str("name").unwrap_or("").to_string(),
                 version: e.get_str("version").unwrap_or("0.0.0").to_string(),
                 description: e.get_str("description").unwrap_or("").to_string(),
-                url,
+                url: catalog_raw_url(path),
                 permissions: e
                     .get("permissions")
                     .and_then(Json::as_array)
@@ -166,17 +170,33 @@ fn archive_path_is_safe(path: &str) -> bool {
         && path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
 }
 
+fn catalog_repo_path(url: &str) -> Option<&str> {
+    let prefix = format!("https://raw.githubusercontent.com/{CATALOG_REPO}/");
+    let rest = url.strip_prefix(&prefix)?;
+    if rest.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || rest.contains(['\\', '#', '?', '@'])
+    {
+        return None;
+    }
+    let (reference, path) = rest.split_once('/')?;
+    if reference != "main" && reference != CATALOG_REF {
+        return None;
+    }
+    let repo_path = Path::new(path);
+    if repo_path.as_os_str().is_empty()
+        || repo_path.is_absolute()
+        || !repo_path.components().all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path)
+}
+
 fn marketplace_url_is_safe(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Some(path) = catalog_repo_path(url) else {
         return false;
     };
-    if rest.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        || rest.contains(['\\', '#'])
-    {
-        return false;
-    }
-    let authority = rest.split(['/', '?']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@')
+    path.ends_with(".zip")
 }
 
 fn marketplace_curl() -> Command {
@@ -204,6 +224,7 @@ fn validate_archive_listing(bytes: Vec<u8>) -> Result<usize, String> {
 fn validate_tar_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
     let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 metadata")?;
     let mut entries = 0;
+    let mut extracted_bytes = 0u64;
     for line in listing.lines() {
         if line.is_empty() {
             continue;
@@ -212,6 +233,15 @@ fn validate_tar_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
         if !matches!(line.as_bytes().first(), Some(b'-' | b'd')) {
             return Err("archive contains a link or special file".to_string());
         }
+        let size = line
+            .split_ascii_whitespace()
+            .nth(4)
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| "archive contains unreadable size metadata".to_string())?;
+        extracted_bytes = extracted_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_ARCHIVE_EXTRACTED_BYTES)
+            .ok_or_else(|| "archive expands past the 256 MiB limit".to_string())?;
     }
     (entries == expected)
         .then_some(())
@@ -219,7 +249,7 @@ fn validate_tar_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
 }
 
 #[cfg(any(not(windows), test))]
-fn zipinfo_entry_kind(line: &str) -> Option<u8> {
+fn zipinfo_entry(line: &str) -> Option<(u8, u64)> {
     let mut fields = line.split_ascii_whitespace();
     let attributes = fields.next()?.as_bytes();
     let version = fields.next()?;
@@ -232,18 +262,24 @@ fn zipinfo_entry_kind(line: &str) -> Option<u8> {
         return None;
     }
     fields.next()?;
-    attributes.first().copied()
+    let size = fields.next()?.parse().ok()?;
+    Some((attributes.first().copied()?, size))
 }
 
 #[cfg(any(not(windows), test))]
 fn validate_zipinfo_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
     let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 metadata")?;
     let mut entries = 0;
-    for kind in listing.lines().filter_map(zipinfo_entry_kind) {
+    let mut extracted_bytes = 0u64;
+    for (kind, size) in listing.lines().filter_map(zipinfo_entry) {
         entries += 1;
         if !matches!(kind, b'-' | b'd') {
             return Err("archive contains a link or special file".to_string());
         }
+        extracted_bytes = extracted_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_ARCHIVE_EXTRACTED_BYTES)
+            .ok_or_else(|| "archive expands past the 256 MiB limit".to_string())?;
     }
     (entries == expected)
         .then_some(())
@@ -569,35 +605,25 @@ fn bounded_archive_metadata(command: &mut Command) -> Result<Output, String> {
     })
 }
 
-/// fetch raw bytes for a catalog URL. files under the catalog repo go through
-/// the GitHub CLI (`gh api … Accept: raw`) so a private repo works with the
-/// user's login; anything else — or a missing/unauthenticated gh — falls back
-/// to anonymous curl
+/// fetch raw bytes from the pinned catalog commit, preferring an authenticated
+/// GitHub CLI request and falling back to the matching immutable raw URL
 fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
-    if !marketplace_url_is_safe(url) {
-        return Err("marketplace URL must be an absolute HTTPS URL".to_string());
+    let path = catalog_repo_path(url).ok_or_else(|| "marketplace URL is outside the pinned catalog".to_string())?;
+    let api = format!("repos/{CATALOG_REPO}/contents/{path}?ref={CATALOG_REF}");
+    let mut command = quiet_command("gh");
+    command.args(["api", &api, "-H", "Accept: application/vnd.github.raw"]);
+    match bounded_output(&mut command, limit) {
+        Ok(o) if o.status.success() => return Ok(o.stdout),
+        Ok(o) => log::warn!("gh fetch of {path} failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+        Err(BoundedOutputError::Limit) => return Err(format!("response exceeds {limit} byte limit")),
+        Err(BoundedOutputError::Io(e)) => log::warn!("gh unavailable ({e}); trying curl"),
     }
-    let catalog_raw_prefix = catalog_raw_url("");
-    let repo_path = url.strip_prefix(&catalog_raw_prefix);
-    if let Some(path) = repo_path {
-        let api = format!("repos/{CATALOG_REPO}/contents/{path}?ref={CATALOG_REF}");
-        let mut command = quiet_command("gh");
-        command.args(["api", &api, "-H", "Accept: application/vnd.github.raw"]);
-        match bounded_output(&mut command, limit) {
-            Ok(o) if o.status.success() => return Ok(o.stdout),
-            Ok(o) => log::warn!("gh fetch of {path} failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
-            Err(BoundedOutputError::Limit) => return Err(format!("response exceeds {limit} byte limit")),
-            Err(BoundedOutputError::Io(e)) => log::warn!("gh unavailable ({e}); trying curl"),
-        }
-    }
+    let pinned_url = catalog_raw_url(path);
     let mut command = marketplace_curl();
-    command.args(["-fsSL", "--max-time", "60", "--", url]);
+    command.args(["-fsSL", "--max-time", "60", "--", &pinned_url]);
     match bounded_output(&mut command, limit) {
         Ok(o) if o.status.success() => Ok(o.stdout),
-        Ok(_) if repo_path.is_some() => {
-            Err("couldn't reach the catalog — install the GitHub CLI and run `gh auth login`".to_string())
-        }
-        Ok(o) => Err(format!("fetch failed (curl exit {})", o.status.code().unwrap_or(-1))),
+        Ok(_) => Err("couldn't reach the pinned plugin catalog".to_string()),
         Err(BoundedOutputError::Limit) => Err(format!("response exceeds {limit} byte limit")),
         Err(BoundedOutputError::Io(e)) => Err(format!("couldn't run curl: {e}")),
     }
@@ -651,6 +677,9 @@ pub fn install(entry: &Entry, plugins_dir: &Path, temp_dir: &Path) -> Result<Man
         let text = read_manifest(&root.join("plugin.json"))?;
         let manifest = Manifest::parse(&text, &entry.id)
             .ok_or_else(|| format!("manifest invalid or id != {:?}", entry.id))?;
+        if manifest.cmd.is_empty() || !archive_path_is_safe(&manifest.cmd) {
+            return Err("marketplace plugin entry command must stay inside its install directory".to_string());
+        }
 
         let dest = plugins_dir.join(&entry.id);
         crate::ensure_user_dir(plugins_dir).map_err(|e| format!("plugins dir: {e}"))?;
@@ -790,13 +819,13 @@ mod tests {
     #[test]
     fn parse_index_extracts_entries() {
         let text = r#"{"plugins":[
-            {"id":"pet","name":"Pet","version":"1.0.0","description":"a pet","url":"https://x/pet.zip","permissions":["write_pty"]},
-            {"id":"relay","name":"Relay","version":"0.1.0","description":"bus","url":"https://x/relay.zip"}
+            {"id":"pet","name":"Pet","version":"1.0.0","description":"a pet","url":"https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/pet.zip","permissions":["write_pty"]},
+            {"id":"relay","name":"Relay","version":"0.1.0","description":"bus","url":"https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/relay.zip"}
         ]}"#;
         let e = parse_index(text);
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].id, "pet");
-        assert_eq!(e[0].url, "https://x/pet.zip");
+        assert_eq!(e[0].url, catalog_raw_url("dist/pet.zip"));
         assert_eq!(e[0].permissions, vec!["write_pty".to_string()]);
         assert_eq!(e[1].id, "relay");
         assert!(e[1].permissions.is_empty());
@@ -806,23 +835,24 @@ mod tests {
     fn catalog_urls_share_the_named_repository_and_ref() {
         assert_eq!(
             catalog_raw_url("index.json"),
-            "https://raw.githubusercontent.com/zeo/termie-plugins/main/index.json"
+            format!("https://raw.githubusercontent.com/zeo/termie-plugins/{CATALOG_REF}/index.json")
         );
         assert_eq!(
             catalog_raw_url("plugins/pet.zip"),
-            "https://raw.githubusercontent.com/zeo/termie-plugins/main/plugins/pet.zip"
+            format!("https://raw.githubusercontent.com/zeo/termie-plugins/{CATALOG_REF}/plugins/pet.zip")
         );
     }
 
     #[test]
     fn parse_index_drops_unsafe_ids_and_urlless() {
         let text = r#"{"plugins":[
-            {"id":"../evil","url":"https://x/e.zip"},
+            {"id":"../evil","url":"https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/e.zip"},
             {"id":"ok","url":""},
             {"id":"file","url":"file:///etc/passwd"},
             {"id":"options","url":"--output=/tmp/termie"},
-            {"id":"credentials","url":"https://user:pass@x/g.zip"},
-            {"id":"good","url":"https://x/g.zip"}
+            {"id":"credentials","url":"https://user:pass@raw.githubusercontent.com/zeo/termie-plugins/main/dist/g.zip"},
+            {"id":"outside","url":"https://example.com/g.zip"},
+            {"id":"good","url":"https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/g.zip"}
         ]}"#;
         let e = parse_index(text);
         assert_eq!(e.len(), 1);
@@ -830,21 +860,25 @@ mod tests {
     }
 
     #[test]
-    fn marketplace_urls_require_https_without_userinfo_or_ambiguous_bytes() {
+    fn marketplace_urls_stay_inside_the_pinned_catalog() {
         for url in [
-            "https://plugins.example/pet.zip",
-            "https://plugins.example:8443/pet.zip?channel=stable",
-            "https://[2001:db8::1]/pet.zip",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/pet.zip",
+            concat!(
+                "https://raw.githubusercontent.com/zeo/termie-plugins/",
+                "6b21244e584bc344d21fdafcc3300264dea58364/dist/pet.zip"
+            ),
         ] {
             assert!(marketplace_url_is_safe(url), "{url:?} should be accepted");
         }
         for url in [
-            "http://plugins.example/pet.zip",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/other/dist/pet.zip",
+            "https://raw.githubusercontent.com/other/termie-plugins/main/dist/pet.zip",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/pet.txt",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/../pet.zip",
+            "https://example.com/pet.zip",
             "file:///etc/passwd",
-            "https://user:pass@plugins.example/pet.zip",
-            "https://plugins.example\\pet.zip",
-            "https://plugins.example/pet.zip#fragment",
-            "https://plugins.example/pet zip",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/pet.zip#fragment",
+            "https://raw.githubusercontent.com/zeo/termie-plugins/main/dist/pet zip",
             "-o/tmp/termie",
         ] {
             assert!(!marketplace_url_is_safe(url), "{url:?} should be rejected");
@@ -879,6 +913,8 @@ mod tests {
         assert!(archive_path_is_safe("plugin/plugin.json"));
         assert!(archive_path_is_safe("plugin/assets/icon.png"));
         assert!(!archive_path_is_safe("../plugin.json"));
+        assert!(!archive_path_is_safe(r"plugin\..\outside.exe"));
+        assert!(!archive_path_is_safe("C:/outside.exe"));
         assert!(!archive_path_is_safe("plugin/../../outside"));
         assert!(!archive_path_is_safe("/tmp/plugin.json"));
     }
@@ -895,6 +931,14 @@ mod tests {
         assert!(validate_zipinfo_types(zip.to_vec(), 1).is_err());
         let linked = b"lrwxrwxrwx  3.0 unx 2 bx stor 21-Jul-26 12:00 plugin/escape\n";
         assert!(validate_zipinfo_types(linked.to_vec(), 1).is_err());
+
+        let huge_tar = format!("-rw-r--r--  0 owner group {} Jan 1 00:00 plugin/huge", MAX_ARCHIVE_EXTRACTED_BYTES + 1);
+        assert!(validate_tar_types(huge_tar.into_bytes(), 1).is_err());
+        let huge_zip = format!(
+            "-rw-r--r--  3.0 unx {} tx defN 21-Jul-26 12:00 plugin/huge",
+            MAX_ARCHIVE_EXTRACTED_BYTES + 1
+        );
+        assert!(validate_zipinfo_types(huge_zip.into_bytes(), 1).is_err());
     }
 
     #[test]

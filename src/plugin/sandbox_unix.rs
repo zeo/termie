@@ -3,10 +3,9 @@
 //! spawns a plugin inside a bwrap namespace jail: the filesystem is a read-only
 //! view of the system libraries plus the plugin's own install dir, everything
 //! else (home, other processes, the session bus) is invisible, and every
-//! namespace is unshared — real privilege isolation on top of the subprocess
-//! crash isolation the normal host already gives. opt-in via the config
-//! `plugin_sandbox=bwrap` (the `on`/`true` spellings work too); the normal
-//! spawn path is used otherwise, and a missing bwrap surfaces as a launch error.
+//! namespace is unshared. the sandbox is enabled by default;
+//! `plugin_sandbox=off` uses the normal spawn path, and a missing bwrap surfaces
+//! as a launch error.
 //!
 //! network access is granted only when the plugin holds the `network`
 //! permission (`--share-net`, plus resolv.conf and the CA store so tls works).

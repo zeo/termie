@@ -2,9 +2,8 @@
 //!
 //! spawns a plugin inside an appcontainer so it runs at low integrity with no
 //! access to the user's files, registry, network, windows, or other processes
-//! unless a capability is granted — real privilege isolation on top of the
-//! subprocess crash isolation the normal host already gives. opt-in via the
-//! config `plugin_sandbox=appcontainer`; the normal spawn path is used otherwise.
+//! unless a capability is granted. the sandbox is enabled by default;
+//! `plugin_sandbox=off` uses the normal spawn path.
 //!
 //! network access is granted only when the plugin holds the `network` permission
 //! (the internetClient capability). the plugin's own install directory is granted

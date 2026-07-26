@@ -897,7 +897,7 @@ struct MarketRow {
     /// installed + currently enabled
     installed: bool,
     enabled: bool,
-    /// the catalog download url, if present in the remote catalog
+    /// the pinned catalog download url, if present in the remote catalog
     url: Option<String>,
 }
 
@@ -1055,16 +1055,39 @@ fn pane_state_event(pane: usize, status: PaneStatus, title: &str) -> plugin::Hos
 /// for std::fs). the leading slash is only an artifact on windows drive paths
 /// (`file:///C:/x` → `C:/x`); a unix path keeps it (`file:///home/x` → `/home/x`)
 fn cwd_path(cwd: Option<&str>) -> Option<String> {
-    let u = cwd?;
-    let path = u
-        .strip_prefix("file://")
-        .map(|r| match r.find('/') {
-            Some(i) => &r[i..],
-            None => r,
-        })
-        .unwrap_or(u);
-    let drive = path.len() > 2 && path.starts_with('/') && path.as_bytes()[2] == b':';
-    let path = if drive { &path[1..] } else { path };
+    let cwd = cwd?;
+    if cwd.is_empty() || cwd.chars().any(char::is_control) {
+        return None;
+    }
+    let path = if let Some(rest) = cwd.strip_prefix("file://") {
+        if !rest.starts_with('/') {
+            return None;
+        }
+        rest
+    } else {
+        cwd
+    };
+    #[cfg(windows)]
+    let path = {
+        let path = path
+            .strip_prefix('/')
+            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or(path);
+        let bytes = path.as_bytes();
+        if path.starts_with('\\')
+            || path.starts_with('/')
+            || !bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            || bytes.get(1) != Some(&b':')
+            || !matches!(bytes.get(2), Some(b'/' | b'\\'))
+        {
+            return None;
+        }
+        path
+    };
+    #[cfg(unix)]
+    if !path.starts_with('/') {
+        return None;
+    }
     Some(path.replace("%20", " "))
 }
 
@@ -1631,30 +1654,6 @@ fn write_keybindings_template_if_absent() {
     }
     let _ = ensure_user_dir(&dir);
     let _ = std::fs::write(&path, keybindings_template());
-}
-
-/// the git branch (or short detached hash) for a cwd, walking up to the repo root.
-/// reads at most a few hundred bytes of .git/HEAD and caps the walk depth so a
-/// hostile cwd / oversized HEAD can't hang or OOM the UI thread
-fn git_branch(cwd: Option<&str>) -> Option<String> {
-    let mut dir = std::path::PathBuf::from(cwd_path(cwd)?);
-    for _ in 0..64 {
-        let head = dir.join(".git").join("HEAD");
-        if let Ok(f) = std::fs::File::open(&head) {
-            let mut s = String::new();
-            if f.take(256).read_to_string(&mut s).is_ok() {
-                let s = s.trim();
-                if let Some(b) = s.strip_prefix("ref: refs/heads/") {
-                    return Some(b.to_string());
-                }
-                return Some(s.chars().take(7).collect());
-            }
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-    None
 }
 
 /// split the leaf with `id` into [old | new] using `dir`; `new` is taken on success
@@ -2990,10 +2989,12 @@ struct Persisted {
     quake_key_raw: Option<String>,
     /// the WSL distribution `new tab: wsl` launches (None = wsl.exe default)
     wsl_distro: Option<String>,
-    /// run plugins inside the OS sandbox for privilege isolation — a windows
+    /// run plugins inside the OS sandbox for privilege isolation: a windows
     /// appcontainer (`plugin_sandbox=appcontainer`) or a linux bwrap jail
-    /// (`plugin_sandbox=bwrap`); off by default
+    /// (`plugin_sandbox=bwrap`); on by default
     plugin_sandbox: bool,
+    /// let terminal programs replace the OS clipboard through OSC 52
+    osc52: bool,
     /// system backdrop behind the window (`acrylic=true`, alias `mica`): mica
     /// on windows 11 and compositor blur on linux
     acrylic: bool,
@@ -3054,7 +3055,8 @@ impl Default for Persisted {
             quake_key: None,
             quake_key_raw: None,
             wsl_distro: None,
-            plugin_sandbox: false,
+            plugin_sandbox: true,
+            osc52: false,
             acrylic: false,
             profiles_raw: Vec::new(),
             profiles: Vec::new(),
@@ -3758,6 +3760,7 @@ fn parse_persisted(text: &str) -> Persisted {
             "plugin_sandbox" => {
                 p.plugin_sandbox = v == "appcontainer" || v == "bwrap" || v == "on" || v == "true"
             }
+            "osc52" => p.osc52 = v == "true" || v == "on",
             "acrylic" | "mica" => p.acrylic = v == "true" || v == "on",
             "inline_paint" => p.inline_paint = v == "true" || v == "on",
             "latency_hud" => p.latency_hud = v == "true" || v == "on",
@@ -3866,9 +3869,6 @@ struct PaneWindow {
     ime_preedit_caret: Option<(usize, usize)>,
     // this window's open right-click pane context menu (None = closed)
     pane_menu: Option<PaneMenu>,
-    // this window's focused-pane git branch + the cwd it was computed for
-    git: Option<String>,
-    last_git_cwd: Option<String>,
     // last pointer position within this window (mouse events carry no window id)
     cursor: PhysicalPosition<f64>,
     cursor_icon: CursorIcon,
@@ -3895,8 +3895,6 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         ime_preedit: String::new(),
         ime_preedit_caret: None,
         pane_menu: None,
-        git: None,
-        last_git_cwd: None,
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_icon: CursorIcon::Default,
         confirm: None,
@@ -4836,8 +4834,7 @@ impl App {
                 let permit = budget.acquire();
                 let _ = proxy.send_event(UserEvent::Plugin { id: idx, msg, _permit: permit });
             };
-            // sandboxed launch is opt-in; on failure we fail closed (skip the
-            // plugin) rather than run it unconfined
+            // on sandbox failure, skip the plugin instead of running it unconfined
             match spawn_plugin(sandbox, &id, &d, on_msg) {
                 Ok(mut p) => {
                     // handshake: tell the plugin our api version + the perms the
@@ -5720,8 +5717,8 @@ impl App {
         // command the moment it lands; hold it behind a confirm so a stray paste
         // can't fire a string of commands. bracketed-paste programs (modern
         // shells, full-screen apps) buffer the whole paste safely, so they go straight
-        let multiline = normalized.trim_end_matches('\r').contains('\r');
-        if !bracketed && multiline {
+        let has_line_break = normalized.contains('\r');
+        if !bracketed && has_line_break {
             let lines = normalized.split('\r').filter(|l| !l.is_empty()).count();
             self.pw.confirm = Some(ConfirmState {
                 prompt: format!("paste {lines} lines into a program with no paste protection?"),
@@ -5852,7 +5849,6 @@ impl App {
         }
         let clock = win::local_hm();
         let focus_ease = self.focus_ease();
-        let git = self.pw.git.clone();
         let sessions = self.pw.tabs.len();
         // the font picker reuses the palette overlay box: when it's open, feed
         // build_palette the filtered font list instead of the action list
@@ -5942,7 +5938,7 @@ impl App {
         let hud = if self.persisted.latency_hud { self.lat.hud() } else { None };
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_latency_hud(hud);
-            r.set_status(git, clock, sessions);
+            r.set_status(None, clock, sessions);
             r.set_palette(palette_view);
             r.set_pane_menu(pane_menu_view);
             r.set_find(find_view);
@@ -6155,16 +6151,6 @@ impl App {
             })
             .collect();
         let active = self.pw.active_tab;
-        let cwd: Option<String> = self
-            .pw.tabs
-            .get(active)
-            .and_then(|t| t.root.as_ref().and_then(|r| find_pane(r, t.focused)))
-            .and_then(|p| p.term.cwd.clone());
-        // only walk the filesystem for .git/HEAD when the cwd actually changed
-        if cwd != self.pw.last_git_cwd {
-            self.pw.git = git_branch(cwd.as_deref());
-            self.pw.last_git_cwd = cwd;
-        }
         let colors: Vec<Option<u8>> = self.pw.tabs.iter().map(|t| t.color).collect();
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_tabs(labels, active);
@@ -8599,9 +8585,11 @@ impl App {
         if let Some(d) = &self.persisted.wsl_distro {
             let _ = writeln!(s, "wsl_distro={d}");
         }
-        if self.persisted.plugin_sandbox {
-            let spelling = if cfg!(windows) { "appcontainer" } else { "bwrap" };
-            let _ = writeln!(s, "plugin_sandbox={spelling}");
+        if !self.persisted.plugin_sandbox {
+            let _ = writeln!(s, "plugin_sandbox=off");
+        }
+        if self.persisted.osc52 {
+            let _ = writeln!(s, "osc52=true");
         }
         if self.persisted.acrylic {
             let _ = writeln!(s, "acrylic=true");
@@ -11182,7 +11170,9 @@ impl ApplicationHandler<UserEvent> for App {
                             if !p.term.responses.is_empty() {
                                 responses = Some(std::mem::take(&mut p.term.responses));
                             }
-                            if let Some(text) = p.term.clipboard.take() {
+                            if let Some(text) = p.term.clipboard.take()
+                                && self.persisted.osc52
+                            {
                                 clip = Some(text);
                             }
                             if !p.term.color_queries.is_empty() {
@@ -11259,7 +11249,9 @@ impl ApplicationHandler<UserEvent> for App {
                             if !p.term.responses.is_empty() {
                                 sat_responses = Some(std::mem::take(&mut p.term.responses));
                             }
-                            if let Some(text) = p.term.clipboard.take() {
+                            if let Some(text) = p.term.clipboard.take()
+                                && self.persisted.osc52
+                            {
                                 clip = Some(text);
                             }
                             if !p.term.color_queries.is_empty() {
@@ -11403,7 +11395,9 @@ impl ApplicationHandler<UserEvent> for App {
                         if !sp.term.responses.is_empty() {
                             responses = Some(std::mem::take(&mut sp.term.responses));
                         }
-                        if let Some(text) = sp.term.clipboard.take() {
+                        if let Some(text) = sp.term.clipboard.take()
+                            && self.persisted.osc52
+                        {
                             clip = Some(text);
                         }
                         if !sp.term.color_queries.is_empty() {
@@ -12823,12 +12817,14 @@ mod tests {
 
     #[test]
     fn config_parses_feature_flags_and_aliases() {
-        // the opt-in sandbox accepts each of its documented spellings
+        // the sandbox is on unless explicitly disabled
         assert!(parse_persisted("plugin_sandbox=appcontainer").plugin_sandbox);
         assert!(parse_persisted("plugin_sandbox=on").plugin_sandbox);
         assert!(parse_persisted("plugin_sandbox=true").plugin_sandbox);
         assert!(!parse_persisted("plugin_sandbox=off").plugin_sandbox);
-        assert!(!Persisted::default().plugin_sandbox);
+        assert!(Persisted::default().plugin_sandbox);
+        assert!(!Persisted::default().osc52);
+        assert!(parse_persisted("osc52=true").osc52);
 
         assert!(parse_persisted("inline_paint=true").inline_paint);
         assert!(parse_persisted("inline_paint=on").inline_paint);
@@ -13047,10 +13043,10 @@ mod tests {
 
     #[test]
     fn config_round_trips_the_serialized_flag_lines() {
-        // exactly what the settings writer emits for the opt-in features
-        let text = "plugin_sandbox=appcontainer\ninline_paint=true\nlatency_hud=true\nwsl_distro=Arch\n";
+        // exactly what the settings writer emits for non-default feature values
+        let text = "plugin_sandbox=off\nosc52=true\ninline_paint=true\nlatency_hud=true\nwsl_distro=Arch\n";
         let p = parse_persisted(text);
-        assert!(p.plugin_sandbox && p.inline_paint && p.latency_hud);
+        assert!(!p.plugin_sandbox && p.osc52 && p.inline_paint && p.latency_hud);
         assert_eq!(p.wsl_distro.as_deref(), Some("Arch"));
     }
 
@@ -13060,8 +13056,8 @@ mod tests {
         let p = parse_persisted(text);
         // the one real key still takes effect
         assert!(p.latency_hud);
-        // a bare key with no '=' is skipped, not read as enabling the sandbox
-        assert!(!p.plugin_sandbox);
+        // a bare key with no '=' is skipped, leaving the secure default
+        assert!(p.plugin_sandbox);
         // unknown keys leave everything else at its default
         assert_eq!(p.scrollback, Persisted::default().scrollback);
     }
@@ -13081,9 +13077,23 @@ mod tests {
 
     #[test]
     fn cwd_path_parses_osc7_uris() {
-        assert_eq!(cwd_path(Some("file:///C:/Users/dev")).as_deref(), Some("C:/Users/dev"));
-        assert_eq!(cwd_path(Some("file://host/C:/dev")).as_deref(), Some("C:/dev"));
-        assert_eq!(cwd_path(Some("file:///C:/a%20b")).as_deref(), Some("C:/a b"));
+        #[cfg(windows)]
+        {
+            assert_eq!(cwd_path(Some("file:///C:/Users/dev")).as_deref(), Some("C:/Users/dev"));
+            assert_eq!(cwd_path(Some("file:///C:/a%20b")).as_deref(), Some("C:/a b"));
+            assert_eq!(cwd_path(Some("C:\\Users\\dev")).as_deref(), Some("C:\\Users\\dev"));
+            assert_eq!(cwd_path(Some(r"\\server\share")), None);
+            assert_eq!(cwd_path(Some("file://server/C:/dev")), None);
+            assert_eq!(cwd_path(Some("C:relative")), None);
+            assert_eq!(cwd_path(Some("1:/invalid")), None);
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(cwd_path(Some("file:///home/dev")).as_deref(), Some("/home/dev"));
+            assert_eq!(cwd_path(Some("/home/dev")).as_deref(), Some("/home/dev"));
+            assert_eq!(cwd_path(Some("file://server/home/dev")), None);
+            assert_eq!(cwd_path(Some("relative/path")), None);
+        }
         assert_eq!(cwd_path(None), None);
     }
 

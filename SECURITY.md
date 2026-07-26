@@ -14,6 +14,7 @@ Use GitHub's private vulnerability reporting on this repository: the **Security*
 
 These are the deliberate boundaries; a report that shows a way around one is exactly what's useful:
 
-- termie runs each plugin as a **separate OS process** over a line-delimited JSON protocol. Sensitive capabilities (`read_output`, `write_pty`) are off unless explicitly granted at install; declaring widgets, posting notifications, and using the in-process bus need no permission.
+- termie runs each plugin as a **separate OS process** over a line-delimited JSON protocol and confines it in a Windows AppContainer or Linux bubblewrap jail by default. Sensitive capabilities (`read_output`, `write_pty`, `network`) are off unless explicitly granted.
 - The plugin JSON parser bounds its recursion depth, and the kitty-graphics scanner caps both the buffered escape sequence and the reassembled image size, so a hostile or garbled stream can't grow memory without bound.
-- termie refuses OSC 52 clipboard *reads*, so a remote program can't exfiltrate your clipboard.
+- termie refuses OSC 52 clipboard reads. Clipboard writes are disabled unless `osc52=true` is set in the config.
+- OSC 7 accepts local absolute paths only. Remote authorities and Windows UNC paths are rejected, and terminal-provided paths are never probed for repository metadata.

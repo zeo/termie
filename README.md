@@ -20,7 +20,7 @@ Drag a tab out to make a window, or drop it into any other ordinary Termie windo
 
 To combine a complete window at once, drag the square Termie app badge at the far left of its title bar into another Termie tab strip. Every tab moves in order and the emptied window closes. Dragging the neighboring `termie` wordmark still moves the OS window.
 
-Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting, bracketed paste, OSC 7 cwd (tab labels + window title), reflow on resize, the kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs), OSC 8 hyperlinks, OSC 52 clipboard writes, OSC 4/10/11/12 color queries, OSC 9;4 taskbar progress, underline styles, strikethrough, blink, and DEC 2026 synchronized output for tear-free frames.
+Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser, alt screen, scroll regions, mouse reporting, bracketed paste, OSC 7 cwd (tab labels + window title), reflow on resize, the kitty keyboard protocol (so `Shift+Enter` inserts a newline in TUIs), OSC 8 hyperlinks, optional OSC 52 clipboard writes, OSC 4/10/11/12 color queries, OSC 9;4 taskbar progress, underline styles, strikethrough, blink, and DEC 2026 synchronized output for tear-free frames.
 
 Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG, cursor flow like kitty's, z-index stacking, scoped deletes, unicode placeholders so images survive tmux and scrollback) and sixel — `img2sixel`, `chafa`, `lsix`, and anything else that probes DA1 finds both — plus full-color emoji, all packed into a dedicated RGBA atlas beside the glyph cache. On Windows, installs ship a current ConPTY host (`conpty.dll` + `OpenConsole.exe`, MIT, from microsoft/terminal) beside the exe, because the ConPTY built into Windows strips sixel before a terminal ever sees it; on Linux the kernel pty passes every byte through untouched, so nothing extra is needed. IME composition, a screen-reader path via AccessKit, and session restore (tab + split layout) with crash recovery.
 
@@ -30,7 +30,7 @@ Termie can be the **default terminal**: run "default terminal" from the palette 
 
 A command palette (`Ctrl+P`) for fuzzy access to every action, plus a searchable numbered tab switcher (`tab search` in the palette) for crowded windows. Save the focused directory with `bookmark current location`, or use the same action in a tab's context menu. Saved locations become searchable `open bookmark` actions. Seven built-in themes, three house schemes plus Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord, a bundled Maple Mono Nerd Font, adjustable font size / padding / cursor / opacity, and per-user `colors.conf` and `keybindings.conf`. The live font picker checks each installed face for real fixed-width ASCII and shows a specimen before it can be selected. Windows, Linux X11, and KDE Plasma Wayland have an optional Quake-style drop-down (`quake_key`).
 
-A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and can be confined to an OS sandbox — a Windows AppContainer or a Linux [bubblewrap](https://github.com/containers/bubblewrap) jail. An in-app marketplace browses and installs them.
+A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and run inside an OS sandbox by default: a Windows AppContainer or a Linux [bubblewrap](https://github.com/containers/bubblewrap) jail. An in-app marketplace browses and installs them.
 
 ## install
 
@@ -87,7 +87,7 @@ A shell or profile can carry its own theme — `theme.<name>=<theme>` paints tha
 
 Configuration lives in `%APPDATA%\termie\` on Windows. Linux follows the XDG base-directory split: configuration in `$XDG_CONFIG_HOME/termie` (usually `~/.config/termie`), plugins in `$XDG_DATA_HOME/termie`, session state and logs in `$XDG_STATE_HOME/termie`, and generated shell hooks plus the update stamp in `$XDG_CACHE_HOME/termie`. Existing Linux files migrate from the old config directory on first use.
 
-- `config` — general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, …). Opt-ins live here too: `quake_key=ctrl+grave` on Windows or Linux, `plugin_sandbox=appcontainer` on Windows or `plugin_sandbox=bwrap` on Linux, `latency_hud=true`, `acrylic=true` for Windows Mica or Linux compositor blur, `right_click=paste`, `term_program=ghostty`, `font_weight=semibold`, `min_contrast=3`, `background_image=<path.png>` with `background_image_opacity=0.3`, and `ligatures=false`.
+- `config`: general settings the in-app panel also writes (`shell`, `theme`, `scrollback`, ...). Plugins are sandboxed by default; `plugin_sandbox=off` disables confinement. Other opt-ins include `quake_key=ctrl+grave` on Windows or Linux, `osc52=true` for terminal-controlled clipboard writes, `latency_hud=true`, `acrylic=true` for Windows Mica or Linux compositor blur, `right_click=paste`, `term_program=ghostty`, `font_weight=semibold`, `min_contrast=3`, `background_image=<path.png>` with `background_image_opacity=0.3`, and `ligatures=false`.
 - `colors.conf` — override theme colors, one `key=color` per line (`fg`, `bg`, `cursor`, `sel`, `ansi0`..`ansi255`; `#rrggbb`, `#rgb`, or `r,g,b`).
 - `keybindings.conf` — rebind keys, one `combo=action` per line, e.g. `ctrl+alt+t=new tab here`.
 
@@ -123,7 +123,7 @@ cd termie
 cargo build --release      # target/release/termie
 ```
 
-At runtime the binary needs those same libraries, `unzip` for marketplace installs, and a Vulkan or GL driver. `mesa-vulkan-drivers` covers the software fallback. Optional: `systemd-run` isolates each pane for independent out-of-memory handling, `bubblewrap` confines plugins, and `xdg-open` opens links. `theme=auto` reads and monitors the desktop color scheme through `xdg-desktop-portal` using `gdbus`. Copy `assets/fonts/` next to a source-built binary (or run from the repo); the release archive already carries them.
+At runtime the binary needs those same libraries, `unzip` and `bubblewrap` for marketplace plugins, and a Vulkan or GL driver. `mesa-vulkan-drivers` covers the software fallback. Optional: `systemd-run` isolates each pane for independent out-of-memory handling, and `xdg-open` opens links. `theme=auto` reads and monitors the desktop color scheme through `xdg-desktop-portal` using `gdbus`. Copy `assets/fonts/` next to a source-built binary (or run from the repo); the release archive already carries them.
 
 Every platform:
 
@@ -136,7 +136,7 @@ cargo build --release  # optimized
 
 ## plugins
 
-Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be written in any language and be as heavy as it likes while the core stays lean. They render widgets in a side dock — Tier-1 text or Tier-2 immediate-mode graphics — talk to each other over an in-process bus, and can be confined to an OS sandbox (opt-in): a Windows AppContainer, or a bubblewrap jail on Linux that shows the plugin only its own install directory and grants network only with the `network` permission. The in-app marketplace (palette → "plugins") browses, installs, enables/disables, and removes them; the registry — plugin source plus the catalog — lives at [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins), which is also where you contribute one.
+Plugins are separate processes termie talks to over newline-delimited JSON, so a plugin can be written in any language and be as heavy as it likes while the core stays lean. They render widgets in a side dock, talk to each other over an in-process bus, and run in an OS sandbox by default. Windows uses an AppContainer. Linux uses a bubblewrap jail that shows the plugin only its own install directory and grants network only with the `network` permission. The in-app marketplace pins downloads to one catalog commit per Termie release. The registry, plugin source, and catalog live at [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins).
 
 ## license
 
