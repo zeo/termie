@@ -495,7 +495,7 @@ pub fn run_setup(path: &std::path::Path) -> Result<(), String> {
     if path.file_stem().is_some_and(|name| name == "rot-installer") {
         let scope = std::env::current_exe()
             .ok()
-            .and_then(|current| std::env::var_os("ProgramFiles").map(|root| (current, root)))
+            .zip(std::env::var_os("ProgramFiles"))
             .filter(|(current, root)| current.starts_with(root))
             .map(|_| "machine")
             .unwrap_or("user");
