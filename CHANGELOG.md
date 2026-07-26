@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-07-26
+
+### Changed
+- Updates now use the shared signed installer and publish online, offline, Windows, and Linux payloads from one release path.
+
 ### Security
 - Plugins now run inside the platform sandbox by default. Marketplace downloads are restricted to an immutable catalog commit, manifests cannot launch outside their install directory, and archives cannot expand past 256 MiB.
 - OSC 52 clipboard writes now require `osc52=true`. Unprotected pastes with any line break require confirmation.
 - OSC 7 current-directory reports accept local absolute paths only. Remote file authorities and Windows UNC paths are rejected, and terminal-provided paths no longer trigger repository metadata reads.
-- Release builds verify the SHA-256 digest of the downloaded WiX toolset before executing it.
+- Windows releases now use the signed shared installer payload and no longer build or execute WiX.
 
 ## 0.5.0 - 2026-07-18
 

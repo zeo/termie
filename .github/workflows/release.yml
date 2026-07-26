@@ -21,6 +21,12 @@ jobs:
     runs-on: [self-hosted, windows-vm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.ROT_INSTALLER_REPOSITORY }}
+          path: .rot-installer
+          ssh-key: ${{ secrets.ROT_INSTALLER_DEPLOY_KEY }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
@@ -42,32 +48,23 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File setup\fetch-conpty.ps1 -Dest target\release
 
-      - name: build installer (WiX MSI)
+      - name: build shared installer tools
         shell: powershell
+        env:
+          TERMIE_INSTALLER_PUBLIC_KEY: ${{ vars.TERMIE_INSTALLER_PUBLIC_KEY }}
         run: |
-          $ver = "${{ github.ref_name }}" -replace '^v',''
-          # WiX 3.14 runs on .NET Framework 4.x (present on the runner); the older
-          # 3.11 toolset needs .NET 3.5, which the runner doesn't have.
-          $wix = Join-Path $env:RUNNER_TEMP "wix314-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $zip = "$wix.zip"
-          Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip -UseBasicParsing -MaximumRedirection 5
-          $expectedWixHash = '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31'
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash -ne $expectedWixHash) {
-            throw 'WiX 3.14 archive hash mismatch'
-          }
-          Expand-Archive $zip -DestinationPath $wix -Force
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $obj = Join-Path $env:RUNNER_TEMP 'termie.wixobj'
-          & "$wix\candle.exe" -nologo -arch x64 "-dVersion=$ver" -out $obj wix\main.wxs
-          if ($LASTEXITCODE -ne 0) { throw "candle failed with exit code $LASTEXITCODE" }
-          & "$wix\light.exe" -nologo -sice:ICE61 -sice:ICE60 -sice:ICE69 -out "dist\termie-$ver-windows-x64.msi" $obj
-          if ($LASTEXITCODE -ne 0) { throw "light failed with exit code $LASTEXITCODE" }
+          cargo build --release --locked --manifest-path .rot-installer\Cargo.toml --bin rot-installer --bin rot-pack
+          if ($LASTEXITCODE -ne 0) { throw "shared installer build failed" }
 
-      - name: build setup (native installer)
+      - name: pack shared installer release
         shell: powershell
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
         run: |
           $ver = "${{ github.ref_name }}" -replace '^v',''
-          # stage the payload exactly as it installs: exe + assets + licenses
           $stage = Join-Path $env:RUNNER_TEMP 'termie-payload'
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
           New-Item -ItemType Directory -Force $stage | Out-Null
@@ -76,23 +73,59 @@ jobs:
           Copy-Item assets $stage\assets -Recurse
           Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRDPARTY.md $stage\
           Set-Content (Join-Path $stage 'VERSION') $ver
-          $env:TERMIE_PAYLOAD_DIR = $stage
-          cargo build --release --locked --manifest-path setup/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw "setup build failed" }
-          Copy-Item setup\target\release\termie-setup.exe "dist\termie-$ver-setup.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $pack = '.rot-installer\target\release\rot-pack.exe'
+          $installer = '.rot-installer\target\release\rot-installer.exe'
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool is unavailable" }
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_THUMBPRINT)) { throw "certificate thumbprint is unavailable" }
+          $timestamp = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
+          foreach ($file in @('target\release\termie.exe', 'target\release\conpty.dll', 'target\release\OpenConsole.exe', $installer)) {
+            & $signtool.FullName sign /sha1 $env:CERTIFICATE_THUMBPRINT /fd sha256 /tr $timestamp /td sha256 $file
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $file" }
+          }
+          Copy-Item target\release\termie.exe $stage\ -Force
+          Copy-Item target\release\conpty.dll, target\release\OpenConsole.exe $stage\ -Force
+          function Invoke-RotPack {
+            & $pack @args
+            if ($LASTEXITCODE -ne 0) { throw "rot-pack failed with exit code $LASTEXITCODE" }
+          }
+          $package = "dist\termie-$ver-windows-x86_64.rpack"
+          Invoke-RotPack pack $stage $package --app termie --version $ver
+          Invoke-RotPack sign $package "$package.minisig"
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$(Split-Path $package -Leaf)"
+          Invoke-RotPack manifest $package dist\installer.json --url $url --signature "$package.minisig" --published-at ([DateTime]::UtcNow.ToString('o')) --target windows-x86_64
+          Invoke-RotPack sign dist\installer.json dist\installer.json.minisig
+          Invoke-RotPack online $installer "dist\termie-$ver-setup.exe"
+          Invoke-RotPack offline $installer $package "$package.minisig" "dist\termie-$ver-offline-setup.exe" --app termie
+          foreach ($file in @("dist\termie-$ver-setup.exe", "dist\termie-$ver-offline-setup.exe")) {
+            & $signtool.FullName sign /sha1 $env:CERTIFICATE_THUMBPRINT /fd sha256 /tr $timestamp /td sha256 $file
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $file" }
+          }
 
       - name: attach to the release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             dist/termie-*-setup.exe
-            dist/termie-*-windows-x64.msi
+            dist/termie-*.rpack
+            dist/termie-*.rpack.minisig
+            dist/installer.json
+            dist/installer.json.minisig
           fail_on_unmatched_files: true
 
   release-linux:
+    needs: release
     runs-on: [self-hosted, linux-vm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.ROT_INSTALLER_REPOSITORY }}
+          path: .rot-installer
+          ssh-key: ${{ secrets.ROT_INSTALLER_DEPLOY_KEY }}
+          persist-credentials: false
       - name: rustup on PATH
         run: |
           cargo_home="${CARGO_HOME:-/cache/cargo}"
@@ -130,6 +163,10 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: build
         run: cargo build --release --locked
+      - name: build shared installer tools
+        env:
+          TERMIE_INSTALLER_PUBLIC_KEY: ${{ vars.TERMIE_INSTALLER_PUBLIC_KEY }}
+        run: cargo build --release --locked --manifest-path .rot-installer/Cargo.toml --bin rot-installer --bin rot-pack
       - name: package
         run: |
           ver="${GITHUB_REF_NAME#v}"
@@ -142,8 +179,40 @@ jobs:
           install -m644 LICENSE-MIT LICENSE-APACHE THIRDPARTY.md README.md "dist/$root/share/doc/termie/"
           install -m755 packaging/linux/install.sh packaging/linux/uninstall.sh "dist/$root/"
           tar -C dist -czf "dist/$root.tar.gz" "$root"
+      - name: pack shared installer release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          stage="$RUNNER_TEMP/termie-rpack"
+          mkdir -p "$stage/assets"
+          install -m755 target/release/termie "$stage/termie"
+          cp -R assets/. "$stage/assets/"
+          install -m644 LICENSE-MIT LICENSE-APACHE THIRDPARTY.md "$stage/"
+          pack=.rot-installer/target/release/rot-pack
+          installer=.rot-installer/target/release/rot-installer
+          package="dist/termie-$ver-linux-x86_64.rpack"
+          "$pack" pack "$stage" "$package" --app termie --version "$ver"
+          "$pack" sign "$package" "$package.minisig"
+          curl --proto '=https' --tlsv1.2 --retry 5 --location --fail \
+            -o dist/installer.json \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/installer.json"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$(basename "$package")"
+          "$pack" manifest "$package" dist/installer.json --url "$url" --signature "$package.minisig" --published-at "$(date --utc --iso-8601=seconds)" --target linux-x86_64
+          "$pack" sign dist/installer.json dist/installer.json.minisig
+          "$pack" online "$installer" "dist/termie-$ver-linux-x86_64-setup"
+          "$pack" offline "$installer" "$package" "$package.minisig" "dist/termie-$ver-linux-x86_64-offline-setup" --app termie
+          chmod 755 dist/termie-*-setup
       - name: attach to the release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: dist/termie-*-linux-x86_64.tar.gz
+          files: |
+            dist/termie-*-linux-x86_64.tar.gz
+            dist/termie-*.rpack
+            dist/termie-*.rpack.minisig
+            dist/termie-*-setup
+            dist/installer.json
+            dist/installer.json.minisig
+          overwrite_files: true
           fail_on_unmatched_files: true

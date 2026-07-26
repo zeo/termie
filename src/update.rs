@@ -228,11 +228,11 @@ fn managed_installer() -> Option<PathBuf> {
 fn installer_path() -> Option<PathBuf> {
     let name = if cfg!(windows) { "rot-installer.exe" } else { "rot-installer" };
     let mut candidates = Vec::new();
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(parent) = current.parent() {
-            candidates.push(parent.join(name));
-            candidates.push(parent.join("installer").join(name));
-        }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        candidates.push(parent.join(name));
+        candidates.push(parent.join("installer").join(name));
     }
     #[cfg(windows)]
     {
@@ -263,6 +263,9 @@ fn download_to_prefix(u: &Update, prefix: Option<&std::path::Path>) -> Result<Pa
         return Err("update URL does not match the release asset".into());
     }
     let dir = fresh_temp_dir()?;
+    #[cfg(windows)]
+    let path = dir.join("rot-installer.exe");
+    #[cfg(not(windows))]
     let path = dir.join(name);
     let fetched = (|| {
         let mut command = update_curl();
@@ -490,7 +493,20 @@ fn sha256_hex(data: &[u8]) -> String {
 pub fn run_setup(path: &std::path::Path) -> Result<(), String> {
     let mut command = std::process::Command::new(path);
     if path.file_stem().is_some_and(|name| name == "rot-installer") {
-        command.args(["update", "termie", "--wait-pid", &std::process::id().to_string()]);
+        let scope = std::env::current_exe()
+            .ok()
+            .and_then(|current| std::env::var_os("ProgramFiles").map(|root| (current, root)))
+            .filter(|(current, root)| current.starts_with(root))
+            .map(|_| "machine")
+            .unwrap_or("user");
+        command.args([
+            "install",
+            "termie",
+            "--scope",
+            scope,
+            "--wait-pid",
+            &std::process::id().to_string(),
+        ]);
     } else {
         command.arg("/update");
     }
