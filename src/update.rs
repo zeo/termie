@@ -61,7 +61,7 @@ pub fn archive_install_prefix() -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 pub fn can_install() -> bool {
-    archive_install_prefix().is_some()
+    installer_path().is_some() || archive_install_prefix().is_some()
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -202,11 +202,57 @@ fn fresh_temp_dir() -> Result<PathBuf, String> {
 
 /// download and verify the native release asset; blocking — run on a worker thread
 pub fn download(u: &Update) -> Result<PathBuf, String> {
+    if let Some(installer) = managed_installer() {
+        return Ok(installer);
+    }
     #[cfg(target_os = "linux")]
     let prefix = archive_install_prefix();
     #[cfg(not(target_os = "linux"))]
     let prefix: Option<PathBuf> = None;
     download_to_prefix(u, prefix.as_deref())
+}
+
+fn managed_installer() -> Option<PathBuf> {
+    let installer = installer_path()?;
+    let output = std::process::Command::new(&installer)
+        .args(["status", "termie", "--json"])
+        .output()
+        .ok()?;
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("\"app\":\"termie\"") {
+        Some(installer)
+    } else {
+        None
+    }
+}
+
+fn installer_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "rot-installer.exe" } else { "rot-installer" };
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            candidates.push(parent.join(name));
+            candidates.push(parent.join("installer").join(name));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(root).join("rot").join("installer").join(name));
+        }
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(root).join("Programs").join("rot-installer").join(name));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push(PathBuf::from("/opt/rot/installer").join(name));
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+            candidates.push(PathBuf::from(data).join("rot/apps/installer").join(name));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(home).join(".local/share/rot/apps/installer").join(name));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn download_to_prefix(u: &Update, prefix: Option<&std::path::Path>) -> Result<PathBuf, String> {
@@ -442,8 +488,13 @@ fn sha256_hex(data: &[u8]) -> String {
 /// hand off to the installer's silent update mode; the caller exits right after
 #[cfg(windows)]
 pub fn run_setup(path: &std::path::Path) -> Result<(), String> {
-    std::process::Command::new(path)
-        .arg("/update")
+    let mut command = std::process::Command::new(path);
+    if path.file_stem().is_some_and(|name| name == "rot-installer") {
+        command.args(["update", "termie", "--wait-pid", &std::process::id().to_string()]);
+    } else {
+        command.arg("/update");
+    }
+    command
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -474,7 +525,15 @@ fn spawn_after(parent: u32, path: &std::path::Path) -> Result<std::process::Chil
 
 #[cfg(target_os = "linux")]
 pub fn run_setup(path: &std::path::Path) -> Result<(), String> {
-    spawn_after(std::process::id(), path).map(|_| ())
+    if path.file_name().is_some_and(|name| name == "rot-installer") {
+        std::process::Command::new(path)
+            .args(["update", "termie", "--wait-pid", &std::process::id().to_string()])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        spawn_after(std::process::id(), path).map(|_| ())
+    }
 }
 
 #[cfg(test)]
