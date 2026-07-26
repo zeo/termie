@@ -11849,7 +11849,9 @@ impl ApplicationHandler<UserEvent> for App {
             // with no/disabled plugins pays nothing at startup
             if !self.plugins_started {
                 self.plugins_started = true;
-                self.start_plugins();
+                if self.drive.is_none() {
+                    self.start_plugins();
+                }
             }
             // one deferred daily update check, entirely off-thread; failures
             // are silent (an update check must never bother anyone)
