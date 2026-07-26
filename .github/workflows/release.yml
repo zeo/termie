@@ -81,7 +81,7 @@ jobs:
           if (-not $signtool) { throw "signtool is unavailable" }
           if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_THUMBPRINT)) { throw "certificate thumbprint is unavailable" }
           $timestamp = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
-          foreach ($file in @('target\release\termie.exe', 'target\release\conpty.dll', 'target\release\OpenConsole.exe', $installer)) {
+          foreach ($file in @('target\release\termie.exe', 'target\release\conpty.dll', 'target\release\OpenConsole.exe')) {
             & $signtool.FullName sign /sha1 $env:CERTIFICATE_THUMBPRINT /fd sha256 /tr $timestamp /td sha256 $file
             if ($LASTEXITCODE -ne 0) { throw "signing failed for $file" }
           }

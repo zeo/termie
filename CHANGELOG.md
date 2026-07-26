@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.5.1 - 2026-07-26
+## 0.5.2 - 2026-07-26
 
 ### Changed
 - Updates now use the shared signed installer and publish online, offline, Windows, and Linux payloads from one release path.
