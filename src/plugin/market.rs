@@ -165,7 +165,7 @@ pub(crate) fn quiet_command(program: &str) -> Command {
 
 fn archive_path_is_safe(path: &str) -> bool {
     let archive_path = Path::new(path);
-    !path.contains('\\')
+    !path.contains(['\\', ':'])
         && !archive_path.as_os_str().is_empty()
         && !archive_path.is_absolute()
         && archive_path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
