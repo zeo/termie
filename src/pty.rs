@@ -669,7 +669,7 @@ impl Pty {
             let Some(process_group) = self.process_group else {
                 return false;
             };
-            return unsafe { libc::tcgetpgrp(fd) == process_group };
+            unsafe { libc::tcgetpgrp(fd) == process_group }
         }
         #[cfg(windows)]
         {
