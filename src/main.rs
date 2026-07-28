@@ -36,7 +36,7 @@ use anyhow::Result;
 use vte::Parser;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -53,6 +53,7 @@ const POOL_TARGET: usize = 3;
 /// stop respawning after this many consecutive shell-spawn failures so a broken
 /// shell can't peg a CPU core; the window then stays up (logged) instead
 const MAX_WARM_FAILS: usize = 10;
+const ZOOM_PIXEL_STEP: f64 = 40.0;
 const MAX_STARTUP_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_PLUGINS: usize = 128;
@@ -266,6 +267,13 @@ impl PaneStatus {
     }
 }
 
+fn submits_shell_command(bracketed_paste: bool, bytes: &[u8]) -> bool {
+    let wrapped_paste = bracketed_paste
+        && bytes.starts_with(b"\x1b[200~")
+        && bytes.ends_with(b"\x1b[201~");
+    !wrapped_paste && bytes.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
+}
+
 impl Pane {
     // resize the screen and the pty together so the two can never diverge or be
     // transposed; both take (rows, cols). cell pixel size goes to ConPTY so
@@ -274,6 +282,29 @@ impl Pane {
         self.term.resize(rows, cols);
         let (cw, ch) = self.term.cell_px();
         self.pty.resize(rows as u16, cols as u16, cw, ch);
+    }
+
+    fn at_integrated_shell_prompt(&self) -> bool {
+        self.has_integrated_shell_prompt() && self.pty.shell_owns_foreground()
+    }
+
+    fn has_integrated_shell_prompt(&self) -> bool {
+        !self.term.cmd_running
+            && matches!(
+                self.term.last_osc133,
+                Some(term::Osc133::PromptStart | term::Osc133::PromptEnd)
+            )
+    }
+
+    fn write_user_input(&mut self, bytes: &[u8]) -> bool {
+        let submits_command = submits_shell_command(self.term.bracketed_paste, bytes);
+        let was_prompt = submits_command && self.at_integrated_shell_prompt();
+        let queued = self.pty.write(bytes);
+        if queued && was_prompt {
+            self.term.cmd_running = true;
+            self.status = PaneStatus::Running;
+        }
+        queued
     }
 }
 
@@ -823,15 +854,17 @@ enum MenuTarget {
     NewTab,
 }
 
-/// find-in-scrollback overlay state for the focused pane; matches are
-/// (global_line_index, col) into that pane's grid
+/// find-in-scrollback overlay state for the focused pane
 struct FindState {
     query: String,
-    /// (global line, col, match char length) — regex matches vary in length
-    matches: Vec<(usize, usize, usize)>,
+    matches: Vec<grid::SearchHit>,
     current: usize,
+    owner_pane: usize,
+    grid_epoch: u64,
     /// the query failed to compile as a regex (regex mode only)
     bad: bool,
+    truncated: bool,
+    budget_exhausted: bool,
 }
 
 /// a pending modal confirmation: the action runs on enter, esc cancels
@@ -1314,12 +1347,6 @@ fn find_must_follow_focus(
     hold: bool,
 ) -> bool {
     find_open && !hold && focus_view_changed(before, after)
-}
-
-/// after a focus context change, replace the match list and snap the cursor to
-/// the first hit in the new grid (or stay at 0 when empty)
-fn find_after_grid_change<T>(matches: Vec<T>) -> (Vec<T>, usize) {
-    (matches, 0)
 }
 
 /// after closing a pane that may have lived in a non-viewer tab, the active_tab
@@ -1980,8 +2007,18 @@ fn discover_plugins() -> Vec<Discovered> {
             break;
         }
         let dir = entry.path();
-        if !dir.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&dir) else {
             continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                continue;
+            }
         }
         let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -2802,6 +2839,7 @@ fn handle_kitty(term: &mut Terminal, cmd: &apc::KittyCmd) {
         }
         _ => {}
     }
+    term.mark_dirty();
 }
 
 /// queue a kitty "OK" APC response for the program (drained to the pty with the
@@ -3842,6 +3880,22 @@ fn parse_persisted(text: &str) -> Persisted {
     p
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDeltaKind {
+    Lines,
+    Pixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkRevision {
+    pane: usize,
+    terminal: u64,
+    view_offset: usize,
+    total_lines: usize,
+    reflow: u32,
+    hover_enabled: bool,
+}
+
 /// per-window state. step 1 of the multi-window refactor extracts the main
 /// window's state here (App.pw); torn-off panes still live in App.satellites
 /// until step 2 graduates them to first-class PaneWindows
@@ -3851,6 +3905,7 @@ struct PaneWindow {
     a11y: Option<accesskit_winit::Adapter>,
     tabs: Vec<Tab>,
     active_tab: usize,
+    session_ephemeral: bool,
     layout_cache: Vec<(usize, Rect)>,
     // per-window ui state: these belong to one window, so the swap-dispatch
     // (self.pw <-> a satellite) keeps them from leaking across windows
@@ -3872,6 +3927,14 @@ struct PaneWindow {
     // last pointer position within this window (mouse events carry no window id)
     cursor: PhysicalPosition<f64>,
     cursor_icon: CursorIcon,
+    cursor_inside: bool,
+    /// hovered web link span in the focused pane
+    link: Option<(usize, usize, usize)>,
+    /// exact target shown before ctrl+click opens it
+    link_url: Option<String>,
+    link_revision: Option<LinkRevision>,
+    zoom_accum: f64,
+    zoom_delta_kind: Option<ZoomDeltaKind>,
     // modal overlays carrying this window's own tab index, so a confirm/rename
     // raised here can only be resolved here (never targets another window's tab)
     confirm: Option<ConfirmState>,
@@ -3885,6 +3948,7 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         a11y: None,
         tabs,
         active_tab: 0,
+        session_ephemeral: false,
         layout_cache: Vec::new(),
         maximized: false,
         pane_mode: false,
@@ -3897,9 +3961,103 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         pane_menu: None,
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_icon: CursorIcon::Default,
+        cursor_inside: false,
+        link: None,
+        link_url: None,
+        link_revision: None,
+        zoom_accum: 0.0,
+        zoom_delta_kind: None,
         confirm: None,
         rename: None,
     }
+}
+
+fn pane_window_counts<'a>(
+    windows: impl IntoIterator<Item = &'a PaneWindow>,
+) -> (usize, usize) {
+    windows
+        .into_iter()
+        .fold((0, 0), |(tabs, panes), window| {
+            let window_panes = window
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.root.as_ref())
+                .map(pane_count)
+                .sum::<usize>();
+            (tabs + window.tabs.len(), panes + window_panes)
+        })
+}
+
+fn append_session_tabs(window: &PaneWindow, tabs: &mut Vec<session::TabSnap>) {
+    if window.session_ephemeral {
+        return;
+    }
+    for tab in &window.tabs {
+        let Some(root) = tab.root.as_ref() else {
+            continue;
+        };
+        let mut leaf_ids = Vec::new();
+        let root = node_to_snap(root, &mut leaf_ids);
+        let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
+        tabs.push(session::TabSnap {
+            focused_leaf,
+            root,
+            title: tab.title.clone(),
+            color: tab.color,
+        });
+    }
+}
+
+fn accumulated_zoom_steps(
+    accumulator: &mut f64,
+    active_kind: &mut Option<ZoomDeltaKind>,
+    kind: ZoomDeltaKind,
+    delta: f64,
+) -> f32 {
+    if !delta.is_finite() || delta == 0.0 {
+        return 0.0;
+    }
+    if *active_kind != Some(kind) {
+        *accumulator = 0.0;
+        *active_kind = Some(kind);
+    }
+    if *accumulator != 0.0 && accumulator.signum() != delta.signum() {
+        *accumulator = 0.0;
+    }
+    *accumulator += delta;
+    let steps = accumulator.trunc();
+    *accumulator -= steps;
+    steps as f32
+}
+
+fn normalized_zoom_delta(
+    delta: MouseScrollDelta,
+    scale_factor: f64,
+) -> (ZoomDeltaKind, f64) {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => (ZoomDeltaKind::Lines, y as f64),
+        MouseScrollDelta::PixelDelta(position) => {
+            let scale_factor =
+                if scale_factor.is_finite() && scale_factor > 0.0 { scale_factor } else { 1.0 };
+            (ZoomDeltaKind::Pixels, position.y / (ZOOM_PIXEL_STEP * scale_factor))
+        }
+    }
+}
+
+fn reset_zoom_gesture(window: &mut PaneWindow) {
+    window.zoom_accum = 0.0;
+    window.zoom_delta_kind = None;
+}
+
+fn link_preview_matches(
+    span: Option<(usize, usize, usize)>,
+    target: Option<&str>,
+    row: usize,
+    start: usize,
+    end: usize,
+    url: &str,
+) -> bool {
+    span == Some((row, start, end)) && target == Some(url)
 }
 
 struct App {
@@ -3954,6 +4112,8 @@ struct App {
     /// the font in use when the picker opened, restored if the pick is cancelled
     font_pick_orig: Option<String>,
     find: Option<FindState>,
+    /// next live-output refresh for an open find
+    find_refresh_at: Option<Instant>,
     /// regex mode for the find bar; remembered across open/close (toggled by
     /// the .* button or Alt+R while find is open)
     find_regex: bool,
@@ -4035,9 +4195,6 @@ struct App {
     /// motion is suppressed when the cell hasn't changed so any-event tracking
     /// can't flood a TUI's input buffer with identical CSI reports
     last_mouse_report: Option<(usize, u8, bool, bool, usize, usize, u8)>,
-    /// url under the cursor while ctrl is held, to underline + open on click:
-    /// (focused-pane viewport row, col_start, col_end exclusive)
-    link: Option<(usize, usize, usize)>,
     /// system fonts are scanned lazily after first paint to keep startup fast
     system_fonts_pending: bool,
     /// the printable-ASCII glyph cache has been warmed once (off the boot path)
@@ -4160,6 +4317,7 @@ impl App {
             tab_drag: None,
             closed_tabs: Vec::new(),
             find_follow_hold: false,
+            find_refresh_at: None,
             last_title: String::new(),
             config: Config {
                 scrollback: p.scrollback,
@@ -4177,7 +4335,6 @@ impl App {
             broadcast: false,
             mouse_down: None,
             last_mouse_report: None,
-            link: None,
             system_fonts_pending: true,
             ascii_warmed: false,
             warm_fails: 0,
@@ -4659,6 +4816,24 @@ impl App {
         }
     }
 
+    fn redraw_pane_window(&self, pane: usize) {
+        let contains = |pw: &PaneWindow| {
+            pw.tabs
+                .iter()
+                .any(|tab| tab.root.as_ref().is_some_and(|root| find_pane(root, pane).is_some()))
+        };
+        if contains(&self.pw) {
+            self.redraw();
+        } else if let Some(window) = self
+            .satellites
+            .iter()
+            .find(|pw| contains(pw))
+            .and_then(|pw| pw.window.as_ref())
+        {
+            window.request_redraw();
+        }
+    }
+
     /// request a redraw on every torn-off window whose renderer is mid-animation
     /// (reveal / hover / tab-slide / overlay bloom). about_to_wait only drives the
     /// main window, so without this a satellite animation would stall until the
@@ -4821,6 +4996,18 @@ impl App {
     /// plugin's stdout line arrives as UserEvent::Plugin. failures are logged and
     /// skipped so a broken plugin can never block startup or the core
     fn start_plugins(&mut self) {
+        #[cfg(windows)]
+        if let Some(base) = plugins_dir()
+            && let Ok(entries) = std::fs::read_dir(base)
+        {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && let Err(error) = plugin::sandbox::remove_legacy_access(&entry.path())
+                {
+                    log::warn!("plugin acl migration failed: {error}");
+                }
+            }
+        }
         // only launch enabled plugins; disabled ones still appear in the
         // marketplace UI but never spawn a process
         let sandbox = self.persisted.plugin_sandbox;
@@ -4981,7 +5168,7 @@ impl App {
                 if let Some(id) = self.active_focused_id()
                     && let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut())
                         && let Some(p) = find_pane_mut(root, id) {
-                            p.pty.write(data.as_bytes());
+                            p.write_user_input(data.as_bytes());
                         }
             }
             C::Unknown(t) => log::warn!("plugin sent unknown command: {t}"),
@@ -5064,12 +5251,48 @@ impl App {
         let g = &p.term.grid;
         // an explicit OSC 8 hyperlink on the cell wins over url autodetection
         let cell_link = g.line_at(row).get(col).map(|c| c.link).unwrap_or(0);
-        if let Some(uri) = g.link_uri(cell_link) {
+        if let Some(uri) = g.link_uri(cell_link)
+            && win::web_url_is_safe(uri)
+        {
             let (start, end) = g.link_span(row, col, cell_link);
             return Some((row, start, end, uri.to_string()));
         }
         let (start, end, url) = g.url_at(row, col)?;
-        Some((row, start, end, url))
+        win::web_url_is_safe(&url).then_some((row, start, end, url))
+    }
+
+    fn focused_link_revision(&self) -> Option<LinkRevision> {
+        let pane = self.active_focused_id()?;
+        let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
+        let terminal = &find_pane(root, pane)?.term;
+        Some(LinkRevision {
+            pane,
+            terminal: terminal.revision,
+            view_offset: terminal.grid.view_offset,
+            total_lines: terminal.grid.total_lines(),
+            reflow: terminal.grid.reflow_gen,
+            hover_enabled: self.link_hover_enabled(),
+        })
+    }
+
+    fn link_hover_enabled(&self) -> bool {
+        self.pw.cursor_inside
+            && self.pw.focused
+            && !self.selecting
+            && !self.pw.pane_mode
+            && !self.broadcast
+            && self.terminal_surface_uncovered()
+    }
+
+    fn terminal_surface_uncovered(&self) -> bool {
+        !self.pw.settings_open
+            && self.pw.pane_menu.is_none()
+            && self.pw.confirm.is_none()
+            && self.pw.rename.is_none()
+            && self.palette.is_none()
+            && self.font_pick.is_none()
+            && !self.find_is_open_here()
+            && self.market.is_none()
     }
 
     /// which pane (id) sits under a pixel position
@@ -5427,6 +5650,10 @@ impl App {
     }
 
     fn open_find(&mut self) {
+        let Some(owner_pane) = self.active_focused_id() else {
+            return;
+        };
+        let previous_owner = self.find.as_ref().map(|find| find.owner_pane);
         // a single-line selection on the focused pane seeds the query, the
         // way editors prefill find; multi-line selections don't make sense
         // as a substring search so they leave the box empty
@@ -5444,22 +5671,61 @@ impl App {
             .filter(|t| !t.is_empty() && !t.contains('\n') && t.chars().count() <= 128)
             .unwrap_or_default();
         let seeded = !seed.is_empty();
+        let grid_epoch = self.focused_grid_epoch().unwrap_or_default();
         self.find = Some(FindState {
             query: seed,
             matches: Vec::new(),
             current: 0,
+            owner_pane,
+            grid_epoch,
             bad: false,
+            truncated: false,
+            budget_exhausted: false,
         });
         if seeded {
             self.find_recompute();
         }
         self.redraw();
+        if let Some(previous_owner) = previous_owner.filter(|pane| *pane != owner_pane) {
+            self.redraw_pane_window(previous_owner);
+        }
+    }
+
+    fn close_find(&mut self) {
+        let owner = self.find.take().map(|find| find.owner_pane);
+        self.find_refresh_at = None;
+        if let Some(owner) = owner {
+            self.redraw_pane_window(owner);
+        }
     }
 
     /// re-run the search for the current query against the focused pane and jump
     /// to the first match. in regex mode a pattern that fails to compile shows
     /// as "bad pattern" instead of silently matching nothing
     fn find_recompute(&mut self) {
+        self.find_recompute_inner(None, true);
+    }
+
+    fn focused_grid_epoch(&self) -> Option<u64> {
+        let id = self.active_focused_id()?;
+        let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
+        find_pane(root, id).map(|pane| pane.term.grid_epoch)
+    }
+
+    fn find_refresh(&mut self) {
+        let grid_epoch = self.focused_grid_epoch();
+        let anchor = self
+            .find
+            .as_ref()
+            .filter(|find| Some(find.owner_pane) == self.active_focused_id())
+            .filter(|find| Some(find.grid_epoch) == grid_epoch)
+            .and_then(|find| find.matches.get(find.current))
+            .map(|hit| hit.start);
+        self.find_recompute_inner(anchor, false);
+    }
+
+    fn find_recompute_inner(&mut self, anchor: Option<(u64, usize)>, scroll: bool) {
+        self.find_refresh_at = None;
         let query = match &self.find {
             Some(f) => f.query.clone(),
             None => return,
@@ -5473,19 +5739,39 @@ impl App {
                     .unwrap_or_default(),
                 None => {
                     bad = true;
-                    Vec::new()
+                    grid::SearchMatches::default()
                 }
             }
         } else {
             self.focused_grid().map(|g| g.search(&query)).unwrap_or_default()
         };
+        let grid::SearchMatches {
+            hits,
+            truncated,
+            budget_exhausted,
+        } = matches;
+        let owner_pane = self.active_focused_id();
+        let grid_epoch = self.focused_grid_epoch().unwrap_or_default();
         if let Some(f) = self.find.as_mut() {
-            let (m, cur) = find_after_grid_change(matches);
-            f.matches = m;
-            f.current = cur;
+            f.current = anchor
+                .filter(|_| !hits.is_empty())
+                .map(|anchor| {
+                    hits.partition_point(|hit| hit.start < anchor)
+                        .min(hits.len() - 1)
+                })
+                .unwrap_or(0);
+            f.matches = hits;
+            if let Some(owner_pane) = owner_pane {
+                f.owner_pane = owner_pane;
+            }
+            f.grid_epoch = grid_epoch;
             f.bad = bad;
+            f.truncated = truncated;
+            f.budget_exhausted = budget_exhausted;
         }
-        self.find_scroll_to_current();
+        if scroll {
+            self.find_scroll_to_current();
+        }
         self.redraw();
     }
 
@@ -5497,13 +5783,23 @@ impl App {
         Some((self.pw.active_tab, tab.focused))
     }
 
+    fn find_is_open_here(&self) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|find| Some(find.owner_pane) == self.active_focused_id())
+    }
+
     /// finish a UI update that may have retargeted the focused pane: re-run find
     /// when it is open and the focused *pane id* changed, otherwise plain redraw.
     /// when `find_follow_hold` is set (temporary owner-tab switch for a
     /// background exit), only redraw so the viewer's match list stays intact
     fn after_focus_context_change(&mut self, before: Option<(usize, usize)>) {
         let after = self.focus_identity();
-        if find_must_follow_focus(self.find.is_some(), before, after, self.find_follow_hold) {
+        let find_open = self
+            .find
+            .as_ref()
+            .is_some_and(|find| before.is_some_and(|(_, pane)| pane == find.owner_pane));
+        if find_must_follow_focus(find_open, before, after, self.find_follow_hold) {
             self.find_recompute();
         } else {
             self.redraw();
@@ -5547,13 +5843,31 @@ impl App {
             .find
             .as_ref()
             .and_then(|f| f.matches.get(f.current).copied());
-        if let Some((g, _, _)) = target
+        if let Some(hit) = target
             && let Some(grid) = self.focused_grid_mut() {
-                grid.scroll_to_global(g);
+                grid.scroll_to_abs(hit.start.0);
             }
     }
 
     fn find_step(&mut self, forward: bool) {
+        let Some((abs_base, grid_epoch)) =
+            self.focused_grid().map(|grid| grid.abs_base()).zip(self.focused_grid_epoch())
+        else {
+            return;
+        };
+        if self.find.as_ref().is_some_and(|find| find.grid_epoch != grid_epoch) {
+            self.find_recompute_inner(None, false);
+        }
+        if let Some(find) = self.find.as_mut() {
+            let evicted = find.matches.partition_point(|hit| hit.start.0 < abs_base);
+            if evicted != 0 {
+                find.matches.drain(..evicted);
+                find.current = find
+                    .current
+                    .saturating_sub(evicted)
+                    .min(find.matches.len().saturating_sub(1));
+            }
+        }
         let len = self.find.as_ref().map(|f| f.matches.len()).unwrap_or(0);
         if len == 0 {
             return;
@@ -5569,24 +5883,65 @@ impl App {
         self.redraw();
     }
 
-    /// build the renderer's find overlay view: the query/count for the box plus
-    /// on-screen match rects (viewport row, col, len, is_current) for the focused
-    /// pane
+    /// build the renderer's find overlay view
     fn build_find_view(&self) -> Option<render::FindView> {
         let f = self.find.as_ref()?;
+        if Some(f.owner_pane) != self.active_focused_id() {
+            return None;
+        }
         let mut vps = Vec::new();
+        let mut retained_count = f.matches.len();
+        let mut current = f.current;
         if !f.query.is_empty()
-            && let Some(g) = self.focused_grid() {
-                for (i, &(gl, col, len)) in f.matches.iter().enumerate() {
-                    if let Some(vr) = g.global_to_viewport(gl) {
-                        vps.push((vr, col, len, i == f.current));
+            && let Some(g) = self.focused_grid()
+        {
+            let retained_start = if Some(f.grid_epoch) != self.focused_grid_epoch() {
+                retained_count = 0;
+                current = 0;
+                f.matches.len()
+            } else {
+                let retained_start =
+                    f.matches.partition_point(|hit| hit.start.0 < g.abs_base());
+                retained_count -= retained_start;
+                current = f
+                    .current
+                    .saturating_sub(retained_start)
+                    .min(retained_count.saturating_sub(1));
+                retained_start
+            };
+            let visible = g.visible_abs_range();
+            let first = f
+                .matches
+                .partition_point(|hit| hit.end.0 < visible.start)
+                .max(retained_start);
+            let last = first
+                + f.matches[first..]
+                    .partition_point(|hit| hit.start.0 < visible.end);
+            for (offset, hit) in f.matches[first..last].iter().enumerate() {
+                let i = first + offset;
+                let first_line = hit.start.0.max(visible.start);
+                let last_line = hit.end.0.min(visible.end.saturating_sub(1));
+                for line in first_line..=last_line {
+                    let start = if line == hit.start.0 { hit.start.1 } else { 0 };
+                    let end = if line == hit.end.0 {
+                        hit.end.1
+                    } else {
+                        g.cols
+                    }
+                    .min(g.cols);
+                    if start < end
+                        && let Some(row) = g.abs_to_viewport(line)
+                    {
+                        vps.push((row, start, end - start, i == retained_start + current));
                     }
                 }
             }
+        }
         Some(render::FindView {
             query: f.query.clone(),
-            count: f.matches.len(),
-            current: f.current,
+            count: retained_count,
+            current,
+            capped: f.truncated || f.budget_exhausted,
             matches: vps,
             regex_on: self.find_regex,
             bad: f.bad,
@@ -5739,7 +6094,7 @@ impl App {
         {
             // pasting is input: snap a history-scrolled view to the bottom
             p.term.grid.view_offset = 0;
-            p.pty.write(bytes)
+            p.write_user_input(bytes)
         } else {
             true
         };
@@ -5815,13 +6170,11 @@ impl App {
     /// the same count gate tab-close uses, so Alt+F4 can't silently take down
     /// a window full of working agents
     fn request_quit(&mut self, event_loop: &ActiveEventLoop) {
-        let panes = self.window_pane_count();
-        if self.pw.tabs.len() > 1 || panes > 1 {
+        let (tabs, panes) =
+            pane_window_counts(std::iter::once(&self.pw).chain(self.satellites.iter()));
+        if tabs > 1 || panes > 1 {
             self.pw.confirm = Some(ConfirmState {
-                prompt: format!(
-                    "quit with {panes} panes across {} tabs?",
-                    self.pw.tabs.len()
-                ),
+                prompt: format!("quit with {panes} panes across {tabs} tabs?"),
                 hint: "enter: quit \u{b7} esc: cancel".to_string(),
                 action: ConfirmAction::Quit,
             });
@@ -5846,6 +6199,11 @@ impl App {
             if s.width == 0 || s.height == 0 {
                 return;
             }
+        }
+        let link_revision = self.focused_link_revision();
+        if self.pw.link_revision != link_revision {
+            let (_, has_link) = self.refresh_hovered_link();
+            self.set_hover_pointer(has_link);
         }
         let clock = win::local_hm();
         let focus_ease = self.focus_ease();
@@ -5983,7 +6341,6 @@ impl App {
         let App {
             pw,
             selection,
-            link,
             persisted,
             ..
         } = self;
@@ -5996,6 +6353,7 @@ impl App {
             focused,
             ime_preedit,
             ime_preedit_caret,
+            link,
             ..
         } = pw;
         if let Some(r) = renderer.as_mut() {
@@ -6060,6 +6418,9 @@ impl App {
         let Some(r) = self.pw.renderer.as_ref() else {
             return;
         };
+        self.pw.link_revision = None;
+        let focused = self.active_focused_id();
+        let mut find_grid_changed = false;
         // a settings tab has no panes; clear so stale rects don't linger
         self.pw.layout_cache.clear();
         let content = r.content_rect();
@@ -6102,13 +6463,19 @@ impl App {
                     // produced output yet — resizing pwsh mid-PSReadLine-startup
                     // wedges it (same guard the warm pool already uses above)
                     if p.ready && (p.term.grid.rows != rows || p.term.grid.cols != cols) {
+                        let grid_epoch = p.term.grid_epoch;
                         p.resize(rows, cols);
+                        find_grid_changed |=
+                            Some(*id) == focused && p.term.grid_epoch != grid_epoch;
                     }
                 }
             }
             if ti == self.pw.active_tab {
                 self.pw.layout_cache = rects;
             }
+        }
+        if find_grid_changed && self.find_is_open_here() {
+            self.find_refresh();
         }
     }
 
@@ -6325,11 +6692,11 @@ impl App {
             if self.broadcast {
                 each_pane_mut(root, &mut |p| {
                     p.term.grid.view_offset = 0;
-                    p.pty.write(bytes);
+                    p.write_user_input(bytes);
                 });
             } else if let Some(p) = find_pane_mut(root, id) {
                 p.term.grid.view_offset = 0;
-                p.pty.write(bytes);
+                p.write_user_input(bytes);
             }
         }
     }
@@ -7761,7 +8128,7 @@ impl App {
                 .ok()
                 .map(|origin| PhysicalPosition::new(origin.x + 48, origin.y + 48))
         });
-        let pw = match self.create_satellite_window(event_loop, point) {
+        let mut pw = match self.create_satellite_window(event_loop, point) {
             Ok(pw) => pw,
             Err(error) => {
                 log::error!("forwarded launch window failed: {error:#}");
@@ -7777,6 +8144,7 @@ impl App {
         for tab in &mut cli.tabs {
             resolve_layout_dirs(&mut tab.root, base);
         }
+        pw.session_ephemeral = !cli.is_bare();
 
         self.satellites.push(pw);
         let slot = self.satellites.len() - 1;
@@ -8193,50 +8561,80 @@ impl App {
         }
     }
 
-    /// a file landed on this window (self.pw is the receiving window: the
-    /// satellite path swaps its state in before dispatching here). winit
-    /// reports no drop position, but the cursor still sits exactly where the
-    /// user let go — ask the OS. a drop on the tab strip opens a tab at the
-    /// folder (wt-style); a drop on the content lands in the pane under the
-    /// pointer, like right-click, and types the quoted path at its prompt
+    /// route a file drop using a fresh native point when available
+    /// drops without one open the location in a tab and never inject terminal input
     fn on_dropped_file(&mut self, path: &std::path::Path) {
-        let at = Some((self.pw.cursor.x as f32, self.pw.cursor.y as f32));
+        let at = self
+            .pw
+            .window
+            .as_ref()
+            .and_then(|window| win::drop_position(window, self.pw.cursor))
+            .map(|position| (position.x as f32, position.y as f32));
         let hit = at.zip(self.pw.renderer.as_ref()).map(|((x, y), r)| r.hit_test(x, y));
-        if matches!(
-            hit,
-            Some(
-                Hit::TitleBar
-                    | Hit::Button(
-                        Hot::WindowTabs
-                            | Hot::Tab(_)
-                            | Hot::TabClose(_)
-                            | Hot::NewTab
-                            | Hot::NewTabMenu,
-                    )
+        if at.is_none()
+            || matches!(
+                hit,
+                Some(
+                    Hit::TitleBar
+                        | Hit::Button(
+                            Hot::WindowTabs
+                                | Hot::Tab(_)
+                                | Hot::TabClose(_)
+                                | Hot::NewTab
+                                | Hot::NewTabMenu,
+                        )
+                )
             )
-        ) {
+        {
             let dir = if path.is_dir() { Some(path) } else { path.parent() };
             if let Some(d) = dir {
-                self.new_tab_cwd(Some(d.to_string_lossy().into_owned()), None);
+                let Some(cwd) = d.to_str() else {
+                    self.show_notice("path is not valid unicode");
+                    return;
+                };
+                self.new_tab_cwd(Some(cwd.to_owned()), None);
             }
             return;
         }
-        if matches!(hit, Some(Hit::Content))
-            && let Some((x, y)) = at
-        {
-            self.focus_pane_at(x, y);
-        }
-        if let Some(id) = self.active_focused_id() {
-            // quote the typed path if it has spaces so the shell treats it
-            // as a single argument
-            let s = path.to_string_lossy();
-            let text = if s.contains(' ') { format!("\"{s}\" ") } else { format!("{s} ") };
-            if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
-                && let Some(root) = tab.root.as_mut()
-                && let Some(p) = find_pane_mut(root, id)
-            {
-                p.pty.write(text.as_bytes());
+        let Some((x, y)) = at.filter(|_| {
+            matches!(hit, Some(Hit::Content)) && self.terminal_surface_uncovered()
+        }) else {
+            self.show_notice("drop files onto a terminal pane");
+            return;
+        };
+        let Some(id) = self.pane_at(x, y) else {
+            self.show_notice("drop files onto a terminal pane");
+            return;
+        };
+        self.focus_pane_at(x, y);
+        let shell = self
+            .pw
+            .tabs
+            .get(self.pw.active_tab)
+            .and_then(|tab| tab.root.as_ref())
+            .and_then(|root| find_pane(root, id))
+            .map(|pane| (pane.shell, pane.at_integrated_shell_prompt()));
+        let Some((shell, true)) = shell else {
+            self.show_notice("path drop needs the launched shell alone at its prompt");
+            return;
+        };
+        let mut text = match pty::quote_path_for_shell(shell, path) {
+            Ok(text) => text,
+            Err(message) => {
+                self.show_notice(message);
+                return;
             }
+        };
+        text.push(b' ');
+        let queued = self
+            .pw
+            .tabs
+            .get_mut(self.pw.active_tab)
+            .and_then(|tab| tab.root.as_mut())
+            .and_then(|root| find_pane_mut(root, id))
+            .is_some_and(|pane| pane.write_user_input(&text));
+        if !queued {
+            self.show_notice("terminal input queue is full");
         }
     }
 
@@ -8624,27 +9022,34 @@ impl App {
         let _ = write_atomic(&path, s.as_bytes());
     }
 
-    /// build a snapshot of the current window's tabs + split tree for persistence
+    /// build a snapshot of every live tab and split tree for persistence
     fn session_snapshot(&self) -> session::SessionFile {
-        // always snapshot the MAIN window (a satellite may be swapped into self.pw
-        // when a quit/close is triggered from a torn-off window)
         let main = self.main_pw();
+        let active_tab = main.active_tab;
         let mut tabs = Vec::new();
-        for tab in &main.tabs {
-            let Some(root) = tab.root.as_ref() else {
-                continue;
-            };
-            let mut leaf_ids = Vec::new();
-            let root = node_to_snap(root, &mut leaf_ids);
-            let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
-            tabs.push(session::TabSnap { focused_leaf, root, title: tab.title.clone(), color: tab.color });
+        append_session_tabs(main, &mut tabs);
+        match self.cur_sat {
+            None => {
+                for satellite in &self.satellites {
+                    append_session_tabs(satellite, &mut tabs);
+                }
+            }
+            Some(current) => {
+                for (index, satellite) in self.satellites.iter().enumerate() {
+                    if index == current {
+                        append_session_tabs(&self.pw, &mut tabs);
+                    } else {
+                        append_session_tabs(satellite, &mut tabs);
+                    }
+                }
+            }
         }
         // capture the window's outer position + inner size for next launch; a
         // minimized window reports zero size, so fall back to the last good
         // bounds instead of writing a session with no window key (which would
         // silently reset placement after a quit-while-minimized)
         let window = self.live_window_bounds().or_else(|| self.last_window_bounds.clone());
-        session::SessionFile { active_tab: main.active_tab, tabs, window }
+        session::SessionFile { active_tab, tabs, window }
     }
 
     /// the main window's current bounds, or None while minimized/degenerate
@@ -9464,7 +9869,7 @@ impl App {
                 self.relayout_all();
                 self.paint();
             }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => self.on_modifiers_changed(m.state()),
             WindowEvent::KeyboardInput { event: ke, .. } => {
                 // input-to-photon: stamp the first keypress not yet reflected on
                 // screen; paint() clears it once the resulting frame presents
@@ -9547,7 +9952,7 @@ impl App {
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
             WindowEvent::CursorEntered { .. } => self.on_cursor_entered(),
             WindowEvent::CursorLeft { .. } => self.on_cursor_left(),
-            WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
+            WindowEvent::MouseWheel { delta, phase, .. } => self.on_mouse_wheel(delta, phase),
             WindowEvent::MouseInput {
                 state, button, ..
             } => self.on_mouse_input(state, button, event_loop),
@@ -9733,6 +10138,102 @@ impl App {
         }
     }
 
+    fn update_hovered_link(
+        &mut self,
+        hovered: Option<(usize, usize, usize, String)>,
+    ) -> bool {
+        let span = hovered.as_ref().map(|(row, start, end, _)| (*row, *start, *end));
+        let target = hovered.map(|(_, _, _, target)| target);
+        if self.pw.link == span && self.pw.link_url.as_deref() == target.as_deref() {
+            return false;
+        }
+        self.pw.link = span;
+        self.pw.link_url = target;
+        if let Some(renderer) = self.pw.renderer.as_mut() {
+            renderer.set_link_preview(self.pw.link_url.as_deref());
+        }
+        true
+    }
+
+    fn refresh_hovered_link(&mut self) -> (bool, bool) {
+        let revision = self.focused_link_revision();
+        if self.link_hover_enabled()
+            && self.pw.link_revision == revision
+            && let (Some((row, start, end)), Some(_)) = (self.pw.link, self.pw.link_url.as_ref())
+            && self.focused_pane_rect().is_some_and(|(x, y, width, height)| {
+                let cursor = self.pw.cursor;
+                cursor.x >= x as f64
+                    && cursor.y >= y as f64
+                    && cursor.x < (x + width) as f64
+                    && cursor.y < (y + height) as f64
+            })
+            && let Some((hover_row, hover_col)) =
+                self.cell_in_focused(self.pw.cursor.x as f32, self.pw.cursor.y as f32)
+            && hover_row == row
+            && (start..end).contains(&hover_col)
+        {
+            return (false, true);
+        }
+        let hovered = if self.link_hover_enabled() {
+            self.focused_url_at(self.pw.cursor.x as f32, self.pw.cursor.y as f32)
+        } else {
+            None
+        };
+        let has_link = hovered.is_some();
+        let changed = self.update_hovered_link(hovered);
+        self.pw.link_revision = revision;
+        (changed, has_link)
+    }
+
+    fn hover_pointer(&self, has_link: bool) -> CursorIcon {
+        if has_link {
+            return CursorIcon::Pointer;
+        }
+        if !self.pw.cursor_inside || self.selecting || !self.terminal_surface_uncovered() {
+            return CursorIcon::Default;
+        }
+        if !self.mods.shift_key() && self.pane_wants_motion() {
+            return CursorIcon::Default;
+        }
+        let (x, y) = (self.pw.cursor.x as f32, self.pw.cursor.y as f32);
+        let divider = if self.mods.shift_key() {
+            None
+        } else if let (Some(content), Some(root)) = (
+            self.pw.renderer.as_ref().map(|renderer| renderer.content_rect()),
+            self.pw.tabs.get(self.pw.active_tab).and_then(|tab| tab.root.as_ref()),
+        ) {
+            divider_dir(root, content, x, y, 6.0)
+        } else {
+            None
+        };
+        match divider {
+            Some(Dir::Vertical) => CursorIcon::EwResize,
+            Some(Dir::Horizontal) => CursorIcon::NsResize,
+            None
+                if self.pw.renderer.as_ref().is_some_and(|renderer| {
+                    matches!(
+                        renderer.hit_test(x, y),
+                        Hit::Button(Hot::WindowTabs | Hot::Tab(_))
+                    )
+                }) =>
+            {
+                CursorIcon::Grab
+            }
+            None if self.pw.pane_mode && self.pane_at(x, y).is_some() => CursorIcon::Grab,
+            None => CursorIcon::Default,
+        }
+    }
+
+    fn set_hover_pointer(&mut self, has_link: bool) {
+        if self.tab_drag.is_none()
+            && self.pane_drag.is_none()
+            && self.drag_divider.is_none()
+            && self.sb_drag.is_none()
+        {
+            self.set_pointer(self.hover_pointer(has_link));
+        }
+    }
+
     /// pointer motion: hover/link/divider feedback, selection drag, mouse-report
     /// motion, divider drag. operates on self.pw so the swap reuses it for any
     /// window
@@ -9741,15 +10242,26 @@ impl App {
     // doesn't linger over the window while it's unfocused
     fn release_held_input(&mut self) {
         self.mods = ModifiersState::empty();
+        reset_zoom_gesture(&mut self.pw);
         // scroll-thumb state is window-local; tab and pane drags stay alive so
         // they can cross into another termie window
         self.sb_drag = None;
-        if self.link.take().is_some() {
+        if self.update_hovered_link(None) {
             self.set_pointer(CursorIcon::Default);
         }
+        self.pw.link_revision = self.focused_link_revision();
+    }
+
+    fn on_modifiers_changed(&mut self, modifiers: ModifiersState) {
+        if !modifiers.control_key() {
+            reset_zoom_gesture(&mut self.pw);
+        }
+        self.mods = modifiers;
     }
 
     fn on_cursor_left(&mut self) {
+        self.pw.cursor_inside = false;
+        reset_zoom_gesture(&mut self.pw);
         let Some(current) = self.pw.window.as_ref().map(|window| window.id()) else {
             return;
         };
@@ -9764,9 +10276,15 @@ impl App {
             self.show_tab_drop(None);
             self.show_drag_preview(None);
         }
+        if self.update_hovered_link(None) {
+            self.set_pointer(CursorIcon::Default);
+            self.redraw();
+        }
+        self.pw.link_revision = self.focused_link_revision();
     }
 
     fn on_cursor_entered(&mut self) {
+        self.pw.cursor_inside = true;
         let Some(current) = self.pw.window.as_ref().map(|window| window.id()) else {
             return;
         };
@@ -9774,6 +10292,11 @@ impl App {
             && drag.source == current
         {
             drag.left_window = false;
+        }
+        let (changed, has_link) = self.refresh_hovered_link();
+        self.set_hover_pointer(has_link);
+        if changed {
+            self.redraw();
         }
         if let Some(drag) = self.pane_drag.as_mut()
             && drag.source_window == current
@@ -9783,6 +10306,7 @@ impl App {
     }
 
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+        self.pw.cursor_inside = true;
         self.pw.cursor = position;
         let (px, py) = (position.x as f32, position.y as f32);
         // hovering the open palette moves its selection with the pointer
@@ -9975,10 +10499,20 @@ impl App {
                 if wants {
                     self.report_to_pane(id, btn, true, true);
                 }
+                let (changed, has_link) = self.refresh_hovered_link();
+                self.set_hover_pointer(has_link);
+                if changed {
+                    self.redraw();
+                }
                 return;
             } else if self.pane_wants_motion() {
                 // 1003 any-motion with no button held
                 self.mouse_report(3, true, true);
+                let (changed, has_link) = self.refresh_hovered_link();
+                self.set_hover_pointer(has_link);
+                if changed {
+                    self.redraw();
+                }
                 return;
             }
         }
@@ -10019,64 +10553,42 @@ impl App {
             // clickable without holding a modifier. opening still needs
             // ctrl+click (checked against tracked modifiers at click time); a plain
             // click here still starts a selection
-            let new_link = if !self.pw.settings_open {
-                self.focused_url_at(px, py).map(|(r, a, b, _)| (r, a, b))
-            } else {
-                None
-            };
-            if new_link != self.link {
-                self.link = new_link;
+            let (link_changed, has_link) = self.refresh_hovered_link();
+            if link_changed {
                 self.redraw();
             }
-            let icon = if new_link.is_some() {
-                CursorIcon::Pointer
-            } else {
-                // otherwise show a resize pointer over a split divider
-                let dir = if self.pw.settings_open || self.mods.shift_key() {
-                    None
-                } else if let (Some(content), Some(root)) = (
-                    self.pw.renderer.as_ref().map(|r| r.content_rect()),
-                    self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()),
-                ) {
-                    divider_dir(root, content, px, py, 6.0)
-                } else {
-                    None
-                };
-                match dir {
-                    Some(Dir::Vertical) => CursorIcon::EwResize,
-                    Some(Dir::Horizontal) => CursorIcon::NsResize,
-                    None
-                        if self.pw.renderer.as_ref().is_some_and(|renderer| {
-                            matches!(
-                                renderer.hit_test(px, py),
-                                Hit::Button(Hot::WindowTabs | Hot::Tab(_))
-                            )
-                        }) =>
-                    {
-                        CursorIcon::Grab
-                    }
-                    None if self.pw.pane_mode && self.pane_at(px, py).is_some() => CursorIcon::Grab,
-                    None => CursorIcon::Default,
-                }
-            };
-            self.set_pointer(icon);
+            self.set_hover_pointer(has_link);
         }
     }
 
     /// wheel: settings-panel scroll, mouse-report wheel buttons, or local scrollback
-    fn on_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
-        use winit::event::MouseScrollDelta;
+    fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        if phase == TouchPhase::Started {
+            reset_zoom_gesture(&mut self.pw);
+        } else if phase == TouchPhase::Cancelled {
+            reset_zoom_gesture(&mut self.pw);
+            return;
+        }
         // ctrl+wheel zooms the content font, like every other windows terminal
         if self.mods.control_key() {
-            let y = match delta {
-                MouseScrollDelta::LineDelta(_, y) => y,
-                MouseScrollDelta::PixelDelta(p) => p.y as f32,
-            };
-            if y != 0.0 {
-                self.nudge_font(if y > 0.0 { 1.0 } else { -1.0 });
+            let scale_factor =
+                self.pw.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0);
+            let (kind, delta) = normalized_zoom_delta(delta, scale_factor);
+            let steps = accumulated_zoom_steps(
+                &mut self.pw.zoom_accum,
+                &mut self.pw.zoom_delta_kind,
+                kind,
+                delta,
+            );
+            if phase == TouchPhase::Ended {
+                reset_zoom_gesture(&mut self.pw);
+            }
+            if steps != 0.0 {
+                self.nudge_font(steps);
             }
             return;
         }
+        reset_zoom_gesture(&mut self.pw);
         let (cx, cy) = (self.pw.cursor.x as f32, self.pw.cursor.y as f32);
         // the open settings panel grabs the wheel when hovered
         if self.pw.settings_open {
@@ -10274,7 +10786,7 @@ impl App {
                 }
                 // find-bar buttons: regex toggle / prev / next / close (misses
                 // fall through so text can still be selected while find is open)
-                if self.find.is_some()
+                if self.find_is_open_here()
                     && state == ElementState::Pressed
                     && let Some(btn) = self.pw.renderer.as_ref().and_then(|r| r.find_btn_at(cx, cy))
                 {
@@ -10285,10 +10797,7 @@ impl App {
                         }
                         1 => self.find_step(false),
                         2 => self.find_step(true),
-                        _ => {
-                            self.find = None;
-                            self.redraw();
-                        }
+                        _ => self.close_find(),
                     }
                     return;
                 }
@@ -10343,6 +10852,11 @@ impl App {
                 if state == ElementState::Released
                     && let Some((btn, id)) = self.mouse_down.take() {
                         self.report_to_pane(id, btn, false, false);
+                        let (changed, has_link) = self.refresh_hovered_link();
+                        self.set_hover_pointer(has_link);
+                        if changed {
+                            self.redraw();
+                        }
                         return;
                     }
                 // while the settings panel is open, a press outside it dismisses it
@@ -10417,13 +10931,34 @@ impl App {
                 }
                 // ctrl+click opens a web link under the cursor (before any TUI
                 // forwarding, so it works inside mouse-reporting apps too)
-                if state == ElementState::Pressed && self.mods.control_key()
-                    && let Some((_, _, _, url)) = self.focused_url_at(cx, cy) {
+                if state == ElementState::Pressed
+                    && self.mods.control_key()
+                    && self.link_hover_enabled()
+                {
+                    if let Some((row, start, end, url)) = self.focused_url_at(cx, cy) {
+                        if !link_preview_matches(
+                            self.pw.link,
+                            self.pw.link_url.as_deref(),
+                            row,
+                            start,
+                            end,
+                            &url,
+                        ) {
+                            self.update_hovered_link(Some((row, start, end, url)));
+                            self.redraw();
+                            return;
+                        }
                         if !win::open_url(&url) {
                             self.show_notice("couldn't open browser");
                         }
                         return;
                     }
+                    if self.update_hovered_link(None) {
+                        self.set_pointer(CursorIcon::Default);
+                        self.redraw();
+                        return;
+                    }
+                }
                 // a click on a plugin dock widget notifies the owning plugin
                 if state == ElementState::Pressed {
                     let di = self.pw.renderer.as_ref().and_then(|r| r.widget_at(cx, cy));
@@ -10650,6 +11185,11 @@ impl App {
                                 self.copy_selection();
                             }
                         }
+                        let (link_changed, has_link) = self.refresh_hovered_link();
+                        self.set_hover_pointer(has_link);
+                        if link_changed {
+                            self.redraw();
+                        }
                         // tabs already switched on press, so a tab release is a no-op
                         if let Some(h) = self.pressed.take()
                             && matches!(hit, Some(Hit::Button(hh)) if hh == h)
@@ -10827,7 +11367,7 @@ impl App {
         // never over an open overlay or pane mode
         if !self.keybindings.is_empty()
             && self.market.is_none()
-            && self.find.is_none()
+            && !self.find_is_open_here()
             && self.palette.is_none()
             && self.font_pick.is_none()
             && !self.pw.settings_open
@@ -10851,7 +11391,7 @@ impl App {
         // shell still receives the interrupt. ctrl+shift+c stays the unconditional
         // copy chord
         if self.market.is_none()
-            && self.find.is_none()
+            && !self.find_is_open_here()
             && self.palette.is_none()
             && self.font_pick.is_none()
             && !self.pw.settings_open
@@ -10873,11 +11413,10 @@ impl App {
             return true;
         }
         // find-in-scrollback overlay captures every key while open
-        if self.find.is_some() {
+        if self.find_is_open_here() {
             match logical {
                 Key::Named(NamedKey::Escape) => {
-                    self.find = None;
-                    self.redraw();
+                    self.close_find();
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.find_step(!self.mods.shift_key());
@@ -11120,6 +11659,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut cwd_changed = false;
                 let mut status_changed = false;
                 let mut state_event: Option<plugin::HostEvent> = None;
+                let active_tab = self.pw.active_tab;
                 for (ti, tab) in self.pw.tabs.iter_mut().enumerate() {
                     if let Some(root) = tab.root.as_mut()
                         && let Some(p) = find_pane_mut(root, id) {
@@ -11149,7 +11689,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // command finishing in the viewed pane is already
                             // seen, so it never earns a done badge
                             let viewed =
-                                self.pw.focused && ti == self.pw.active_tab && tab.focused == id;
+                                self.pw.focused && ti == active_tab && tab.focused == id;
                             let status = if p.term.cmd_running {
                                 p.term.cmd_done = None;
                                 PaneStatus::Running
@@ -11329,6 +11869,12 @@ impl ApplicationHandler<UserEvent> for App {
                     {
                         self.plugins_broadcast_gated("read_output", &ev);
                     }
+                }
+                if found
+                    && self.find.as_ref().is_some_and(|find| find.owner_pane == id)
+                {
+                    self.find_refresh_at =
+                        Some(Instant::now() + Duration::from_millis(250));
                 }
                 // a pane that just became ready may need its deferred resize
                 if newly_ready {
@@ -11711,12 +12257,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => {
-                self.mods = m.state();
+                self.on_modifiers_changed(m.state());
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
             WindowEvent::CursorEntered { .. } => self.on_cursor_entered(),
             WindowEvent::CursorLeft { .. } => self.on_cursor_left(),
-            WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(delta),
+            WindowEvent::MouseWheel { delta, phase, .. } => self.on_mouse_wheel(delta, phase),
             WindowEvent::MouseInput {
                 state, button, ..
             } => self.on_mouse_input(state, button, event_loop),
@@ -11905,6 +12451,19 @@ impl ApplicationHandler<UserEvent> for App {
             if self.session_dirty {
                 self.session_dirty = false;
                 self.write_session();
+            }
+        }
+        if let Some(t) = self.find_refresh_at
+            && Instant::now() >= t
+        {
+            self.find_refresh_at = None;
+            let owner = self.find.as_ref().map(|find| find.owner_pane);
+            if owner.is_some() && owner == self.active_focused_id() {
+                self.find_refresh();
+            } else if let Some(index) = owner.and_then(|pane| self.satellite_with_pane(pane)) {
+                self.with_window(index, |app| app.find_refresh());
+            } else {
+                self.close_find();
             }
         }
         if let Some(t) = self.sync_redraw_pending {
@@ -12102,6 +12661,12 @@ impl ApplicationHandler<UserEvent> for App {
         let notice_ms: Option<u64> = self
             .notice_until
             .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 10);
+        let session_ms: Option<u64> = self
+            .session_flush_at
+            .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 1);
+        let find_ms: Option<u64> = self
+            .find_refresh_at
+            .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 1);
         // a pending --drive step wakes the loop at its due time
         let drive_ms: Option<u64> = self.drive.as_ref().and_then(|d| {
             let started = d.started?;
@@ -12123,6 +12688,8 @@ impl ApplicationHandler<UserEvent> for App {
             .into_iter()
             .chain(sat_ms)
             .chain(notice_ms)
+            .chain(session_ms)
+            .chain(find_ms)
             .chain(drive_ms)
             .chain(kwin_ms)
             .min()
@@ -13463,18 +14030,6 @@ mod tests {
     }
 
     #[test]
-    fn find_after_grid_change_snaps_to_first_match() {
-        let hits = vec![(3, 0), (5, 2), (9, 1)];
-        let (m, cur) = find_after_grid_change(hits.clone());
-        assert_eq!(m, hits);
-        assert_eq!(cur, 0);
-        // empty result still resets the cursor so next/prev do not wrap a stale index
-        let (m2, cur2) = find_after_grid_change(Vec::<(usize, usize)>::new());
-        assert!(m2.is_empty());
-        assert_eq!(cur2, 0);
-    }
-
-    #[test]
     fn fuzzy_palette_matches_and_ranks() {
         assert!(fuzzy_score("xyz", "new tab").is_none());
         assert!(fuzzy_score("nt", "new tab").is_some());
@@ -13577,6 +14132,155 @@ mod tests {
         let mut v = Vec::new();
         each_pane(node, &mut |p| v.push(p.id));
         v
+    }
+
+    #[test]
+    fn quit_counts_every_window() {
+        let main = pane_window(None, None, vec![tab_from_pane(tp(1))]);
+        let mut satellite_tab = tab_from_pane(tp(2));
+        satellite_tab.root = Some(split(Dir::Vertical, 0.5, leaf(2), leaf(3)));
+        let satellite = pane_window(None, None, vec![satellite_tab]);
+        assert_eq!(pane_window_counts([&main, &satellite]), (2, 3));
+        assert_eq!(pane_window_counts([&satellite, &main]), (2, 3));
+    }
+
+    #[test]
+    fn session_tabs_skip_forwarded_windows_but_keep_tear_offs() {
+        let mut main = pane_window(None, None, vec![tab_from_pane(tp(1))]);
+        main.tabs[0].title = Some("main".to_string());
+        let mut forwarded = pane_window(None, None, vec![tab_from_pane(tp(2))]);
+        forwarded.tabs[0].title = Some("forwarded".to_string());
+        forwarded.session_ephemeral = true;
+        let mut tear_off = pane_window(None, None, vec![tab_from_pane(tp(3))]);
+        tear_off.tabs[0].title = Some("tear off".to_string());
+
+        let mut tabs = Vec::new();
+        for window in [&main, &forwarded, &tear_off] {
+            append_session_tabs(window, &mut tabs);
+        }
+        assert_eq!(
+            tabs.iter().map(|tab| tab.title.as_deref()).collect::<Vec<_>>(),
+            vec![Some("main"), Some("tear off")]
+        );
+    }
+
+    #[test]
+    fn dropped_paths_require_shell_ownership_and_prompt_markers() {
+        let mut pane = tp(1);
+        assert!(!pane.at_integrated_shell_prompt());
+
+        pane.term.last_osc133 = Some(term::Osc133::PromptEnd);
+        assert!(pane.has_integrated_shell_prompt());
+        assert!(!pane.at_integrated_shell_prompt());
+
+        pane.term.cmd_running = true;
+        assert!(!pane.has_integrated_shell_prompt());
+        assert!(!pane.at_integrated_shell_prompt());
+
+        let wrapped = b"\x1b[200~two\r\nlines\x1b[201~";
+        assert!(submits_shell_command(false, wrapped));
+        assert!(!submits_shell_command(true, wrapped));
+    }
+
+    #[test]
+    fn precision_wheel_zoom_accumulates_fractional_lines() {
+        let mut accumulator = 0.0;
+        let mut kind = None;
+        let mut steps = 0.0;
+        for _ in 0..120 {
+            steps += accumulated_zoom_steps(
+                &mut accumulator,
+                &mut kind,
+                ZoomDeltaKind::Lines,
+                (1.0f32 / 120.0) as f64,
+            );
+        }
+        assert_eq!(steps, 1.0);
+        assert!(accumulator.abs() < 0.000_01);
+    }
+
+    #[test]
+    fn precision_zoom_is_per_window_and_resets_on_delta_kind_change() {
+        let mut first = pane_window(None, None, Vec::new());
+        let mut second = pane_window(None, None, Vec::new());
+        assert_eq!(
+            accumulated_zoom_steps(
+                &mut first.zoom_accum,
+                &mut first.zoom_delta_kind,
+                ZoomDeltaKind::Lines,
+                0.6,
+            ),
+            0.0
+        );
+        assert_eq!(
+            accumulated_zoom_steps(
+                &mut second.zoom_accum,
+                &mut second.zoom_delta_kind,
+                ZoomDeltaKind::Lines,
+                0.6,
+            ),
+            0.0
+        );
+        assert_eq!(
+            accumulated_zoom_steps(
+                &mut first.zoom_accum,
+                &mut first.zoom_delta_kind,
+                ZoomDeltaKind::Lines,
+                0.4,
+            ),
+            1.0
+        );
+        assert_eq!(second.zoom_accum, 0.6);
+        assert_eq!(
+            accumulated_zoom_steps(
+                &mut second.zoom_accum,
+                &mut second.zoom_delta_kind,
+                ZoomDeltaKind::Pixels,
+                0.5,
+            ),
+            0.0
+        );
+        assert_eq!(second.zoom_accum, 0.5);
+    }
+
+    #[test]
+    fn pixel_zoom_uses_logical_distance() {
+        let (_, one_step) = normalized_zoom_delta(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 80.0)),
+            2.0,
+        );
+        assert_eq!(one_step, 1.0);
+    }
+
+    #[test]
+    fn ending_a_zoom_gesture_clears_its_remainder() {
+        let mut window = pane_window(None, None, Vec::new());
+        window.zoom_accum = 0.75;
+        window.zoom_delta_kind = Some(ZoomDeltaKind::Lines);
+        reset_zoom_gesture(&mut window);
+        assert_eq!(window.zoom_accum, 0.0);
+        assert_eq!(window.zoom_delta_kind, None);
+    }
+
+    #[test]
+    fn link_open_requires_the_shown_span_and_target() {
+        assert!(!link_preview_matches(None, None, 4, 2, 8, "https://example.com"));
+        assert!(!link_preview_matches(
+            Some((3, 2, 8)),
+            Some("https://example.com"),
+            4,
+            2,
+            8,
+            "https://example.com",
+        ));
+        assert!(link_preview_matches(
+            Some((4, 2, 8)),
+            Some("https://example.com"),
+            4,
+            2,
+            8,
+            "https://example.com",
+        ));
     }
 
     #[test]
@@ -13730,6 +14434,7 @@ mod tests {
     #[test]
     fn handle_kitty_transmit_display_and_delete_all() {
         let mut term = term::Terminal::new(4, 8);
+        let initial_revision = term.revision;
         // a=T transmits + displays a 1x1 RGBA image scaled to a 3x2 cell box
         // and (quiet 0) queues an OK ack
         let cmd = apc::KittyCmd {
@@ -13751,6 +14456,7 @@ mod tests {
             payload: vec![1, 2, 3, 4],
         };
         handle_kitty(&mut term, &cmd);
+        assert!(term.revision > initial_revision);
         assert_eq!(term.grid.placements().len(), 1);
         assert_eq!((term.grid.placements()[0].cols, term.grid.placements()[0].rows), (3, 2));
         // the cursor steps past the box like text: right 3, down onto row 2's last line
@@ -13775,7 +14481,9 @@ mod tests {
             quiet: 0,
             payload: vec![],
         };
+        let displayed_revision = term.revision;
         handle_kitty(&mut term, &del);
+        assert!(term.revision > displayed_revision);
         assert!(term.grid.placements().is_empty());
     }
 

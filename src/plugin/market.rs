@@ -411,34 +411,93 @@ impl ProcessTree {
     }
 
     pub(crate) fn attach_handle(process: windows::Win32::Foundation::HANDLE) -> Self {
+        Self::new_kill_on_close()
+            .and_then(|job| {
+                job.assign_handle(process)?;
+                Ok(job)
+            })
+            .unwrap_or(Self(None))
+    }
+
+    pub(crate) fn new_kill_on_close() -> std::io::Result<Self> {
         use windows::Win32::{
             System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
                 SetInformationJobObject,
             },
         };
 
-        let mut job = Self(unsafe { CreateJobObjectW(None, None).ok() });
-        let Some(handle) = job.0 else {
-            return job;
-        };
+        let handle = unsafe { CreateJobObjectW(None, None) }
+            .map_err(|error| std::io::Error::other(error.message()))?;
+        let mut job = Self(Some(handle));
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
+        if let Err(error) = unsafe {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
                 &limits as *const _ as _,
                 std::mem::size_of_val(&limits).try_into().unwrap(),
             )
-            .and_then(|_| AssignProcessToJobObject(handle, process))
-            .is_ok()
-        };
-        if !configured {
+        } {
             job.close();
+            return Err(std::io::Error::other(error.message()));
         }
-        job
+        Ok(job)
+    }
+
+    pub(crate) fn assign_handle(
+        &self,
+        process: windows::Win32::Foundation::HANDLE,
+    ) -> std::io::Result<()> {
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let handle = self
+            .0
+            .ok_or_else(|| std::io::Error::other("process job is unavailable"))?;
+        unsafe { AssignProcessToJobObject(handle, process) }
+            .map_err(|error| std::io::Error::other(error.message()))
+    }
+
+    pub(crate) fn contains_only(&self, process_id: u32) -> bool {
+        use windows::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+            QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_BASIC_PROCESS_ID_LIST,
+        };
+
+        let Some(handle) = self.0 else {
+            return false;
+        };
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                Some(handle),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                None,
+            )
+        }
+        .is_err()
+            || accounting.ActiveProcesses != 1
+        {
+            return false;
+        }
+        let mut processes = JOBOBJECT_BASIC_PROCESS_ID_LIST::default();
+        unsafe {
+            QueryInformationJobObject(
+                Some(handle),
+                JobObjectBasicProcessIdList,
+                (&mut processes as *mut JOBOBJECT_BASIC_PROCESS_ID_LIST).cast(),
+                std::mem::size_of_val(&processes) as u32,
+                None,
+            )
+        }
+        .is_ok()
+            && processes.NumberOfProcessIdsInList == 1
+            && processes.ProcessIdList[0] == process_id as usize
     }
 
     pub(crate) fn terminate(&mut self) {

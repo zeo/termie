@@ -842,6 +842,43 @@ pub fn clear_attention(w: &winit::window::Window) {
     emit_launcher_update("{'urgent': <false>}");
 }
 
+/// current file-drop point in window client coordinates
+#[cfg(windows)]
+pub fn drop_position(
+    window: &winit::window::Window,
+    _fallback: winit::dpi::PhysicalPosition<f64>,
+) -> Option<winit::dpi::PhysicalPosition<f64>> {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return None;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point).ok()?;
+        if !ScreenToClient(hwnd, &mut point).as_bool() {
+            return None;
+        }
+    }
+    Some(winit::dpi::PhysicalPosition::new(
+        point.x as f64,
+        point.y as f64,
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn drop_position(
+    _window: &winit::window::Window,
+    _fallback: winit::dpi::PhysicalPosition<f64>,
+) -> Option<winit::dpi::PhysicalPosition<f64>> {
+    None
+}
+
 /// the user's "roll the wheel to scroll N lines" setting; u32::MAX is the
 /// "one screen at a time" sentinel (WHEEL_PAGESCROLL)
 #[cfg(windows)]
@@ -897,7 +934,7 @@ pub fn local_hm() -> String {
     format!("{h:02}:{m:02}")
 }
 
-fn web_url_is_safe(url: &str) -> bool {
+pub(crate) fn web_url_is_safe(url: &str) -> bool {
     let rest = if url.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://")) {
         &url[7..]
     } else if url.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://")) {
@@ -909,7 +946,21 @@ fn web_url_is_safe(url: &str) -> bool {
     let host = authority.rsplit('@').next().unwrap_or_default();
     !host.is_empty()
         && !host.starts_with(':')
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        && host.is_ascii()
+        && !host.contains('%')
+        && !url.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || c == '\\'
+                || matches!(
+                    c,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
 }
 
 /// open an http(s) URL in the default browser via the shell. the scheme is
@@ -1543,6 +1594,23 @@ mod defterm_reg_tests {
         let key = super::CLSID_KEY.to_ascii_uppercase();
         let clsid = super::termie_clsid_string().to_ascii_uppercase();
         assert!(key.ends_with(&clsid), "{key} vs {clsid}");
+    }
+
+    #[test]
+    fn web_url_gate_allows_normal_web_urls_only() {
+        assert!(super::web_url_is_safe("https://example.com/path?q=one#part"));
+        assert!(super::web_url_is_safe("HTTP://EXAMPLE.COM"));
+        assert!(!super::web_url_is_safe("file:///C:/nope"));
+        assert!(!super::web_url_is_safe("https:///missing-host"));
+        assert!(!super::web_url_is_safe("https://example.com/a b"));
+        assert!(!super::web_url_is_safe("https:\\\\example.com"));
+        assert!(!super::web_url_is_safe(
+            "https://example.com/\u{202e}moc.elpmaxe"
+        ));
+        assert!(!super::web_url_is_safe(
+            "https://ex\u{0430}mple.com"
+        ));
+        assert!(!super::web_url_is_safe("https://ex%61mple.com"));
     }
 }
 
@@ -2191,6 +2259,9 @@ mod tests {
         assert!(!web_url_is_safe("https://example.com\nfile:///tmp/nope"));
         assert!(!web_url_is_safe("https://example.com/a b"));
         assert!(!web_url_is_safe("https:\\\\example.com"));
+        assert!(!web_url_is_safe("https://example.com/\u{202e}moc.elpmaxe"));
+        assert!(!web_url_is_safe("https://ex\u{0430}mple.com"));
+        assert!(!web_url_is_safe("https://ex%61mple.com"));
         assert!(!open_url("file:///tmp/nope"));
     }
 

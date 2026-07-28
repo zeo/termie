@@ -15,6 +15,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+const MONIKER_PREFIX: &str = "termie.plugin.";
+const MAX_MONIKER_LEN: usize = 64;
+
 /// a plugin process running inside a bwrap jail plus the host ends of its
 /// stdio pipes. dropping or `kill`ing it stops the process
 pub struct Sandboxed {
@@ -132,14 +135,16 @@ pub fn spawn(
     Ok(Sandboxed { child, terminated: false })
 }
 
-/// a conservative moniker derived from a plugin id, mirroring the windows
-/// naming so logs and config read the same on both platforms
+/// a stable moniker derived from an already validated plugin id
 pub fn moniker_for(id: &str) -> String {
-    let mut m = format!("termie.plugin.{id}");
-    if m.len() > 64 {
-        m.truncate(64);
+    let direct = format!("{MONIKER_PREFIX}{id}");
+    if direct.len() <= MAX_MONIKER_LEN {
+        return direct;
     }
-    m
+    let digest = crate::update::sha256_hex(id.as_bytes());
+    let suffix = &digest[..32];
+    let visible = MAX_MONIKER_LEN - MONIKER_PREFIX.len() - suffix.len() - 1;
+    format!("{MONIKER_PREFIX}{}-{suffix}", &id[..visible])
 }
 
 #[cfg(test)]
@@ -149,7 +154,19 @@ mod tests {
     #[test]
     fn moniker_is_bounded_and_prefixed() {
         assert_eq!(moniker_for("pet"), "termie.plugin.pet");
-        assert!(moniker_for(&"x".repeat(100)).len() <= 64);
+        let longest_direct = "x".repeat(MAX_MONIKER_LEN - MONIKER_PREFIX.len());
+        assert_eq!(
+            moniker_for(&longest_direct),
+            format!("{MONIKER_PREFIX}{longest_direct}")
+        );
+        let first = format!("{}a", "x".repeat(63));
+        let second = format!("{}b", "x".repeat(63));
+        assert_eq!(moniker_for(&first).len(), 64);
+        assert_ne!(moniker_for(&first), moniker_for(&second));
+        assert_eq!(
+            moniker_for(&first),
+            "termie.plugin.xxxxxxxxxxxxxxxxx-2fc161cbc92f96faebbbb9dd80287517"
+        );
     }
 
     #[test]

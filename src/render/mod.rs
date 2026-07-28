@@ -232,6 +232,7 @@ pub struct FindView {
     pub query: String,
     pub count: usize,
     pub current: usize,
+    pub capped: bool,
     pub matches: Vec<(usize, usize, usize, bool)>,
     /// regex mode is on (the .* button paints lit)
     pub regex_on: bool,
@@ -527,6 +528,105 @@ fn in_rect(x: f32, y: f32, r: (f32, f32, f32, f32)) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
+struct LinkPreview {
+    display: String,
+    host_end: usize,
+    display_chars: usize,
+    host_chars: usize,
+    fitted: String,
+    fitted_chars: usize,
+    fitted_for: usize,
+}
+
+impl LinkPreview {
+    fn new(target: &str) -> Self {
+        let (scheme, rest) = if target
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        {
+            ("https", &target[8..])
+        } else if target
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        {
+            ("http", &target[7..])
+        } else {
+            ("", target)
+        };
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let suffix = &rest[authority_end..];
+        let display = if scheme.is_empty() {
+            target.to_string()
+        } else {
+            format!("{host}  {scheme}{suffix}")
+        };
+        let host_end = if scheme.is_empty() { authority_end } else { host.len() };
+        Self {
+            display_chars: display.chars().count(),
+            host_chars: display[..host_end].chars().count(),
+            display,
+            host_end,
+            fitted: String::new(),
+            fitted_chars: 0,
+            fitted_for: usize::MAX,
+        }
+    }
+
+    fn fit(&mut self, max_chars: usize) {
+        if self.fitted_for == max_chars {
+            return;
+        }
+        self.fitted_for = max_chars;
+        self.fitted.clear();
+        if max_chars == 0 {
+            self.fitted_chars = 0;
+            return;
+        }
+        if self.display_chars <= max_chars {
+            self.fitted.push_str(&self.display);
+            self.fitted_chars = self.display_chars;
+            return;
+        }
+        let host = &self.display[..self.host_end];
+        if self.host_chars > max_chars {
+            if max_chars == 1 {
+                self.fitted.push('\u{2026}');
+            } else {
+                let visible = max_chars - 1;
+                let prefix_chars = visible.div_ceil(2);
+                let suffix_chars = visible - prefix_chars;
+                let prefix_end = host
+                    .char_indices()
+                    .nth(prefix_chars)
+                    .map(|(index, _)| index)
+                    .unwrap_or(host.len());
+                let suffix_start = host
+                    .char_indices()
+                    .nth(self.host_chars - suffix_chars)
+                    .map(|(index, _)| index)
+                    .unwrap_or(host.len());
+                self.fitted.push_str(&host[..prefix_end]);
+                self.fitted.push('\u{2026}');
+                self.fitted.push_str(&host[suffix_start..]);
+            }
+            self.fitted_chars = max_chars;
+            return;
+        }
+        self.fitted.push_str(host);
+        let remaining = max_chars - self.host_chars;
+        if remaining >= 2 {
+            self.fitted
+                .extend(self.display[self.host_end..].chars().take(remaining - 1));
+            self.fitted.push('\u{2026}');
+            self.fitted_chars = max_chars;
+        } else {
+            self.fitted_chars = self.host_chars;
+        }
+    }
+}
+
 /// emit the rects (cell-local x,y,w,h) that draw an underline of the given
 /// style; shared by the GPU renderer and the dev PNG preview so they match.
 /// `ascent`/`px` anchor the line to the font's baseline — at line heights
@@ -720,6 +820,7 @@ pub struct Renderer {
     /// transient program-notification text shown in the status bar's right
     /// cluster in place of READY (the app expires it after a few seconds)
     notice: Option<String>,
+    link_preview: Option<LinkPreview>,
     /// a newer release's version: draws a clickable UPDATE chip on the status
     /// bar until installed. its hit rect is rebuilt each paint
     update_chip: Option<String>,
@@ -1430,6 +1531,7 @@ impl Renderer {
             status_clock: String::new(),
             status_sessions: 1,
             notice: None,
+            link_preview: None,
             update_chip: None,
             update_hit: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
@@ -2042,6 +2144,10 @@ impl Renderer {
     /// transient status-bar notification text (None clears the readout)
     pub fn set_notice(&mut self, notice: Option<String>) {
         self.notice = notice;
+    }
+
+    pub fn set_link_preview(&mut self, target: Option<&str>) {
+        self.link_preview = target.map(LinkPreview::new);
     }
 
     /// a pending update's version for the status-bar chip (None clears it)
@@ -3012,15 +3118,64 @@ impl Renderer {
         // so the image shows wherever a cell has no ink or colored background
         Self::push_image_placements(atlas, out, term, ox, oy, cell_w, cell_h, true);
 
-        // find-match highlights drawn beneath glyphs; current match is brighter
-        for &(mr, mc, mlen, cur) in matches {
-            let (col, alpha) = if cur { (palette.cursor, 0.75) } else { (palette.sel, 0.45) };
-            for k in 0..mlen {
-                let cc = mc + k;
-                if cc >= grid.cols {
-                    break;
+        for r in 0..grid.rows {
+            let line = grid.line_at(r);
+            for c in 0..grid.cols {
+                let cell = line.get(c).copied().unwrap_or_default();
+                if cell.attrs.hidden() {
+                    continue;
                 }
-                Self::push_rect(out, ox + cc as f32 * cell_w, oy + mr as f32 * cell_h, cell_w, cell_h, col, alpha);
+                let mut bg = cell.bg;
+                if cell.attrs.inverse() {
+                    bg = cell.fg;
+                }
+                let bg = palette.resolve_bg(bg);
+                if bg != palette.bg {
+                    Self::push_rect(
+                        out,
+                        ox + c as f32 * cell_w,
+                        oy + r as f32 * cell_h,
+                        cell_w,
+                        cell_h,
+                        bg,
+                        1.0,
+                    );
+                }
+            }
+        }
+
+        for &(row, start, len, current) in matches {
+            if row >= grid.rows {
+                continue;
+            }
+            let line = grid.line_at(row);
+            let end = start.saturating_add(len).min(grid.cols);
+            let (color, alpha) =
+                if current { (palette.cursor, 0.75) } else { (palette.sel, 0.45) };
+            let mut col = start.min(end);
+            while col < end {
+                while col < end
+                    && line.get(col).is_some_and(|cell| cell.attrs.hidden())
+                {
+                    col += 1;
+                }
+                let visible_start = col;
+                while col < end
+                    && !line.get(col).is_some_and(|cell| cell.attrs.hidden())
+                {
+                    col += 1;
+                }
+                if visible_start < col {
+                    Self::push_rect(
+                        out,
+                        ox + visible_start as f32 * cell_w,
+                        oy + row as f32 * cell_h,
+                        (col - visible_start) as f32 * cell_w,
+                        cell_h,
+                        color,
+                        alpha,
+                    );
+                }
             }
         }
 
@@ -3037,10 +3192,7 @@ impl Renderer {
         let mut run_buf = String::new();
         for r in 0..grid.rows {
             let line = grid.line_at(r);
-            // cells whose glyph a ligature strip already covers this row; the
-            // strip instance itself is held back until the run's LAST cell so
-            // it lands after every covered cell's bg/selection rects (pushed
-            // per cell, later in the vec, and thus painted over it otherwise)
+            // hold a ligature strip until its cells have painted selection
             let mut liga_until = 0usize;
             let mut liga_strip: Option<Instance> = None;
             let mut ph_prev: Option<PhPrev> = None;
@@ -3089,9 +3241,6 @@ impl Renderer {
                     })
                     .unwrap_or(false);
 
-                if bg != palette.bg {
-                    Self::push_rect(out, x, y, cell_w, cell_h, bg, 1.0);
-                }
                 if selected {
                     Self::push_rect(out, x, y, cell_w, cell_h, sel_col, 0.9);
                 }
@@ -4116,6 +4265,68 @@ impl Renderer {
             let _ = Self::draw_text(
                 &mut self.atlas, &mut out, FontId::Chrome, rx_n, st_top, &shown, PAPER, 1.0, track,
             );
+        } else if self.broadcast {
+            let ready = "BROADCAST";
+            let ready_w = self.text_w(FontId::Chrome, ready, wide);
+            let rx_ready = rx_ver - (16.0 * self.scale).round() - ready_w;
+            let _ = Self::draw_text(
+                &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, PAPER, 1.0, wide,
+            );
+        } else if self.link_preview.is_some() {
+            let avail = (rx_ver - (16.0 * self.scale).round() - left_end - gap).max(0.0);
+            let full_key = "CTRL+CLICK";
+            let full_key_w = self.text_w(FontId::Chrome, full_key, wide);
+            let short_key = "LINK";
+            let short_key_w = self.text_w(FontId::Chrome, short_key, wide);
+            let value_gap = (7.0 * scale).round();
+            let chrome_char_w = self.atlas.metrics(FontId::Chrome).cell_w + track;
+            let useful_chars =
+                self.link_preview.as_ref().map(|preview| preview.host_chars.min(24)).unwrap_or(0)
+                    as f32;
+            if chrome_char_w <= avail {
+                let (key, key_w, key_gap) =
+                    if full_key_w + value_gap + useful_chars * chrome_char_w <= avail {
+                        (full_key, full_key_w, value_gap)
+                    } else if short_key_w + value_gap + useful_chars * chrome_char_w <= avail {
+                        (short_key, short_key_w, value_gap)
+                    } else {
+                        ("", 0.0, 0.0)
+                    };
+                let value_avail = (avail - key_w - key_gap).max(0.0);
+                let maxc = (value_avail / chrome_char_w).floor() as usize;
+                if let Some(preview) = self.link_preview.as_mut() {
+                    preview.fit(maxc);
+                }
+                let preview = self.link_preview.as_ref().expect("link preview exists");
+                let value = preview.fitted.as_str();
+                let value_w = preview.fitted_chars as f32 * chrome_char_w;
+                if key.is_empty() {
+                    let rx_preview = rx_ver - (16.0 * self.scale).round() - value_w;
+                    let _ = Self::draw_text(
+                        &mut self.atlas,
+                        &mut out,
+                        FontId::Chrome,
+                        rx_preview,
+                        st_top,
+                        value,
+                        MUTE,
+                        1.0,
+                        track,
+                    );
+                } else {
+                    let preview_w = key_w + key_gap + value_w;
+                    let rx_preview = rx_ver - (16.0 * self.scale).round() - preview_w;
+                    let _ = draw_seg(
+                        &mut self.atlas,
+                        &mut out,
+                        rx_preview,
+                        key,
+                        value,
+                        PAPER,
+                        MUTE,
+                    );
+                }
+            }
         } else if let Some(&(key, value)) = drag_hint_variants(self.hovered)
             .iter()
             .find(|&&(key, value)| {
@@ -4139,9 +4350,7 @@ impl Renderer {
                 MUTE,
             );
         } else {
-            let (ready, ready_col) = if self.broadcast {
-                ("BROADCAST", PAPER)
-            } else if self.pane_mode {
+            let (ready, ready_col) = if self.pane_mode {
                 ("PANE MODE", PAPER)
             } else if self.mark_mode {
                 ("MARK MODE", PAPER)
@@ -4821,6 +5030,7 @@ impl Renderer {
         let query = fv.query.clone();
         let count = fv.count;
         let current = fv.current;
+        let capped = fv.capped;
         let regex_on = fv.regex_on;
         let bad = fv.bad;
         let INK_0 = self.palette.ink0;
@@ -4873,11 +5083,13 @@ impl Renderer {
         } else if count == 0 {
             if query.is_empty() {
                 String::new()
+            } else if capped {
+                "search incomplete".to_string()
             } else {
                 "no matches".to_string()
             }
         } else {
-            format!("{}/{}", current + 1, count)
+            format!("{}/{}{}", current + 1, count, if capped { "+" } else { "" })
         };
         let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Chrome, &info, track) };
         let right_edge = rx_r.0 - 10.0 * s;
@@ -5870,7 +6082,27 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_image_v, CursorShape, GlyphAtlas, Palette, Renderer, Terminal, ThemeId};
+    use super::{
+        clip_image_v, CursorShape, GlyphAtlas, LinkPreview, Palette, Renderer, Terminal, ThemeId,
+    };
+
+    #[test]
+    fn link_preview_keeps_the_real_host_visible() {
+        let mut preview = LinkPreview::new("https://account@example.com/releases/stable");
+        preview.fit(21);
+        assert_eq!(preview.fitted, "example.com  https/r\u{2026}");
+        preview.fit(80);
+        assert_eq!(preview.fitted, "example.com  https/releases/stable");
+
+        let mut long =
+            LinkPreview::new("https://misleading-subdomain.very-long.example.com/path");
+        long.fit(12);
+        assert_eq!(long.fitted, "mislea\u{2026}e.com");
+
+        let mut deceptive = LinkPreview::new("https://evil-example.com/path");
+        deceptive.fit(12);
+        assert_eq!(deceptive.fitted, "evil-e\u{2026}e.com");
+    }
 
     #[test]
     fn image_clip_fully_visible() {
@@ -6550,6 +6782,7 @@ mod hit_tests {
             query: "err".into(),
             count: 4,
             current: 1,
+            capped: false,
             matches: Vec::new(),
             regex_on: true,
             bad: false,

@@ -44,7 +44,12 @@ pub fn maybe_run() -> bool {
         "notice" => {
             // an OSC 9 notification's text on the status bar
             r.set_tab_status(vec![0, 3, 0]);
-            r.set_notice(Some("claude: waiting for your approval in web-ui".into()));
+            r.set_notice(Some("deploy: waiting for approval in web-ui".into()));
+        }
+        "link" => {
+            r.set_link_preview(Some(
+                "https://example.com/releases/termie?channel=stable#checksums",
+            ));
         }
         "gear" => {
             r.set_hovered(Some(Hot::Gear));
@@ -117,6 +122,7 @@ pub fn maybe_run() -> bool {
                 query: "parser".into(),
                 count: 3,
                 current: 1,
+                capped: false,
                 matches: vec![],
                 regex_on: false,
                 bad: false,

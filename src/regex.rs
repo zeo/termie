@@ -5,6 +5,8 @@
 //! rolled like the rest of termie's codecs — a regex crate would be the
 //! project's largest dependency, bought for one search box
 
+use std::collections::VecDeque;
+
 #[derive(Clone)]
 enum Inst {
     Char(char),
@@ -20,6 +22,13 @@ enum Inst {
 
 pub struct Regex {
     prog: Vec<Inst>,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct RegexMatches {
+    pub matches: Vec<(usize, usize)>,
+    pub truncated: bool,
+    pub budget_exhausted: bool,
 }
 
 /// one-to-one case folding, identical to the plain find's
@@ -316,10 +325,16 @@ impl Regex {
     }
 
     /// all non-overlapping leftmost-longest matches as (start, end) char
-    /// indexes. `budget` caps total work so a pathological pattern over a huge
-    /// scrollback degrades to partial results instead of freezing the UI
-    pub fn find_all(&self, hay: &[char], budget: &mut usize) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
+    /// indexes within the shared work and result limits
+    pub fn find_all(
+        &self,
+        hay: &[char],
+        budget: &mut usize,
+        limit: usize,
+    ) -> RegexMatches {
+        let mut out = VecDeque::new();
+        let mut truncated = false;
+        let mut budget_exhausted = false;
         // fast skip: when the program opens with a literal, only attempt
         // starts on that character
         let first = match self.prog.first() {
@@ -327,23 +342,49 @@ impl Regex {
             _ => None,
         };
         let mut start = 0;
-        while start < hay.len() && *budget > 0 {
+        while start < hay.len() {
+            if *budget == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            *budget -= 1;
             if let Some(f) = first
                 && fold(hay[start]) != f
             {
                 start += 1;
                 continue;
             }
-            match self.match_at(hay, start, budget) {
+            if *budget == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            let found = self.match_at(hay, start, budget);
+            if *budget == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            match found {
                 // zero-length matches (a*, ^) are noise in a find box; skip
                 Some(end) if end > start => {
-                    out.push((start, end));
+                    if limit == 0 {
+                        truncated = true;
+                        break;
+                    }
+                    if out.len() == limit {
+                        out.pop_front();
+                        truncated = true;
+                    }
+                    out.push_back((start, end));
                     start = end;
                 }
                 _ => start += 1,
             }
         }
-        out
+        RegexMatches {
+            matches: out.into(),
+            truncated,
+            budget_exhausted,
+        }
     }
 }
 
@@ -354,7 +395,7 @@ mod tests {
     fn all(pat: &str, hay: &str) -> Vec<(usize, usize)> {
         let re = Regex::compile(pat).expect("compiles");
         let chars: Vec<char> = hay.chars().collect();
-        re.find_all(&chars, &mut 1_000_000)
+        re.find_all(&chars, &mut 1_000_000, usize::MAX).matches
     }
 
     #[test]
@@ -405,7 +446,29 @@ mod tests {
         let re = Regex::compile("(a+)+$").expect("compiles");
         let hay: Vec<char> = "a".repeat(5000).chars().chain("b".chars()).collect();
         let mut budget = 10_000usize;
-        let _ = re.find_all(&hay, &mut budget);
+        let found = re.find_all(&hay, &mut budget, usize::MAX);
         assert_eq!(budget, 0, "the budget stops the scan");
+        assert!(found.budget_exhausted);
+    }
+
+    #[test]
+    fn result_limit_keeps_the_newest_matches() {
+        let re = Regex::compile("x").expect("compiles");
+        let hay: Vec<char> = "xxxxx".chars().collect();
+        let found = re.find_all(&hay, &mut 100, 3);
+        assert_eq!(found.matches, vec![(2, 3), (3, 4), (4, 5)]);
+        assert!(found.truncated);
+        assert!(!found.budget_exhausted);
+    }
+
+    #[test]
+    fn literal_skips_spend_the_work_budget() {
+        let re = Regex::compile("z").expect("compiles");
+        let hay: Vec<char> = "aaaaaaaa".chars().collect();
+        let mut budget = 3;
+        let found = re.find_all(&hay, &mut budget, usize::MAX);
+        assert!(found.matches.is_empty());
+        assert!(found.budget_exhausted);
+        assert_eq!(budget, 0);
     }
 }

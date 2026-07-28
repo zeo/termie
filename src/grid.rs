@@ -5,6 +5,22 @@ use crate::color::Color;
 
 const MAX_LINKS: usize = 4096;
 const MAX_LINK_BYTES: usize = 4096;
+const MAX_SEARCH_MATCHES: usize = 100_000;
+const MAX_SEARCH_WORK: usize = 4_000_000;
+const MAX_SEARCH_RUN_CHARS: usize = 65_536;
+
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SearchMatches {
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+    pub budget_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub start: (u64, usize),
+    pub end: (u64, usize),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum UnderlineStyle {
@@ -449,10 +465,16 @@ impl Grid {
         while hi < n && is_url(line[hi].c) {
             hi += 1;
         }
-        let run: String = line[lo..hi].iter().map(|c| c.c).collect();
-        // the url begins at the scheme inside the run (so "see http://x" works)
-        let start = run.find("https://").or_else(|| run.find("http://"))?;
-        let mut url: String = run[start..].to_string();
+        let starts_with = |at: usize, scheme: &str| {
+            at + scheme.len() <= hi
+                && line[at..at + scheme.len()]
+                    .iter()
+                    .map(|cell| cell.c)
+                    .eq(scheme.chars())
+        };
+        let col_start = (lo..hi)
+            .find(|&at| starts_with(at, "https://") || starts_with(at, "http://"))?;
+        let mut url: String = line[col_start..hi].iter().map(|cell| cell.c).collect();
         // drop trailing sentence punctuation that is unlikely to be part of it
         while url.ends_with([')', ']', '}', '.', ',', ';', ':', '!', '?', '\'', '"']) {
             url.pop();
@@ -460,7 +482,6 @@ impl Grid {
         if url.len() < 8 {
             return None;
         }
-        let col_start = lo + start;
         let col_end = col_start + url.chars().count();
         if col < col_start || col >= col_end {
             return None;
@@ -583,68 +604,162 @@ impl Grid {
         self.scrollback.len() + self.lines.len()
     }
 
+    fn line_at_global(&self, line: usize) -> &Line {
+        if line < self.scrollback.len() {
+            &self.scrollback[line]
+        } else {
+            &self.lines[line - self.scrollback.len()]
+        }
+    }
+
+    fn search_hit(
+        &self,
+        map: &[(usize, usize)],
+        start: usize,
+        end: usize,
+    ) -> SearchHit {
+        let (start_line, start_col) = map[start];
+        let (end_line, end_col) = map[end - 1];
+        let line = self.line_at_global(end_line);
+        let (end_line, end_col) = if line
+            .get(end_col + 1)
+            .is_some_and(|cell| cell.c == '\0')
+        {
+            (end_line, end_col + 2)
+        } else if end_col + 1 == line.len()
+            && char_width(line[end_col].c) == 2
+            && line.wrapped
+            && end_line + 1 < self.total_lines()
+            && self.line_at_global(end_line + 1).first().is_some_and(|cell| cell.c == '\0')
+        {
+            (end_line + 1, 1)
+        } else {
+            (end_line, end_col + 1)
+        };
+        let base = self.abs_base();
+        SearchHit {
+            start: (base + start_line as u64, start_col),
+            end: (base + end_line as u64, end_col),
+        }
+    }
+
     /// case-insensitive substring search across scrollback and the live screen;
-    /// returns (global_line_index, col, char_len) per match, in top-to-bottom
-    /// order. global indices span scrollback (0..len) then live lines.
-    /// soft-wrapped runs are joined (same as copy), so a long URL that wrapped
-    /// still matches; wide-glyph continuation cells (`\0`) are skipped
-    pub fn search(&self, needle: &str) -> Vec<(usize, usize, usize)> {
+    /// returns absolute start and exclusive end cells in top-to-bottom order
+    pub fn search(&self, needle: &str) -> SearchMatches {
+        self.search_limited(needle, MAX_SEARCH_WORK, MAX_SEARCH_MATCHES)
+    }
+
+    fn search_limited(&self, needle: &str, budget: usize, limit: usize) -> SearchMatches {
         let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
         let needle: Vec<char> = needle.chars().map(fold).collect();
         let mut out = Vec::new();
         if needle.is_empty() {
-            return out;
+            return SearchMatches::default();
         }
-        self.each_logical_run(|text, map| {
+        let mut build_budget = budget;
+        let mut match_budget = budget;
+        let mut truncated = false;
+        let mut budget_exhausted = false;
+        let built = self.each_logical_run_newest(&mut build_budget, |text, map| {
             if text.len() >= needle.len() {
-                for start in 0..=(text.len() - needle.len()) {
+                for start in (0..=(text.len() - needle.len())).rev() {
+                    if match_budget < needle.len() {
+                        budget_exhausted = true;
+                        return false;
+                    }
+                    match_budget -= needle.len();
                     if text[start..start + needle.len()] == needle[..] {
-                        let (line, col) = map[start];
-                        out.push((line, col, needle.len()));
+                        if out.len() == limit {
+                            truncated = true;
+                            return false;
+                        }
+                        out.push(self.search_hit(map, start, start + needle.len()));
                     }
                 }
             }
+            true
         });
-        out
+        if !built {
+            budget_exhausted = true;
+        }
+        out.reverse();
+        SearchMatches {
+            hits: out,
+            truncated,
+            budget_exhausted,
+        }
     }
 
     /// regex search over the same corpus as `search`, same result shape; the
     /// shared budget keeps a pathological pattern from freezing the UI
-    pub fn search_regex(&self, re: &crate::regex::Regex) -> Vec<(usize, usize, usize)> {
-        let mut out = Vec::new();
-        let mut budget = 4_000_000usize;
-        self.each_logical_run(|text, map| {
-            for (s, e) in re.find_all(text, &mut budget) {
-                let (line, col) = map[s];
-                out.push((line, col, e - s));
-            }
-        });
-        out
+    pub fn search_regex(&self, re: &crate::regex::Regex) -> SearchMatches {
+        self.search_regex_limited(re, MAX_SEARCH_WORK, MAX_SEARCH_MATCHES)
     }
 
-    /// walk every logical run (a row plus its soft-wrapped continuations) as
-    /// case-folded chars, with text[i] mapping back to (global_line, col).
-    /// one-to-one folding (first char of to_lowercase) so É matches é and
-    /// Cyrillic/Greek fold too, while every char keeps mapping to one cell
-    fn each_logical_run(&self, mut f: impl FnMut(&[char], &[(usize, usize)])) {
+    fn search_regex_limited(
+        &self,
+        re: &crate::regex::Regex,
+        budget: usize,
+        limit: usize,
+    ) -> SearchMatches {
+        let mut out = Vec::new();
+        let mut build_budget = budget;
+        let mut match_budget = budget;
+        let mut truncated = false;
+        let mut budget_exhausted = false;
+        let built = self.each_logical_run_newest(&mut build_budget, |text, map| {
+            let remaining = limit.saturating_sub(out.len());
+            let found = re.find_all(text, &mut match_budget, remaining);
+            for &(s, e) in found.matches.iter().rev() {
+                out.push(self.search_hit(map, s, e));
+            }
+            truncated |= found.truncated;
+            budget_exhausted |= found.budget_exhausted;
+            !truncated && !budget_exhausted
+        });
+        if !built {
+            budget_exhausted = true;
+        }
+        out.reverse();
+        SearchMatches {
+            hits: out,
+            truncated,
+            budget_exhausted,
+        }
+    }
+
+    /// walk logical runs newest first, bounded by the number of cells inspected
+    fn each_logical_run_newest(
+        &self,
+        budget: &mut usize,
+        mut f: impl FnMut(&[char], &[(usize, usize)]) -> bool,
+    ) -> bool {
         let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
         let total = self.total_lines();
-        let line_at_global = |gi: usize| -> &Line {
-            if gi < self.scrollback.len() {
-                &self.scrollback[gi]
-            } else {
-                &self.lines[gi - self.scrollback.len()]
-            }
-        };
         let mut text: Vec<char> = Vec::new();
         let mut map: Vec<(usize, usize)> = Vec::new();
-        let mut gi = 0;
-        while gi < total {
+        let mut end = total;
+        while end > 0 {
             text.clear();
             map.clear();
+            let mut start = end;
+            let mut clipped = false;
             loop {
-                let line = line_at_global(gi);
-                for (col, cell) in line.iter().enumerate() {
+                let gi = start - 1;
+                let line = self.line_at_global(gi);
+                let mut content_seen = line.wrapped;
+                for (col, cell) in line.iter().enumerate().rev() {
+                    if *budget == 0 || text.len() == MAX_SEARCH_RUN_CHARS {
+                        clipped = true;
+                        break;
+                    }
+                    *budget -= 1;
+                    if !content_seen {
+                        if cell.cluster == 0 && matches!(cell.c, ' ' | '\0') {
+                            continue;
+                        }
+                        content_seen = true;
+                    }
                     // skip the empty half of a wide glyph so "a漢b" still matches
                     if cell.c == '\0' {
                         continue;
@@ -652,14 +767,33 @@ impl Grid {
                     text.push(fold(cell.c));
                     map.push((gi, col));
                 }
-                if !line.wrapped || gi + 1 >= total {
+                start = gi;
+                if clipped || start == 0 || !self.line_at_global(start - 1).wrapped {
                     break;
                 }
-                gi += 1;
             }
-            f(&text, &map);
-            gi += 1;
+            text.reverse();
+            map.reverse();
+            if !f(&text, &map) {
+                return true;
+            }
+            if clipped {
+                return false;
+            }
+            end = start;
         }
+        true
+    }
+
+    pub fn visible_global_range(&self) -> std::ops::Range<usize> {
+        let end = self.total_lines().saturating_sub(self.view_offset);
+        end.saturating_sub(self.rows)..end
+    }
+
+    pub fn visible_abs_range(&self) -> std::ops::Range<u64> {
+        let visible = self.visible_global_range();
+        let base = self.abs_base();
+        base + visible.start as u64..base + visible.end as u64
     }
 
     /// viewport row currently displaying global line `g`, or None if off-screen
@@ -679,6 +813,12 @@ impl Grid {
         let target_start = g.saturating_sub(self.rows / 2);
         let vo = total.saturating_sub(self.rows).saturating_sub(target_start);
         self.view_offset = vo.min(self.scrollback.len());
+    }
+
+    pub fn scroll_to_abs(&mut self, abs: u64) {
+        if let Some(global) = abs.checked_sub(self.abs_base()) {
+            self.scroll_to_global(global as usize);
+        }
     }
 
     pub fn scroll_view(&mut self, delta: isize) {
@@ -1816,6 +1956,13 @@ impl Grid {
 mod tests {
     use super::*;
 
+    fn hit(start_line: u64, start_col: usize, end_line: u64, end_col: usize) -> SearchHit {
+        SearchHit {
+            start: (start_line, start_col),
+            end: (end_line, end_col),
+        }
+    }
+
     #[test]
     fn wraps_at_last_column() {
         let mut g = Grid::new(3, 4);
@@ -2659,11 +2806,62 @@ mod tests {
         for c in "Hello World".chars() {
             g.put_char(c);
         }
-        assert!(g.search("").is_empty());
-        assert_eq!(g.search("hello"), vec![(0, 0, 5)]);
-        assert_eq!(g.search("WORLD"), vec![(0, 6, 5)]);
-        assert_eq!(g.search("lo wo"), vec![(0, 3, 5)]);
-        assert!(g.search("xyz").is_empty());
+        assert!(g.search("").hits.is_empty());
+        assert_eq!(g.search("hello").hits, vec![hit(0, 0, 0, 5)]);
+        assert_eq!(g.search("WORLD").hits, vec![hit(0, 6, 0, 11)]);
+        assert_eq!(g.search("lo wo").hits, vec![hit(0, 3, 0, 8)]);
+        assert!(g.search("xyz").hits.is_empty());
+    }
+
+    #[test]
+    fn search_limit_keeps_the_newest_hits() {
+        let mut g = Grid::new(1, 5);
+        for cell in g.lines[0].iter_mut() {
+            cell.c = 'x';
+        }
+        let plain = g.search_limited("x", 100, 3);
+        assert_eq!(
+            plain.hits,
+            vec![hit(0, 2, 0, 3), hit(0, 3, 0, 4), hit(0, 4, 0, 5)]
+        );
+        assert!(plain.truncated);
+        assert!(!plain.budget_exhausted);
+
+        let regex = crate::regex::Regex::compile("x").expect("compile");
+        let regex_hits = g.search_regex_limited(&regex, 100, 3);
+        assert_eq!(
+            regex_hits.hits,
+            vec![hit(0, 2, 0, 3), hit(0, 3, 0, 4), hit(0, 4, 0, 5)]
+        );
+        assert!(regex_hits.truncated);
+        assert!(!regex_hits.budget_exhausted);
+    }
+
+    #[test]
+    fn search_reports_exhausted_work_budget() {
+        let mut g = Grid::new(1, 20);
+        for cell in g.lines[0].iter_mut() {
+            cell.c = 'a';
+        }
+        let plain = g.search_limited("z", 3, 10);
+        assert!(plain.hits.is_empty());
+        assert!(plain.budget_exhausted);
+
+        let regex = crate::regex::Regex::compile("z").expect("compile");
+        let regex_hits = g.search_regex_limited(&regex, 3, 10);
+        assert!(regex_hits.hits.is_empty());
+        assert!(regex_hits.budget_exhausted);
+    }
+
+    #[test]
+    fn search_caps_a_single_logical_run() {
+        let mut g = Grid::new(1, MAX_SEARCH_RUN_CHARS + 1);
+        for cell in g.lines[0].iter_mut() {
+            cell.c = 'a';
+        }
+        let found = g.search("z");
+        assert!(found.hits.is_empty());
+        assert!(found.budget_exhausted);
     }
 
     #[test]
@@ -2672,9 +2870,9 @@ mod tests {
         for c in "CAFÉ Straße ЛОГ".chars() {
             g.put_char(c);
         }
-        assert_eq!(g.search("café"), vec![(0, 0, 4)]);
-        assert_eq!(g.search("straße"), vec![(0, 5, 6)]);
-        assert_eq!(g.search("лог"), vec![(0, 12, 3)]);
+        assert_eq!(g.search("café").hits, vec![hit(0, 0, 0, 4)]);
+        assert_eq!(g.search("straße").hits, vec![hit(0, 5, 0, 11)]);
+        assert_eq!(g.search("лог").hits, vec![hit(0, 12, 0, 15)]);
     }
 
     #[test]
@@ -2695,15 +2893,15 @@ mod tests {
         }
         // scrollback[0]=alpha, live[0]=beta, live[1]=gamma
         assert_eq!(g.scrollback.len(), 1);
-        assert_eq!(g.search("alpha"), vec![(0, 0, 5)]);
-        assert_eq!(g.search("beta"), vec![(1, 0, 4)]);
-        assert_eq!(g.search("gamma"), vec![(2, 0, 5)]);
+        assert_eq!(g.search("alpha").hits, vec![hit(0, 0, 0, 5)]);
+        assert_eq!(g.search("beta").hits, vec![hit(1, 0, 1, 4)]);
+        assert_eq!(g.search("gamma").hits, vec![hit(2, 0, 2, 5)]);
         // every named hit is present; full "a" scan covers both letters of alpha
-        let a_hits = g.search("a");
-        assert!(a_hits.contains(&(0, 0, 1)));
-        assert!(a_hits.contains(&(0, 4, 1)));
-        assert!(a_hits.contains(&(1, 3, 1)));
-        assert!(a_hits.contains(&(2, 1, 1)));
+        let a_hits = g.search("a").hits;
+        assert!(a_hits.contains(&hit(0, 0, 0, 1)));
+        assert!(a_hits.contains(&hit(0, 4, 0, 5)));
+        assert!(a_hits.contains(&hit(1, 3, 1, 4)));
+        assert!(a_hits.contains(&hit(2, 1, 2, 2)));
     }
 
     #[test]
@@ -2715,7 +2913,7 @@ mod tests {
         }
         // "xxFINDME" on row 0 (wrapped), "!!yy" on row 1 — needle crosses the join
         assert!(g.lines[0].wrapped);
-        assert_eq!(g.search("FINDME!!"), vec![(0, 2, 8)]);
+        assert_eq!(g.search("FINDME!!").hits, vec![hit(0, 2, 1, 2)]);
         // a hard newline must still break the run
         g.carriage_return();
         g.linefeed();
@@ -2723,8 +2921,79 @@ mod tests {
             g.put_char(c);
         }
         // the soft-wrap match on the first logical line, plus the hard-line one
-        let hits = g.search("FINDME!!");
-        assert!(hits.contains(&(0, 2, 8)));
+        let hits = g.search("FINDME!!").hits;
+        assert!(hits.contains(&hit(0, 2, 1, 2)));
         assert!(hits.len() >= 2);
+    }
+
+    #[test]
+    fn search_spans_cover_wide_cells() {
+        let mut g = Grid::new(2, 8);
+        for c in "a漢b".chars() {
+            g.put_char(c);
+        }
+        assert_eq!(g.search("漢").hits, vec![hit(0, 1, 0, 3)]);
+        assert_eq!(g.search("a漢b").hits, vec![hit(0, 0, 0, 4)]);
+    }
+
+    #[test]
+    fn search_ignores_hard_line_padding() {
+        let mut g = Grid::new(2, 8);
+        for c in "foo".chars() {
+            g.put_char(c);
+        }
+        assert!(g.search(" ").hits.is_empty());
+        let anchored = crate::regex::Regex::compile("foo$").expect("compile");
+        assert_eq!(g.search_regex(&anchored).hits, vec![hit(0, 0, 0, 3)]);
+    }
+
+    #[test]
+    fn search_spans_a_wide_cell_split_across_wrapped_rows() {
+        let mut g = Grid::new(2, 8);
+        g.lines[0][7].c = '漢';
+        g.lines[0].wrapped = true;
+        g.lines[1][0].c = '\0';
+        assert_eq!(g.search("漢").hits, vec![hit(0, 7, 1, 1)]);
+    }
+
+    #[test]
+    fn search_before_a_split_wide_cell_stays_on_its_match() {
+        let mut g = Grid::new(2, 8);
+        g.lines[0][0].c = 'a';
+        g.lines[0][7].c = '漢';
+        g.lines[0].wrapped = true;
+        g.lines[1][0].c = '\0';
+        assert_eq!(g.search("a").hits, vec![hit(0, 0, 0, 1)]);
+    }
+
+    #[test]
+    fn search_hits_keep_absolute_lines_across_eviction() {
+        let mut g = Grid::new(2, 8);
+        g.set_scrollback_limit(2);
+        for c in "old".chars() {
+            g.put_char(c);
+        }
+        g.carriage_return();
+        g.linefeed();
+        for c in "keep".chars() {
+            g.put_char(c);
+        }
+        g.carriage_return();
+        g.linefeed();
+        for c in "later".chars() {
+            g.put_char(c);
+        }
+        let before = g.search("keep").hits;
+        assert_eq!(before, vec![hit(1, 0, 1, 4)]);
+
+        g.carriage_return();
+        g.linefeed();
+        for c in "newest".chars() {
+            g.put_char(c);
+        }
+        g.carriage_return();
+        g.linefeed();
+        assert_eq!(g.abs_base(), 1);
+        assert_eq!(g.search("keep").hits, before);
     }
 }

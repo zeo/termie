@@ -107,6 +107,7 @@ const COLOR_QUERY_CAP: usize = 64;
 
 pub struct Terminal {
     pub grid: Grid,
+    pub grid_epoch: u64,
     saved_primary: Option<Grid>,
     pub using_alt: bool,
 
@@ -147,6 +148,7 @@ pub struct Terminal {
     /// bytes the terminal wants to send back to the pty (DSR/DA replies)
     pub responses: Vec<u8>,
     pub dirty: bool,
+    pub revision: u64,
     /// DEC 2026 synchronized output: while true an app is mid-frame, so the
     /// renderer holds off painting until the frame ends (no torn/flickering UI)
     pub sync_output: bool,
@@ -183,6 +185,7 @@ impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Self {
         Terminal {
             grid: Grid::new(rows, cols),
+            grid_epoch: 0,
             saved_primary: None,
             using_alt: false,
             app_cursor_keys: false,
@@ -203,6 +206,7 @@ impl Terminal {
             notify: None,
             responses: Vec::new(),
             dirty: true,
+            revision: 0,
             sync_output: false,
             kbd_stack: vec![0],
             clipboard: None,
@@ -223,6 +227,11 @@ impl Terminal {
         if reply.len() <= MAX_PENDING_RESPONSES.saturating_sub(self.responses.len()) {
             self.responses.extend_from_slice(reply);
         }
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn queue_color_query(&mut self, query: ColorReq) {
@@ -464,11 +473,15 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let reflow_gen = self.grid.reflow_gen;
         self.grid.resize(rows, cols);
+        if self.grid.reflow_gen != reflow_gen {
+            self.grid_epoch = self.grid_epoch.wrapping_add(1);
+        }
         if let Some(p) = self.saved_primary.as_mut() {
             p.resize(rows, cols);
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn enter_alt(&mut self) {
@@ -478,6 +491,7 @@ impl Terminal {
         let (rows, cols) = (self.grid.rows, self.grid.cols);
         let alt = Grid::new(rows, cols);
         let primary = std::mem::replace(&mut self.grid, alt);
+        self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.saved_primary = Some(primary);
         self.using_alt = true;
     }
@@ -488,6 +502,7 @@ impl Terminal {
         }
         if let Some(primary) = self.saved_primary.take() {
             self.grid = primary;
+            self.grid_epoch = self.grid_epoch.wrapping_add(1);
         }
         self.using_alt = false;
         self.reset_interaction_modes();
@@ -877,7 +892,7 @@ impl Perform for Terminal {
         self.grid.put_char(mapped);
         // REP repeats the glyph as presented, so store the post-charset glyph
         self.last_print = Some(mapped);
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn execute(&mut self, byte: u8) {
@@ -891,7 +906,7 @@ impl Perform for Terminal {
             0x0f => self.gl = 0, // SI -> invoke g0
             _ => {}
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
@@ -1119,7 +1134,7 @@ impl Perform for Terminal {
             },
             _ => {}
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -1134,7 +1149,7 @@ impl Perform for Terminal {
             } else {
                 self.g1 = cs;
             }
-            self.dirty = true;
+            self.mark_dirty();
             return;
         }
         // DECALN screen alignment test (ESC # 8): without this check the byte
@@ -1143,7 +1158,7 @@ impl Perform for Terminal {
             if byte == b'8' {
                 self.grid.screen_alignment_test();
             }
-            self.dirty = true;
+            self.mark_dirty();
             return;
         }
         match byte {
@@ -1161,6 +1176,7 @@ impl Perform for Terminal {
                 // RIS full reset
                 let (rows, cols) = (self.grid.rows, self.grid.cols);
                 self.grid = Grid::new(rows, cols);
+                self.grid_epoch = self.grid_epoch.wrapping_add(1);
                 self.saved_primary = None;
                 self.using_alt = false;
                 self.bracketed_paste = false;
@@ -1181,7 +1197,7 @@ impl Perform for Terminal {
             }
             _ => {}
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
@@ -1370,6 +1386,7 @@ impl Perform for Terminal {
                             }
                             self.cmd_running = false;
                             self.cmd_done = Some(code);
+                            self.mark_dirty();
                             Some(Osc133::CommandDone(code))
                         }
                         _ => self.last_osc133,
@@ -1422,7 +1439,7 @@ impl Perform for Terminal {
                         self.grid.linefeed();
                     }
                 }
-                self.dirty = true;
+                self.mark_dirty();
             }
             Some(Dcs::Rqss(req)) => {
                 // reply DCS 1 $ r <setting> ST when the setting is known,
@@ -1476,6 +1493,20 @@ mod tests {
     fn feed(t: &mut Terminal, bytes: &[u8]) {
         let mut p = Parser::new();
         p.advance(t, bytes);
+    }
+
+    #[test]
+    fn revision_tracks_output_and_resize() {
+        let mut t = Terminal::new(4, 10);
+        let initial = t.revision;
+        feed(&mut t, b"x");
+        assert!(t.revision > initial);
+        let after_output = t.revision;
+        t.resize(5, 12);
+        assert!(t.revision > after_output);
+        let after_resize = t.revision;
+        feed(&mut t, b"\x1b]133;D;0\x1b\\");
+        assert!(t.revision > after_resize);
     }
 
     #[test]
@@ -1748,6 +1779,23 @@ mod tests {
         feed(&mut t, b"\x1b[?1049l");
         assert!(!t.using_alt);
         assert_eq!(t.grid.lines[0][0].c, 'p');
+    }
+
+    #[test]
+    fn grid_epoch_changes_when_cell_coordinates_are_rebased() {
+        let mut t = Terminal::new(2, 10);
+        let initial = t.grid_epoch;
+        feed(&mut t, b"\x1b[?1049h");
+        let alternate = t.grid_epoch;
+        assert_ne!(alternate, initial);
+        feed(&mut t, b"\x1b[?1049l");
+        let primary = t.grid_epoch;
+        assert_ne!(primary, alternate);
+        t.resize(2, 8);
+        let reflowed = t.grid_epoch;
+        assert_ne!(reflowed, primary);
+        feed(&mut t, b"\x1bc");
+        assert_ne!(t.grid_epoch, reflowed);
     }
 
     #[test]

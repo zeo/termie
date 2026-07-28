@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Interface
+- Hovered web links now show their destination in the status bar. Ctrl-click requires a reviewed target with a plain ASCII authority, rejects directional formatting, and pauses if the destination changes under the pointer.
+- Precision wheels and touchpads accumulate small zoom deltas and reset at gesture boundaries, giving each font-size step deliberate weight.
+- Find keeps its newest matches within fixed scan, run, and result budgets, refreshes live output without losing the selected result, and paints wrapped or wide-cell matches across every covered row. Reflowed and evicted results cannot leave stale highlights or dead navigation entries.
+
+### Reliability
+- Quit confirmation now counts tabs and panes in every window. Saved sessions keep tabs and split trees from detached interactive windows while command-line layout windows remain ephemeral.
+- Debounced session writes now set their own event-loop deadline, so an idle or unfocused app persists changes on time.
+
+### Security
+- Dropped paths now use the launch shell's literal syntax only after Termie's prompt and shell-ownership checks pass. WSL paths are converted with `wslpath`; drops outside terminal content, nested programs, parser-active filename characters, control characters, and unsupported or custom shells are rejected instead of receiving input. Platforms without a fresh native drop point open the location in a new tab without injecting terminal input.
+- Windows AppContainer plugins now receive a minimal container-local environment and inherit only stdin, stdout, and a NUL stderr handle. They join a kill-on-close job before their first instruction can run. Plugin files grant access to the exact package SID, legacy all-container access is removed, and long plugin IDs retain separate stable container profiles.
+
 ## 0.5.2 - 2026-07-26
 
 ### Changed

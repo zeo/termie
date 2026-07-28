@@ -367,6 +367,7 @@ pub struct Pty {
     // write_all from the ui thread would freeze the whole window on a big paste
     writer_queue: Arc<InputQueue>,
     child: Box<dyn Child + Send + Sync>,
+    prompt_markers_trusted: bool,
     #[cfg(unix)]
     process_group: Option<libc::pid_t>,
     #[cfg(target_os = "linux")]
@@ -429,6 +430,7 @@ impl Pty {
         // an explicit command (from the cli or a context-menu verb) runs directly
         // instead of a login shell, so none of the shell banner/prompt-hook
         // injection applies; otherwise launch the configured shell
+        let mut prompt_markers_trusted = false;
         let mut cmd = match command.filter(|a| !a.is_empty()) {
             Some(argv) => {
                 let mut c = CommandBuilder::new(&argv[0]);
@@ -453,6 +455,7 @@ impl Pty {
                 let mut c = CommandBuilder::new(&shell);
                 match stem.as_str() {
                     "pwsh" | "powershell" => {
+                        prompt_markers_trusted = true;
                         c.arg("-NoLogo");
                         if !load_profile {
                             c.arg("-NoProfile");
@@ -462,6 +465,7 @@ impl Pty {
                         c.arg(pwsh_prompt_hook());
                     }
                     "cmd" => {
+                        prompt_markers_trusted = true;
                         c.arg("/K");
                         c.arg(format!("prompt {CMD_PROMPT_HOOK}"));
                     }
@@ -480,6 +484,7 @@ impl Pty {
                         // an rcfile that sources the user's own ~/.bashrc first,
                         // so termie's prompt hook wraps it instead of replacing it
                         if let Some(dir) = integration_dir() {
+                            prompt_markers_trusted = true;
                             c.arg("--rcfile");
                             c.arg(dir.join("bashrc"));
                         }
@@ -488,6 +493,7 @@ impl Pty {
                     #[cfg(unix)]
                     "zsh" => {
                         if let Some(dir) = integration_dir() {
+                            prompt_markers_trusted = true;
                             c.env(
                                 "TERMIE_USER_ZDOTDIR",
                                 env::var_os("ZDOTDIR").or_else(|| env::var_os("HOME")).unwrap_or_default(),
@@ -498,6 +504,7 @@ impl Pty {
                     }
                     #[cfg(unix)]
                     "fish" => {
+                        prompt_markers_trusted = true;
                         c.arg("-i");
                         c.arg("-C");
                         c.arg(FISH_PROMPT_HOOK);
@@ -576,6 +583,7 @@ impl Pty {
             master: pair.master,
             writer_queue,
             child,
+            prompt_markers_trusted,
             #[cfg(unix)]
             process_group,
             #[cfg(target_os = "linux")]
@@ -649,6 +657,31 @@ impl Pty {
         });
     }
 
+    pub fn shell_owns_foreground(&self) -> bool {
+        if !self.prompt_markers_trusted {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let Some(fd) = self.master.as_raw_fd() else {
+                return false;
+            };
+            let Some(process_group) = self.process_group else {
+                return false;
+            };
+            return unsafe { libc::tcgetpgrp(fd) == process_group };
+        }
+        #[cfg(windows)]
+        {
+            let Some(process_id) = self.child.process_id() else {
+                return false;
+            };
+            self.tree
+                .as_ref()
+                .is_some_and(|tree| tree.contains_only(process_id))
+        }
+    }
+
     pub fn kill(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(scope) = self.scope.take() {
@@ -685,6 +718,160 @@ fn resolve_shell_cached(kind: ShellKind) -> String {
             c.push((kind, resolved.clone()));
         }
     resolved
+}
+
+pub fn quote_path_for_shell(
+    kind: ShellKind,
+    path: &std::path::Path,
+) -> Result<Vec<u8>, &'static str> {
+    dropped_path_is_parser_neutral(path)?;
+    let custom = match kind {
+        ShellKind::Custom(name) => profiles()
+            .iter()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.argv.first())
+            .map(String::as_str),
+        _ => None,
+    };
+    let executable = custom.map(str::to_owned).unwrap_or_else(|| resolve_shell_cached(kind));
+    quote_path_for_executable(&executable, path)
+}
+
+fn dropped_path_is_parser_neutral(path: &std::path::Path) -> Result<(), &'static str> {
+    const UNSAFE_PATH: &str = "this path cannot be inserted safely; paste it manually";
+    let is_metachar = |ch| {
+        matches!(
+            ch,
+            '\'' | '"'
+                | '`'
+                | '$'
+                | '%'
+                | '!'
+                | '^'
+                | '&'
+                | '|'
+                | ';'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '\u{2018}'
+                | '\u{2019}'
+                | '\u{201a}'
+                | '\u{201b}'
+                | '\u{201c}'
+                | '\u{201d}'
+                | '\u{201e}'
+        )
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control() || is_metachar(*byte as char))
+        {
+            return Err(UNSAFE_PATH);
+        }
+        if path.to_str().is_some_and(|path| path.chars().any(is_metachar)) {
+            return Err(UNSAFE_PATH);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if path
+            .to_str()
+            .ok_or("path is not valid unicode")?
+            .chars()
+            .any(|ch| ch.is_control() || is_metachar(ch))
+        {
+            return Err(UNSAFE_PATH);
+        }
+    }
+    Ok(())
+}
+
+fn quote_path_for_executable(
+    executable: &str,
+    path: &std::path::Path,
+) -> Result<Vec<u8>, &'static str> {
+    let stem = std::path::Path::new(executable)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    #[cfg(unix)]
+    if matches!(stem.as_str(), "bash" | "dash" | "ksh" | "sh" | "zsh") {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.iter().any(u8::is_ascii_control) {
+            return Err("path contains control characters");
+        }
+        return Ok(quote_posix_bytes(bytes));
+    }
+
+    let path = path.to_str().ok_or("path is not valid unicode")?;
+    if path.chars().any(char::is_control) {
+        return Err("path contains control characters");
+    }
+    match stem.as_str() {
+        "pwsh" | "powershell" => Ok(quote_powershell(path).into_bytes()),
+        "cmd" => {
+            if path.contains(['%', '!']) {
+                Err("cmd cannot safely insert paths containing % or !")
+            } else {
+                Ok(format!("\"{path}\"").into_bytes())
+            }
+        }
+        "fish" => Ok(format!("'{}'", path.replace('\\', "\\\\").replace('\'', "\\'")).into_bytes()),
+        "bash" | "dash" | "ksh" | "sh" | "zsh" => Ok(quote_posix_bytes(path.as_bytes())),
+        "wsl" => Ok(format!("\"$(wslpath {})\"", quote_posix(path)).into_bytes()),
+        "nu" => Ok(quote_nu(path).into_bytes()),
+        _ => Err("path drop is not supported for this shell"),
+    }
+}
+
+fn quote_powershell(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('\'');
+    for ch in path.chars() {
+        quoted.push(ch);
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}') {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn quote_posix(path: &str) -> String {
+    String::from_utf8(quote_posix_bytes(path.as_bytes())).expect("utf8 input stays utf8")
+}
+
+fn quote_posix_bytes(path: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(path.len() + 2);
+    quoted.push(b'\'');
+    for &byte in path {
+        if byte == b'\'' {
+            quoted.extend_from_slice(b"'\\''");
+        } else {
+            quoted.push(byte);
+        }
+    }
+    quoted.push(b'\'');
+    quoted
+}
+
+fn quote_nu(path: &str) -> String {
+    let mut hashes = "#".to_string();
+    while path.contains(&format!("'{hashes}")) {
+        hashes.push('#');
+    }
+    format!("r{hashes}'{path}'{hashes}")
 }
 
 fn find_in_path(exe: &str) -> Option<PathBuf> {
@@ -805,6 +992,7 @@ impl Pty {
             master: Box::new(handoff_pty::HandoffMaster::new(signal, reference, server)),
             writer_queue,
             child: Box::new(handoff_pty::HandoffChild::new(client)),
+            prompt_markers_trusted: false,
             tree: None,
             reader: Some(Box::new(File::from(reader))),
         }
@@ -952,6 +1140,7 @@ impl Pty {
             master: Box::new(null_pty::NullMaster),
             writer_queue,
             child: Box::new(null_pty::NullChild),
+            prompt_markers_trusted: false,
             #[cfg(unix)]
             process_group: None,
             #[cfg(target_os = "linux")]
@@ -1046,6 +1235,7 @@ mod tests {
     use super::*;
     use portable_pty::{ChildKiller, ExitStatus};
     use std::io::Result as IoResult;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug)]
@@ -1089,6 +1279,7 @@ mod tests {
             master: Box::new(null_pty::NullMaster),
             writer_queue: queue.clone(),
             child: Box::new(TrackingChild(killed.clone())),
+            prompt_markers_trusted: false,
             #[cfg(unix)]
             process_group: None,
             #[cfg(target_os = "linux")]
@@ -1177,6 +1368,122 @@ mod tests {
         }
         // cycling out of a custom profile lands on auto
         assert_eq!(k.next(), ShellKind::Auto);
+    }
+
+    #[test]
+    fn dropped_paths_use_literal_shell_quoting() {
+        let path = Path::new("C:\\work\\it's $HOME; $(touch nope) & done");
+        assert_eq!(
+            quote_path_for_executable("pwsh.exe", path).unwrap(),
+            b"'C:\\work\\it''s $HOME; $(touch nope) & done'"
+        );
+        assert_eq!(
+            quote_path_for_executable("cmd.exe", path).unwrap(),
+            b"\"C:\\work\\it's $HOME; $(touch nope) & done\""
+        );
+        assert_eq!(
+            quote_path_for_executable("/bin/bash", path).unwrap(),
+            b"'C:\\work\\it'\\''s $HOME; $(touch nope) & done'"
+        );
+        assert_eq!(
+            quote_path_for_executable("/usr/bin/fish", path).unwrap(),
+            b"'C:\\\\work\\\\it\\'s $HOME; $(touch nope) & done'"
+        );
+        assert_eq!(
+            quote_path_for_executable("wsl.exe", path).unwrap(),
+            b"\"$(wslpath 'C:\\work\\it'\\''s $HOME; $(touch nope) & done')\""
+        );
+        assert_eq!(
+            String::from_utf8(
+                quote_path_for_executable(
+                    "pwsh.exe",
+                    Path::new("C:\\work\\left\u{2018}; Write-Output nope; right\u{2019}.txt"),
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            "'C:\\work\\left\u{2018}\u{2018}; Write-Output nope; right\u{2019}\u{2019}.txt'"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_reject_unsafe_or_unknown_shell_syntax() {
+        assert_eq!(
+            quote_path_for_shell(
+                ShellKind::Pwsh,
+                Path::new(r"C:\work\x$(calc.exe).txt"),
+            ),
+            Err("this path cannot be inserted safely; paste it manually")
+        );
+        assert_eq!(
+            quote_path_for_shell(
+                ShellKind::Cmd,
+                Path::new("C:\\work\\left\u{2018}right.txt"),
+            ),
+            Err("this path cannot be inserted safely; paste it manually")
+        );
+        assert_eq!(
+            quote_path_for_shell(
+                ShellKind::Pwsh,
+                Path::new("C:\\work\\left\u{201a}right.txt"),
+            ),
+            Err("this path cannot be inserted safely; paste it manually")
+        );
+        assert_eq!(
+            quote_path_for_shell(
+                ShellKind::Pwsh,
+                Path::new("C:\\work\\left\u{201b}right.txt"),
+            ),
+            Err("this path cannot be inserted safely; paste it manually")
+        );
+        assert_eq!(
+            quote_path_for_shell(
+                ShellKind::Pwsh,
+                Path::new("C:\\work\\left\u{201e}right.txt"),
+            ),
+            Err("this path cannot be inserted safely; paste it manually")
+        );
+        assert_eq!(
+            quote_path_for_executable("cmd.exe", Path::new(r"C:\%TERMIE_DROP_TEST%\file")),
+            Err("cmd cannot safely insert paths containing % or !")
+        );
+        assert_eq!(
+            quote_path_for_executable("cmd.exe", Path::new(r"C:\wow!\file")),
+            Err("cmd cannot safely insert paths containing % or !")
+        );
+        assert_eq!(
+            quote_path_for_executable("elvish.exe", Path::new(r"C:\safe path")),
+            Err("path drop is not supported for this shell")
+        );
+        assert_eq!(
+            quote_path_for_executable("bash", Path::new("line\nbreak")),
+            Err("path contains control characters")
+        );
+    }
+
+    #[test]
+    fn nushell_paths_use_literal_raw_strings() {
+        assert_eq!(
+            quote_path_for_executable("nu.exe", Path::new(r"C:\new\it's here")).unwrap(),
+            br"r#'C:\new\it's here'#"
+        );
+        assert_eq!(
+            quote_path_for_executable("nu.exe", Path::new("C:\\has'#\\marker")).unwrap(),
+            b"r##'C:\\has'#\\marker'##"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_shell_paths_preserve_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/\xff'name"));
+        assert_eq!(
+            quote_path_for_executable("bash", path).unwrap(),
+            b"'/tmp/\xff'\\''name'"
+        );
     }
 }
 
@@ -1468,11 +1775,19 @@ mod live_tests {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        pty.kill();
         assert!(
             output.windows(b"\x1b]133;A\x1b\\".len()).any(|s| s == b"\x1b]133;A\x1b\\"),
             "cmd never emitted a prompt mark: {output:?}"
         );
         assert!(output.windows(b"\x1b]9;9;".len()).any(|s| s == b"\x1b]9;9;"));
+        assert!(pty.shell_owns_foreground());
+
+        assert!(pty.write(b"cmd /Q\r\n"));
+        let nested_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < nested_deadline && pty.shell_owns_foreground() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!pty.shell_owns_foreground());
+        pty.kill();
     }
 }
