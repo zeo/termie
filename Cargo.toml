@@ -22,7 +22,7 @@ png = "0.18"
 pollster = "0.4.0"
 portable-pty = "0.9.0"
 vte = "0.15.0"
-wgpu = "29.0.3"
+wgpu = "30.0.0"
 winit = "0.30.13"
 
 [target.'cfg(windows)'.dependencies]
