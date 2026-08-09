@@ -489,7 +489,8 @@ impl Terminal {
             return;
         }
         let (rows, cols) = (self.grid.rows, self.grid.cols);
-        let alt = Grid::new(rows, cols);
+        let mut alt = Grid::new(rows, cols);
+        alt.is_alt = true;
         let primary = std::mem::replace(&mut self.grid, alt);
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.saved_primary = Some(primary);
@@ -2371,6 +2372,38 @@ mod tests {
             // keep feeding to exercise post-resize transitions (no dim assert)
             feed(&mut t, &buf);
         }
+    }
+
+    #[test]
+    fn alt_screen_resize_keeps_scrollback_empty() {
+        let mut t = Terminal::new(24, 80);
+        feed(&mut t, b"\x1b[?1049h"); // enter alt screen
+        assert!(t.using_alt);
+        feed(&mut t, b"TUI content line 1\r\nTUI content line 2");
+        t.resize(40, 120);
+        assert_eq!(t.grid.rows, 40);
+        assert_eq!(t.grid.cols, 120);
+        assert_eq!(t.grid.scrollback.len(), 0, "alt screen scrollback must stay empty on resize");
+        assert_eq!(t.grid.lines.len(), 40, "alt screen lines must match new row count");
+        for line in &t.grid.lines {
+            assert_eq!(line.len(), 120);
+        }
+        assert!(t.grid.cursor.row < 40);
+        assert!(t.grid.cursor.col < 120);
+    }
+
+    #[test]
+    fn resize_expanding_width_and_height_preserves_grid_structure() {
+        let mut t = Terminal::new(24, 80);
+        feed(&mut t, b"Line 1\r\nLine 2\r\nLine 3");
+        t.resize(40, 120);
+        assert_eq!(t.grid.rows, 40);
+        assert_eq!(t.grid.cols, 120);
+        assert_eq!(t.grid.lines.len(), 40);
+        for line in &t.grid.lines {
+            assert_eq!(line.len(), 120);
+        }
+        assert!(t.grid.cursor.row < 40);
     }
 
     #[test]

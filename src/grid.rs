@@ -213,6 +213,7 @@ fn word_class_at(line: &Line, col: usize) -> u8 {
 }
 
 pub struct Grid {
+    pub is_alt: bool,
     pub rows: usize,
     pub cols: usize,
     pub lines: Vec<Line>,
@@ -359,6 +360,7 @@ impl Grid {
         let rows = rows.max(1);
         let cols = cols.max(1);
         Grid {
+            is_alt: false,
             rows,
             cols,
             lines: (0..rows).map(|_| blank_line(cols)).collect(),
@@ -914,43 +916,69 @@ impl Grid {
             return;
         }
 
-        // on a width change, rewrap soft-wrapped logical lines (scrollback + the
-        // live screen) to the new width before the row-count adjustment below
-        if cols != self.cols {
-            self.reflow(cols);
+        if self.is_alt {
+            for line in &mut self.lines {
+                line.resize(cols, Cell::default());
+            }
+            if rows < self.lines.len() {
+                self.lines.truncate(rows);
+            } else {
+                while self.lines.len() < rows {
+                    self.lines.push(blank_line(cols));
+                }
+            }
+            self.rows = rows;
+            self.cols = cols;
+            self.region_top = 0;
+            self.region_bottom = rows - 1;
+            self.cursor.row = self.cursor.row.min(rows - 1);
+            self.cursor.col = self.cursor.col.min(cols - 1);
+            self.saved_cursor.row = self.saved_cursor.row.min(rows - 1);
+            self.saved_cursor.col = self.saved_cursor.col.min(cols - 1);
+            self.cursor.wrap_pending = false;
+            self.view_offset = 0;
+            return;
         }
 
-        // adjust the live lines to the new width (put_char indexes by col);
-        // leave scrollback lines at their captured width so shrinking doesn't
-        // destroy history — draw_grid reads cells via get() and tolerates any
-        // length (clipped if longer, blank-padded if shorter)
+        if cols != self.cols {
+            self.reflow(cols, rows);
+        } else if rows != self.rows {
+            if rows < self.rows {
+                let mut excess = self.rows - rows;
+                let below = self.lines.len().saturating_sub(self.cursor.row + 1);
+                let from_bottom = excess.min(below);
+                for _ in 0..from_bottom {
+                    self.lines.pop();
+                }
+                excess -= from_bottom;
+                for _ in 0..excess {
+                    if !self.lines.is_empty() {
+                        let line = self.lines.remove(0);
+                        self.push_scrollback(line);
+                        self.cursor.row = self.cursor.row.saturating_sub(1);
+                    }
+                }
+            } else {
+                let needed = rows - self.rows;
+                let pull = needed.min(self.scrollback.len());
+                for _ in 0..pull {
+                    if let Some(line) = self.scrollback.pop_back() {
+                        self.lines.insert(0, line);
+                        self.cursor.row = (self.cursor.row + 1).min(rows - 1);
+                    }
+                }
+                let remaining = needed - pull;
+                for _ in 0..remaining {
+                    self.lines.push(blank_line(cols));
+                }
+            }
+            self.rows = rows;
+        }
+
         for line in &mut self.lines {
             line.resize(cols, Cell::default());
         }
 
-        if rows < self.rows {
-            // drop blank rows below the cursor first (keep the prompt + content),
-            // only evicting the top into scrollback once the bottom is exhausted
-            let mut excess = self.rows - rows;
-            let below = self.lines.len().saturating_sub(self.cursor.row + 1);
-            let from_bottom = excess.min(below);
-            for _ in 0..from_bottom {
-                self.lines.pop();
-            }
-            excess -= from_bottom;
-            for _ in 0..excess {
-                let line = self.lines.remove(0);
-                self.push_scrollback(line);
-                self.cursor.row = self.cursor.row.saturating_sub(1);
-            }
-        } else if rows > self.rows {
-            for _ in 0..(rows - self.rows) {
-                self.lines.push(blank_line(cols));
-            }
-        }
-
-        self.rows = rows;
-        self.cols = cols;
         // keep custom stops where columns survive; new columns get the default cadence
         if cols < self.tab_stops.len() {
             self.tab_stops.truncate(cols);
@@ -963,14 +991,16 @@ impl Grid {
         self.region_bottom = rows - 1;
         self.cursor.row = self.cursor.row.min(rows - 1);
         self.cursor.col = self.cursor.col.min(cols - 1);
+        self.saved_cursor.row = self.saved_cursor.row.min(rows - 1);
+        self.saved_cursor.col = self.saved_cursor.col.min(cols - 1);
         self.cursor.wrap_pending = false;
         self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
     /// rewrap soft-wrapped logical lines to `new_cols` across scrollback + the
     /// live screen, preserving the cursor's logical position. wide glyphs that
-    /// straddle the new boundary may split (rare). sets self.cols
-    fn reflow(&mut self, new_cols: usize) {
+    /// straddle the new boundary may split (rare). sets self.cols and self.rows
+    fn reflow(&mut self, new_cols: usize, target_rows: usize) {
         let cur_abs = self.scrollback.len() + self.cursor.row;
         let cur_col = self.cursor.col;
         let prompt_base = self.prompt_base();
@@ -1113,8 +1143,8 @@ impl Grid {
         }
         new_cur_abs = new_cur_abs.min(np.len() - 1);
 
-        // the last `rows` physical lines become the live screen; rest -> scrollback
-        let rows = self.rows;
+        // the last `target_rows` physical lines become the live screen; rest -> scrollback
+        let rows = target_rows;
         let live_start = np.len().saturating_sub(rows);
         self.lines = np.split_off(live_start);
         self.scrollback = np.into();
@@ -1126,6 +1156,7 @@ impl Grid {
         self.cursor.col = (cur_offset % new_cols).min(new_cols - 1);
         self.cursor.wrap_pending = false;
         self.cols = new_cols;
+        self.rows = rows;
         let mut evicted = 0u64;
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();

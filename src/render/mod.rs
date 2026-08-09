@@ -4139,6 +4139,42 @@ impl Renderer {
                     Self::push_rect(&mut out, gx0 + dx * (cell + gap), gy0 + dy * (cell + gap), cell, cell, color, 1.0);
                 }
             }
+            let s = self.scale;
+            let th = hair;
+            let sz = (10.0 * s).round();
+            let bx = ((x0 + x1) / 2.0 - sz / 2.0).round();
+            let by = (self.title_bar_h / 2.0 - sz / 2.0).round();
+            if c == Hot::Minimize {
+                let iw = (10.0 * s).round();
+                let min_x = ((x0 + x1) / 2.0 - iw / 2.0).round();
+                let min_y = (self.title_bar_h / 2.0 + 2.0 * s).round();
+                Self::push_rect(&mut out, min_x, min_y, iw, th.max(1.5), color, 1.0);
+            }
+            if c == Hot::Maximize {
+                if maximized {
+                    let off = (2.5 * s).round().max(2.0);
+                    Self::stroke_rect(&mut out, (bx + off, by - off, sz - off, sz - off), th, color);
+                    let bg_c = if active { INK_4 } else { BG };
+                    Self::push_rect(&mut out, bx, by, sz - off, sz - off, bg_c, 1.0);
+                    Self::stroke_rect(&mut out, (bx, by, sz - off, sz - off), th, color);
+                } else {
+                    Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
+                }
+            }
+            if c == Hot::Close {
+                for offset_i in 0..sz as usize {
+                    let off = offset_i as f32;
+                    Self::push_rect(&mut out, bx + off, by + off, th, th, color, 1.0);
+                    Self::push_rect(&mut out, bx + sz - off - th, by + off, th, th, color, 1.0);
+                }
+            }
+            if c == Hot::Gear {
+                Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
+                let c_sz = (4.0 * s).round();
+                let c_x = ((x0 + x1) / 2.0 - c_sz / 2.0).round();
+                let c_y = (self.title_bar_h / 2.0 - c_sz / 2.0).round();
+                Self::push_rect(&mut out, c_x, c_y, c_sz, c_sz, color, 1.0);
+            }
         }
 
         // ---- status bar (flat) ----
