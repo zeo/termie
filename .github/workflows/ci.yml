@@ -82,7 +82,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: rustup on PATH
         run: |
-          cargo_home="${CARGO_HOME:-/cache/cargo}"
+          # ignore an inherited read-only cargo cache path on hosted runners
+          cargo_home="$HOME/.cargo"
+          mkdir -p "$cargo_home"
           if ! command -v rustup >/dev/null; then
             export CARGO_HOME="$cargo_home"
             curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
