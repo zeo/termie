@@ -954,7 +954,7 @@ impl Grid {
                 for _ in 0..excess {
                     if !self.lines.is_empty() {
                         let line = self.lines.remove(0);
-                        self.push_scrollback(line);
+                        drop(self.push_scrollback(line));
                         self.cursor.row = self.cursor.row.saturating_sub(1);
                     }
                 }
@@ -1184,11 +1184,12 @@ impl Grid {
         self.view_offset = 0;
     }
 
-    fn push_scrollback(&mut self, line: Line) {
+    fn push_scrollback(&mut self, line: Line) -> Option<Line> {
         self.scrollback.push_back(line);
         self.total_scrolled += 1;
+        let mut evicted = None;
         while self.scrollback.len() > self.scrollback_limit {
-            self.scrollback.pop_front();
+            evicted = self.scrollback.pop_front();
         }
         // a view scrolled into history stays anchored to the text being read:
         // each line entering scrollback pushes the offset up with it (typing
@@ -1197,6 +1198,7 @@ impl Grid {
             self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
         }
         self.prune_prompts();
+        evicted
     }
 
     /// absolute index of the oldest retained line (scrollback front)
@@ -1495,20 +1497,26 @@ impl Grid {
     pub fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.region_bottom - self.region_top + 1);
         for _ in 0..n {
-            let line = self.lines.remove(self.region_top);
-            if self.region_top == 0 {
-                self.push_scrollback(line);
-            }
-            self.lines
-                .insert(self.region_bottom, blank_line(self.cols));
+            let removed = self.lines.remove(self.region_top);
+            let mut blank = if self.region_top == 0 {
+                self.push_scrollback(removed)
+                    .unwrap_or_else(|| blank_line(self.cols))
+            } else {
+                removed
+            };
+            blank.cells.fill(Cell::default());
+            blank.wrapped = false;
+            self.lines.insert(self.region_bottom, blank);
         }
     }
 
     pub fn scroll_down(&mut self, n: usize) {
         let n = n.min(self.region_bottom - self.region_top + 1);
         for _ in 0..n {
-            self.lines.remove(self.region_bottom);
-            self.lines.insert(self.region_top, blank_line(self.cols));
+            let mut blank = self.lines.remove(self.region_bottom);
+            blank.cells.fill(Cell::default());
+            blank.wrapped = false;
+            self.lines.insert(self.region_top, blank);
         }
     }
 
@@ -2019,6 +2027,40 @@ mod tests {
         g.linefeed(); // at bottom -> scroll
         assert_eq!(g.scrollback.len(), 1);
         assert_eq!(g.scrollback[0][0].c, 'a');
+    }
+
+    #[test]
+    fn partial_region_scroll_reuses_and_clears_the_removed_row() {
+        let mut g = Grid::new(4, 3);
+        g.lines[1][0].c = 'x';
+        g.lines[1].wrapped = true;
+        let allocation = g.lines[1].cells.as_ptr();
+        g.set_scroll_region(1, 2);
+        g.scroll_up(1);
+        assert_eq!(g.lines[2].cells.as_ptr(), allocation);
+        assert!(g.lines[2].iter().all(|cell| *cell == Cell::default()));
+        assert!(!g.lines[2].wrapped);
+        assert!(g.scrollback.is_empty());
+
+        let allocation = g.lines[2].cells.as_ptr();
+        g.lines[2][0].c = 'y';
+        g.lines[2].wrapped = true;
+        g.scroll_down(1);
+        assert_eq!(g.lines[1].cells.as_ptr(), allocation);
+        assert!(g.lines[1].iter().all(|cell| *cell == Cell::default()));
+        assert!(!g.lines[1].wrapped);
+    }
+
+    #[test]
+    fn full_scrollback_recycles_the_evicted_row() {
+        let mut g = Grid::new(2, 3);
+        g.set_scrollback_limit(1);
+        let oldest = g.lines[0].cells.as_ptr();
+        g.scroll_up(1);
+        g.scroll_up(1);
+        assert_eq!(g.lines[1].cells.as_ptr(), oldest);
+        assert!(g.lines[1].iter().all(|cell| *cell == Cell::default()));
+        assert_eq!(g.scrollback.len(), 1);
     }
 
     #[test]

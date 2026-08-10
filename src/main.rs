@@ -48,8 +48,8 @@ use term::Terminal;
 
 const CONTENT_PT: f32 = 14.0;
 const CHROME_PT: f32 = 12.5;
-/// pre-warmed shells kept ready so splits/tabs open instantly
-const POOL_TARGET: usize = 3;
+/// one pre-warmed shell kept ready so the next split or tab opens instantly
+const POOL_TARGET: usize = 1;
 /// stop respawning after this many consecutive shell-spawn failures so a broken
 /// shell can't peg a CPU core; the window then stays up (logged) instead
 const MAX_WARM_FAILS: usize = 10;
@@ -184,6 +184,8 @@ enum UserEvent {
     /// the marketplace catalog finished fetching on a worker thread (Ok with
     /// entries, or Err with a reason the fetch failed)
     Market(Result<Vec<plugin::market::Entry>, String>),
+    /// one marketplace plugin finished installing on a worker thread
+    MarketInstallDone { id: String, result: Result<(), String> },
     /// the global quake hotkey fired (from the hotkey thread)
     #[cfg(any(windows, target_os = "linux"))]
     ToggleQuake,
@@ -944,6 +946,26 @@ struct MarketState {
     loading: bool,
     /// the catalog fetch failed (vs. simply returning no entries)
     fetch_failed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PointerModal {
+    LeftRouted,
+    FullyBlocking,
+}
+
+fn pointer_button_consumed(
+    modal: Option<PointerModal>,
+    state: ElementState,
+    button: MouseButton,
+) -> bool {
+    match modal {
+        Some(PointerModal::LeftRouted) => {
+            button != MouseButton::Left || state == ElementState::Released
+        }
+        Some(PointerModal::FullyBlocking) => true,
+        None => false,
+    }
 }
 
 // ---- tree helpers (free functions, by-value where ownership moves) ----
@@ -4119,6 +4141,8 @@ struct App {
     find_regex: bool,
     /// the plugins marketplace overlay, when open
     market: Option<MarketState>,
+    /// plugin id currently installing on the marketplace worker
+    market_installing: Option<String>,
     pressed: Option<Hot>,
     /// a tab drag owned by the app so it can cross OS-window boundaries
     tab_drag: Option<TabDrag>,
@@ -4313,6 +4337,7 @@ impl App {
             find: None,
             find_regex: false,
             market: None,
+            market_installing: None,
             pressed: None,
             tab_drag: None,
             closed_tabs: Vec::new(),
@@ -5293,6 +5318,16 @@ impl App {
             && self.font_pick.is_none()
             && !self.find_is_open_here()
             && self.market.is_none()
+    }
+
+    fn pointer_modal(&self) -> Option<PointerModal> {
+        if self.pw.confirm.is_some() || self.pw.rename.is_some() {
+            Some(PointerModal::FullyBlocking)
+        } else if self.palette.is_some() || self.font_pick.is_some() || self.market.is_some() {
+            Some(PointerModal::LeftRouted)
+        } else {
+            None
+        }
     }
 
     /// which pane (id) sits under a pixel position
@@ -7341,10 +7376,15 @@ impl App {
     /// network, arriving later via UserEvent::Market
     fn open_market(&mut self) {
         let rows = self.market_rows(&[]);
+        let status = self
+            .market_installing
+            .as_ref()
+            .map(|id| format!("installing {id}\u{2026}"))
+            .unwrap_or_else(|| "fetching catalog\u{2026}".to_string());
         self.market = Some(MarketState {
             rows,
             selected: 0,
-            status: "fetching catalog\u{2026}".to_string(),
+            status,
             loading: true,
             fetch_failed: false,
         });
@@ -7420,40 +7460,40 @@ impl App {
             }
             self.redraw();
         } else if let Some(url) = row.url.clone() {
-            // install from the catalog (download happens synchronously here; the
-            // catalog is small and installs are user-initiated, rare events)
+            if let Some(id) = self.market_installing.as_ref() {
+                if let Some(m) = self.market.as_mut() {
+                    m.status = format!("installing {id}\u{2026}");
+                }
+                self.redraw();
+                return;
+            }
+            let Some(pdir) = plugins_dir() else {
+                if let Some(m) = self.market.as_mut() {
+                    m.status = "install failed: plugin directory unavailable".to_string();
+                }
+                self.redraw();
+                return;
+            };
+            let id = row.id.clone();
+            self.market_installing = Some(id.clone());
             if let Some(m) = self.market.as_mut() {
-                m.status = format!("installing {}…", row.id);
+                m.status = format!("installing {id}\u{2026}");
             }
             self.redraw();
             let entry = plugin::market::Entry {
-                id: row.id.clone(),
+                id: id.clone(),
                 name: row.name.clone(),
                 version: row.version.clone(),
                 description: row.description.clone(),
                 url,
                 permissions: row.permissions.clone(),
             };
-            let Some(pdir) = plugins_dir() else {
-                return;
-            };
             let tmp = std::env::temp_dir();
-            match plugin::market::install(&entry, &pdir, &tmp) {
-                Ok(_) => {
-                    self.set_plugin_enabled(&row.id, true);
-                    self.restart_plugins();
-                    self.refresh_market_rows();
-                    if let Some(m) = self.market.as_mut() {
-                        m.status = format!("installed {}", row.id);
-                    }
-                }
-                Err(e) => {
-                    if let Some(m) = self.market.as_mut() {
-                        m.status = format!("install failed: {e}");
-                    }
-                }
-            }
-            self.redraw();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let result = plugin::market::install(&entry, &pdir, &tmp).map(|_| ());
+                let _ = proxy.send_event(UserEvent::MarketInstallDone { id, result });
+            });
         }
     }
 
@@ -10309,6 +10349,10 @@ impl App {
         self.pw.cursor_inside = true;
         self.pw.cursor = position;
         let (px, py) = (position.x as f32, position.y as f32);
+        let modal = self.pointer_modal();
+        if modal == Some(PointerModal::FullyBlocking) {
+            return;
+        }
         // hovering the open palette moves its selection with the pointer
         if self.palette.is_some() {
             if let Some(i) = self.pw.renderer.as_ref().and_then(|r| r.palette_row_at(px, py))
@@ -10331,6 +10375,9 @@ impl App {
                 }
                 self.font_pick_preview();
             }
+            return;
+        }
+        if modal.is_some() {
             return;
         }
         // while the pane menu is open, only track which item is hovered
@@ -10563,6 +10610,11 @@ impl App {
 
     /// wheel: settings-panel scroll, mouse-report wheel buttons, or local scrollback
     fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        if self.pointer_modal().is_some() {
+            reset_zoom_gesture(&mut self.pw);
+            self.wheel_accum = 0.0;
+            return;
+        }
         if phase == TouchPhase::Started {
             reset_zoom_gesture(&mut self.pw);
         } else if phase == TouchPhase::Cancelled {
@@ -10666,6 +10718,9 @@ impl App {
     /// left/right/middle button press+release: context menu, tab close, selection,
     /// click-to-focus, divider/pane drag, link open, widget click, title-bar buttons
     fn on_mouse_input(&mut self, state: ElementState, button: MouseButton, event_loop: &ActiveEventLoop) {
+        if pointer_button_consumed(self.pointer_modal(), state, button) {
+            return;
+        }
         match button {
             MouseButton::Back | MouseButton::Forward => {
                 let logical = if button == MouseButton::Back {
@@ -12094,23 +12149,48 @@ impl ApplicationHandler<UserEvent> for App {
                                 m.rows = rows;
                                 m.loading = false;
                                 m.fetch_failed = false;
-                                m.status = if empty {
-                                    "the catalog has no plugins yet".to_string()
-                                } else {
-                                    String::new()
-                                };
+                                if m.status == "fetching catalog\u{2026}" {
+                                    m.status = if empty {
+                                        "the catalog has no plugins yet".to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                }
                             }
                         }
                         Err(e) => {
                             if let Some(m) = self.market.as_mut() {
                                 m.loading = false;
                                 m.fetch_failed = true;
-                                m.status = e;
+                                if m.status == "fetching catalog\u{2026}" {
+                                    m.status = e;
+                                }
                             }
                         }
                     }
                     self.redraw();
                 }
+            }
+            UserEvent::MarketInstallDone { id, result } => {
+                if self.market_installing.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                self.market_installing = None;
+                let status = match result {
+                    Ok(()) => {
+                        self.set_plugin_enabled(&id, true);
+                        self.restart_plugins();
+                        self.refresh_market_rows();
+                        format!("installed {id}")
+                    }
+                    Err(e) => format!("install failed: {e}"),
+                };
+                if let Some(m) = self.market.as_mut() {
+                    m.status = status;
+                } else {
+                    self.show_notice(&status);
+                }
+                self.redraw();
             }
             #[cfg(any(windows, target_os = "linux"))]
             UserEvent::ToggleQuake => self.toggle_quake(),
@@ -12948,6 +13028,47 @@ mod tests {
         assert!(wheel_uses_local_scrollback(false, false));
         assert!(wheel_uses_local_scrollback(true, true));
         assert!(!wheel_uses_local_scrollback(true, false));
+    }
+
+    #[test]
+    fn modal_pointer_buttons_only_leave_routed_left_clicks() {
+        assert!(!pointer_button_consumed(
+            Some(PointerModal::LeftRouted),
+            ElementState::Pressed,
+            MouseButton::Left
+        ));
+        assert!(pointer_button_consumed(
+            Some(PointerModal::LeftRouted),
+            ElementState::Released,
+            MouseButton::Left
+        ));
+        for button in [
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            assert!(pointer_button_consumed(
+                Some(PointerModal::LeftRouted),
+                ElementState::Pressed,
+                button
+            ));
+            assert!(pointer_button_consumed(
+                Some(PointerModal::FullyBlocking),
+                ElementState::Pressed,
+                button
+            ));
+        }
+        assert!(pointer_button_consumed(
+            Some(PointerModal::FullyBlocking),
+            ElementState::Pressed,
+            MouseButton::Left
+        ));
+        assert!(!pointer_button_consumed(
+            None,
+            ElementState::Pressed,
+            MouseButton::Back
+        ));
     }
 
     #[test]

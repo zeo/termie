@@ -30,11 +30,17 @@ impl ApcScanner {
     /// payload is the bytes between `ESC _` and `ESC \`, including the leading
     /// `G`. spans split across calls are buffered until complete. the returned
     /// slices borrow reused internal buffers — consume them before the next feed.
-    /// runs between escapes are bulk-copied, so a no-graphics chunk costs one
-    /// scan for ESC plus one extend (no per-byte work, no allocation)
-    pub fn feed(&mut self, chunk: &[u8]) -> (&[u8], &[Vec<u8>]) {
+    /// chunks without an APC introducer borrow the input directly; mixed chunks
+    /// bulk-copy only the runs that survive the split
+    pub fn feed<'a>(&'a mut self, chunk: &'a [u8]) -> (&'a [u8], &'a [Vec<u8>]) {
         self.pass.clear();
         self.kitty.clear();
+        if self.state == State::Normal
+            && chunk.last() != Some(&0x1b)
+            && !chunk.windows(2).any(|pair| pair == [0x1b, 0x5f])
+        {
+            return (chunk, &self.kitty);
+        }
         let mut i = 0;
         while i < chunk.len() {
             match self.state {
@@ -246,9 +252,22 @@ mod tests {
     fn csi_passes_through_untouched() {
         let mut s = ApcScanner::default();
         // a CSI sequence (ESC [) must not be mistaken for APC (ESC _)
-        let (pass, kitty) = s.feed(b"\x1b[31mred\x1b[0m");
+        let input = b"\x1b[31mred\x1b[0m";
+        let (pass, kitty) = s.feed(input);
         assert_eq!(pass, b"\x1b[31mred\x1b[0m");
+        assert_eq!(pass.as_ptr(), input.as_ptr());
         assert!(kitty.is_empty());
+    }
+
+    #[test]
+    fn trailing_escape_stays_armed_across_the_zero_copy_path() {
+        let mut s = ApcScanner::default();
+        let (pass, kitty) = s.feed(b"plain\x1b");
+        assert_eq!(pass, b"plain");
+        assert!(kitty.is_empty());
+        let (pass, kitty) = s.feed(b"_Ga=T;QUJD\x1b\\tail");
+        assert_eq!(pass, b"tail");
+        assert_eq!(kitty, &[b"Ga=T;QUJD".to_vec()]);
     }
 
     #[test]
@@ -273,7 +292,8 @@ mod tests {
         let mut pass_bytes = Vec::new();
         let mut kitty_bytes: Vec<Vec<u8>> = Vec::new();
         for &byte in stream {
-            let (p, k) = b.feed(&[byte]);
+            let one = [byte];
+            let (p, k) = b.feed(&one);
             pass_bytes.extend_from_slice(p);
             kitty_bytes.extend(k.iter().cloned());
         }

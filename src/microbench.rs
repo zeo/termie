@@ -204,9 +204,13 @@ fn atlas_benches(filter: &Option<String>) {
 
 /// a Terminal with EVERY cell filled (worst-case render = rows*cols glyphs, like
 /// a full-screen TUI), so the draw_grid benches are apples-to-apples and reflect
-/// the heaviest real frame. mode 0 = plain, 1 = per-cell colored, 2 = combining
+/// the heaviest real frame. mode 0 = plain, 1 = per-cell colored, 2 = combining,
+/// 3 = one background run per row
 fn filled_terminal(rows: usize, cols: usize, mode: u8) -> Terminal {
     let mut buf = Vec::new();
+    if mode == 3 {
+        buf.extend_from_slice(b"\x1b[48;5;24m");
+    }
     for r in 0..rows {
         for c in 0..cols {
             match mode {
@@ -243,6 +247,10 @@ fn render_benches(filter: &Option<String>) {
     let t_csi = filled_terminal(50, 200, 1);
     let (d, n) = best_render(&mut atlas, &t_csi, 4000);
     report_render("draw_grid_colored_fullscreen", filter, d, 4000, n);
+
+    let t_background = filled_terminal(50, 200, 3);
+    let (d, n) = best_render(&mut atlas, &t_background, 4000);
+    report_render("draw_grid_background_runs_fullscreen", filter, d, 4000, n);
 
     let t_comb = filled_terminal(50, 200, 2);
     let (d, n) = best_render(&mut atlas, &t_comb, 4000);

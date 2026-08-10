@@ -74,7 +74,8 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\termie.exe $stage\
           Copy-Item target\release\conpty.dll, target\release\OpenConsole.exe $stage\
-          Copy-Item assets $stage\assets -Recurse
+          New-Item -ItemType Directory -Force (Join-Path $stage 'assets\fonts') | Out-Null
+          Copy-Item assets\fonts\* (Join-Path $stage 'assets\fonts')
           Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRDPARTY.md $stage\
           Set-Content (Join-Path $stage 'VERSION') $ver
           New-Item -ItemType Directory -Force -Path dist | Out-Null

@@ -47,6 +47,41 @@ pub struct FontMetrics {
     weight: Weight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shelf {
+    cursor_x: u32,
+    cursor_y: u32,
+    height: u32,
+}
+
+impl Shelf {
+    const fn new() -> Self {
+        Self {
+            cursor_x: PAD,
+            cursor_y: PAD,
+            height: 0,
+        }
+    }
+
+    fn alloc(&mut self, dim: u32, w: u32, h: u32) -> Option<(u32, u32)> {
+        if w + PAD * 2 > dim {
+            return None;
+        }
+        if self.cursor_x + w + PAD > dim {
+            self.cursor_y += self.height + PAD;
+            self.cursor_x = PAD;
+            self.height = 0;
+        }
+        if self.cursor_y + h + PAD > dim {
+            return None;
+        }
+        let pos = (self.cursor_x, self.cursor_y);
+        self.cursor_x += w + PAD;
+        self.height = self.height.max(h);
+        Some(pos)
+    }
+}
+
 pub struct GlyphAtlas {
     pub font_system: FontSystem,
     swash: SwashCache,
@@ -63,14 +98,13 @@ pub struct GlyphAtlas {
     /// row band [y0, y1) needing GPU re-upload; None while dirty means upload
     /// the whole texture (used after a full repack/reconfigure)
     pub dirty_y: Option<(u32, u32)>,
-    /// parallel RGBA atlas for color (emoji) glyphs, packed in the same coords
-    /// as `data`; the renderer samples this when a glyph is color
+    /// parallel RGBA atlas for color glyphs, with the same dimensions as `data`
+    /// and its own shelf coordinates
     pub color_data: Vec<u8>,
     pub color_dirty: bool,
     pub color_dirty_y: Option<(u32, u32)>,
-    cursor_x: u32,
-    cursor_y: u32,
-    shelf_h: u32,
+    mono_shelf: Shelf,
+    color_shelf: Shelf,
     /// whether system fonts have been scanned into the db yet (lazy)
     system_loaded: bool,
 
@@ -150,9 +184,8 @@ impl GlyphAtlas {
             color_data: vec![0u8; 0],
             color_dirty: false,
             color_dirty_y: None,
-            cursor_x: PAD,
-            cursor_y: PAD,
-            shelf_h: 0,
+            mono_shelf: Shelf::new(),
+            color_shelf: Shelf::new(),
             system_loaded: false,
             cache: FxHashMap::default(),
             cluster_cache: FxHashMap::default(),
@@ -357,9 +390,8 @@ impl GlyphAtlas {
         self.cache.clear();
         self.cluster_cache.clear();
         self.image_cache.clear();
-        self.cursor_x = PAD;
-        self.cursor_y = PAD;
-        self.shelf_h = 0;
+        self.mono_shelf = Shelf::new();
+        self.color_shelf = Shelf::new();
         self.dirty = true;
         self.dirty_y = None;
         self.color_dirty = true;
@@ -446,7 +478,7 @@ impl GlyphAtlas {
         let cw = m.cell_w.round().max(1.0) as u32;
         let ch = m.cell_h.round().max(1.0) as u32;
         if let Some(cov) = super::boxdraw::coverage(key.c, cw as usize, ch as usize, m.px / 12.0) {
-            let (x, y) = match self.alloc(cw, ch) {
+            let (x, y) = match self.alloc_mono(cw, ch) {
                 Some(p) => p,
                 None => return RasterOutcome::NoSpace,
             };
@@ -507,7 +539,12 @@ impl GlyphAtlas {
 
         // a full shelf is not a missing glyph: signal NoSpace so get() can grow
         // or evict and retry (never cache it, or it renders blank forever)
-        let (x, y) = match self.alloc(w, h) {
+        let slot = if is_color {
+            self.alloc_color(w, h)
+        } else {
+            self.alloc_mono(w, h)
+        };
+        let (x, y) = match slot {
             Some(p) => p,
             None => return RasterOutcome::NoSpace,
         };
@@ -746,7 +783,7 @@ impl GlyphAtlas {
             return RasterOutcome::Empty;
         }
 
-        let (x, y) = match self.alloc(cw, ch) {
+        let (x, y) = match self.alloc_mono(cw, ch) {
             Some(p) => p,
             None => return RasterOutcome::NoSpace,
         };
@@ -828,7 +865,7 @@ impl GlyphAtlas {
                 }
             };
             if w > 0 && h > 0 {
-                let (x, y) = match self.alloc(w, h) {
+                let (x, y) = match self.alloc_color(w, h) {
                     Some(p) => p,
                     None => return RasterOutcome::NoSpace,
                 };
@@ -896,7 +933,7 @@ impl GlyphAtlas {
             return RasterOutcome::Empty;
         }
 
-        let (x, y) = match self.alloc(cw, ch) {
+        let (x, y) = match self.alloc_mono(cw, ch) {
             Some(p) => p,
             None => return RasterOutcome::NoSpace,
         };
@@ -992,7 +1029,7 @@ impl GlyphAtlas {
         if rgba.len() < needed || w + PAD * 2 > 2048 || h + PAD * 2 > 2048 {
             return ImagePack::TooBig;
         }
-        let (x, y) = match self.alloc(w, h) {
+        let (x, y) = match self.alloc_color(w, h) {
             Some(p) => p,
             None => return ImagePack::NoSpace,
         };
@@ -1026,22 +1063,12 @@ impl GlyphAtlas {
         self.color_dirty = true;
     }
 
-    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        if w + PAD * 2 > self.dim {
-            return None;
-        }
-        if self.cursor_x + w + PAD > self.dim {
-            self.cursor_y += self.shelf_h + PAD;
-            self.cursor_x = PAD;
-            self.shelf_h = 0;
-        }
-        if self.cursor_y + h + PAD > self.dim {
-            return None;
-        }
-        let pos = (self.cursor_x, self.cursor_y);
-        self.cursor_x += w + PAD;
-        self.shelf_h = self.shelf_h.max(h);
-        Some(pos)
+    fn alloc_mono(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        self.mono_shelf.alloc(self.dim, w, h)
+    }
+
+    fn alloc_color(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        self.color_shelf.alloc(self.dim, w, h)
     }
 }
 
@@ -1238,6 +1265,39 @@ mod tests {
         assert_eq!(alpha_cov, 0, "color glyph must not also be stored in the alpha atlas");
     }
 
+    #[test]
+    fn mono_and_color_shelves_advance_independently() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
+        assert_eq!(atlas.alloc_mono(10, 20), Some((PAD, PAD)));
+        assert_eq!(atlas.alloc_color(30, 40), Some((PAD, PAD)));
+        assert_eq!(atlas.alloc_mono(5, 6), Some((PAD + 10 + PAD, PAD)));
+        assert_eq!(atlas.alloc_color(7, 8), Some((PAD + 30 + PAD, PAD)));
+    }
+
+    #[test]
+    fn near_full_color_image_leaves_room_for_mono_glyphs() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
+        let dim = atlas.dim;
+        let side = dim - PAD * 2;
+        let rgba = vec![128u8; (side * side * 4) as usize];
+        assert!(atlas.get_image(1, &rgba, side, side).is_some());
+
+        let glyph = atlas.get(GlyphKey {
+            font: FontId::Content,
+            c: 'A',
+            bold: false,
+            italic: false,
+        });
+        assert!(
+            glyph.is_some(),
+            "mono glyph should retain its own atlas space"
+        );
+        assert_eq!(
+            atlas.dim, dim,
+            "color occupancy must not grow the mono atlas"
+        );
+    }
+
     // growing the atlas must REALLOCATE the cpu buffers, not just zero them:
     // rasterize copies rows at a dim stride, so a stale 1024-sized buffer would
     // index out of bounds the moment dim bumps to 2048
@@ -1281,11 +1341,14 @@ mod tests {
     fn repack_at_reallocates_on_grow() {
         let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
         assert_eq!(atlas.dim, 1024);
+        assert!(atlas.alloc_mono(10, 20).is_some());
+        assert!(atlas.alloc_color(30, 40).is_some());
         atlas.repack_at(2048);
         assert_eq!(atlas.dim, 2048);
         assert_eq!(atlas.data.len(), 2048 * 2048);
         assert_eq!(atlas.color_data.len(), 2048 * 2048 * 4);
-        assert_eq!((atlas.cursor_x, atlas.cursor_y), (PAD, PAD));
+        assert_eq!(atlas.mono_shelf, Shelf::new());
+        assert_eq!(atlas.color_shelf, Shelf::new());
         assert!(atlas.dirty && atlas.dirty_y.is_none(), "grow must flag a full re-upload");
     }
 

@@ -702,6 +702,7 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    uploaded_screen: Option<[u32; 2]>,
 
     atlas_texture: wgpu::Texture,
     color_texture: wgpu::Texture,
@@ -1372,6 +1373,7 @@ impl Renderer {
         self.bg_alpha = if transparent { self.opacity } else { 1.0 };
         self.uniform_buffer = gpu.uniform_buffer;
         self.uniform_bind_group = gpu.uniform_bind_group;
+        self.uploaded_screen = None;
         self.pipeline = gpu.pipeline;
         self.instance_buffer = gpu.instance_buffer;
         self.instance_capacity = gpu.instance_capacity;
@@ -1458,6 +1460,7 @@ impl Renderer {
             pipeline,
             uniform_buffer,
             uniform_bind_group,
+            uploaded_screen: None,
             atlas_texture,
             color_texture,
             atlas_bind_group,
@@ -3120,27 +3123,37 @@ impl Renderer {
 
         for r in 0..grid.rows {
             let line = grid.line_at(r);
-            for c in 0..grid.cols {
-                let cell = line.get(c).copied().unwrap_or_default();
-                if cell.attrs.hidden() {
+            let mut run_start = 0usize;
+            let mut run_bg = None;
+            for c in 0..=grid.cols {
+                let bg = if c == grid.cols {
+                    None
+                } else {
+                    let cell = line.get(c).copied().unwrap_or_default();
+                    if cell.attrs.hidden() {
+                        None
+                    } else {
+                        let color = if cell.attrs.inverse() { cell.fg } else { cell.bg };
+                        let color = palette.resolve_bg(color);
+                        (color != palette.bg).then_some(color)
+                    }
+                };
+                if bg == run_bg {
                     continue;
                 }
-                let mut bg = cell.bg;
-                if cell.attrs.inverse() {
-                    bg = cell.fg;
-                }
-                let bg = palette.resolve_bg(bg);
-                if bg != palette.bg {
+                if let Some(color) = run_bg {
                     Self::push_rect(
                         out,
-                        ox + c as f32 * cell_w,
+                        ox + run_start as f32 * cell_w,
                         oy + r as f32 * cell_h,
-                        cell_w,
+                        (c - run_start) as f32 * cell_w,
                         cell_h,
-                        bg,
+                        color,
                         1.0,
                     );
                 }
+                run_start = c;
+                run_bg = bg;
             }
         }
 
@@ -5693,13 +5706,7 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
         }
-
-        let uniforms = Uniforms {
-            screen: [self.config.width as f32, self.config.height as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.upload_screen_uniform();
 
         use wgpu::CurrentSurfaceTexture as Cst;
         if self.surface.is_none() {
@@ -5807,6 +5814,20 @@ impl Renderer {
         // hand the buffer back so its capacity is reused next frame
         self.scratch = instances;
         Ok(())
+    }
+
+    fn upload_screen_uniform(&mut self) {
+        let screen = [self.config.width, self.config.height];
+        if self.uploaded_screen == Some(screen) {
+            return;
+        }
+        let uniforms = Uniforms {
+            screen: [screen[0] as f32, screen[1] as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.uploaded_screen = Some(screen);
     }
 
     pub fn shutdown(self) {
@@ -5926,12 +5947,7 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
         }
-        let uniforms = Uniforms {
-            screen: [self.config.width as f32, self.config.height as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.upload_screen_uniform();
 
         let (width, height) = (self.config.width, self.config.height);
         let Some((target, readback)) = self.offscreen.as_ref() else {
@@ -6119,8 +6135,68 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        clip_image_v, CursorShape, GlyphAtlas, LinkPreview, Palette, Renderer, Terminal, ThemeId,
+        clip_image_v, CursorShape, FontId, GlyphAtlas, Instance, LinkPreview, Palette, Renderer,
+        Terminal, ThemeId,
     };
+
+    fn draw_backgrounds(input: &[u8], cols: usize) -> (Vec<Instance>, f32) {
+        let mut term = Terminal::new(2, cols);
+        vte::Parser::new().advance(&mut term, input);
+        term.grid.cursor.visible = false;
+        let mut atlas = GlyphAtlas::new(14.0, 12.5, 1.0, None, 1.32);
+        let cell_w = atlas.metrics(FontId::Content).cell_w;
+        let palette = Palette::from_theme(ThemeId::Instrument);
+        let mut out = Vec::new();
+        Renderer::draw_grid(
+            &mut atlas,
+            &palette,
+            &mut out,
+            &term,
+            0.0,
+            0.0,
+            true,
+            true,
+            true,
+            2.0,
+            CursorShape::Block,
+            None,
+            None,
+            &[],
+            true,
+            1.0,
+            false,
+        );
+        (out, cell_w)
+    }
+
+    #[test]
+    fn equal_background_cells_share_one_run() {
+        let (out, cell_w) = draw_backgrounds(b"\x1b[41m   \x1b[0m", 6);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].size[0] - cell_w * 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn alternating_background_colors_stay_separate() {
+        let (out, cell_w) = draw_backgrounds(b"\x1b[41m \x1b[42m \x1b[41m ", 6);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|instance| (instance.size[0] - cell_w).abs() < 0.01));
+    }
+
+    #[test]
+    fn hidden_cell_breaks_a_background_run() {
+        let (out, cell_w) = draw_backgrounds(b"\x1b[41m \x1b[8m \x1b[28m ", 6);
+        assert_eq!(out.len(), 2);
+        assert!((out[0].pos[0] - 0.0).abs() < 0.01);
+        assert!((out[1].pos[0] - cell_w * 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inverse_foreground_cells_share_a_background_run() {
+        let (out, cell_w) = draw_backgrounds(b"\x1b[31;7m  \x1b[27m", 6);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].size[0] - cell_w * 2.0).abs() < 0.01);
+    }
 
     #[test]
     fn link_preview_keeps_the_real_host_visible() {
