@@ -988,11 +988,11 @@ fn build_cell_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Instance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &INSTANCE_ATTRS,
-            }],
+            })],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1192,6 +1192,7 @@ impl Renderer {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: force_fallback,
+                apply_limit_buckets: false,
             }))
             .map_err(|e| anyhow!("no suitable GPU adapter: {e}"))?;
             Ok((instance, surface, adapter))
@@ -1260,6 +1261,8 @@ impl Renderer {
             // one frame ahead — cuts up to a frame of input-to-photon latency
             desired_maximum_frame_latency: 1,
             alpha_mode,
+            // auto keeps wgpu's historical srgb/linear pick for the format
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
@@ -1314,6 +1317,7 @@ impl Renderer {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: force_fallback,
+                apply_limit_buckets: false,
             }))
             .map_err(|e| anyhow!("no GPU adapter on recreate: {e}"))?;
             Ok((instance, surface, adapter))
@@ -5810,7 +5814,7 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         // hand the buffer back so its capacity is reused next frame
         self.scratch = instances;
         Ok(())
@@ -5847,6 +5851,7 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no gpu adapter for headless render");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -5880,6 +5885,7 @@ impl Renderer {
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 1,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
         };
         let atlas = GlyphAtlas::new(content_pt, chrome_pt, scale, None, 1.32);
@@ -6032,7 +6038,7 @@ impl Renderer {
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("readback buffer did not map");
         let row = (width * 4) as usize;
         let mut rgba = Vec::with_capacity(row * height as usize);
         for y in 0..height as usize {
@@ -6717,6 +6723,7 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
