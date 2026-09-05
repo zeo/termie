@@ -836,7 +836,7 @@ fn hex_decode(s: &[u8]) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
-    s.chunks_exact(2).map(|p| Some(nib(p[0])? << 4 | nib(p[1])?)).collect()
+    s.as_chunks::<2>().0.iter().map(|p| Some(nib(p[0])? << 4 | nib(p[1])?)).collect()
 }
 
 fn hex_encode(s: &[u8]) -> String {
