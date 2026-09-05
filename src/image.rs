@@ -350,7 +350,7 @@ fn decode(format: u32, w: u32, h: u32, data: &[u8]) -> Option<Image> {
                 return None;
             }
             let mut v = Vec::with_capacity(n4);
-            for c in data[..n].chunks_exact(3) {
+            for c in data[..n].as_chunks::<3>().0 {
                 v.extend_from_slice(c);
                 v.push(255);
             }
@@ -388,7 +388,7 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<Image> {
         }
         png::ColorType::Rgb => {
             let mut v = Vec::with_capacity(n4);
-            for c in src.chunks_exact(3) {
+            for c in src.as_chunks::<3>().0 {
                 v.extend_from_slice(c);
                 v.push(255);
             }
@@ -396,7 +396,7 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<Image> {
         }
         png::ColorType::GrayscaleAlpha => {
             let mut v = Vec::with_capacity(n4);
-            for c in src.chunks_exact(2) {
+            for c in src.as_chunks::<2>().0 {
                 v.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
             }
             v
