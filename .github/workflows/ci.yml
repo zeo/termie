@@ -9,10 +9,10 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.gitignore']
   workflow_dispatch:
 
-# one self-hosted Windows runner does the (slow) Rust build for both test and
-# lint, so back-to-back pushes used to stack full CI runs behind each other and
-# leave the newest checks "Queued" for ages. collapse a ref to its latest run:
-# a new push cancels the older in-progress/queued run for the same branch or PR.
+# windows and linux jobs run on separate hosted runners, so back-to-back
+# pushes used to stack full CI runs behind each other and leave the newest
+# checks "Queued" for ages. collapse a ref to its latest run: a new push
+# cancels the older in-progress/queued run for the same branch or PR.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -24,16 +24,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # one Windows job builds the app, runs the unit tests, and runs clippy. on the
-  # single self-hosted runner this compiles the (heavy) dependency tree once and
-  # lets test + clippy reuse it, instead of two back-to-back cold builds: clippy
-  # reuses the already-compiled deps and only re-checks the workspace crate, so
-  # it's cheap after the build. formatting is intentionally not enforced (the
-  # project keeps its own non-rustfmt style); clippy is the quality gate.
+  # one Windows job builds the app, runs the unit tests, and runs clippy on
+  # the hosted runner. clippy reuses the already-compiled deps and only
+  # re-checks the workspace crate, so it's cheap after the build. formatting
+  # is intentionally not enforced (the project keeps its own non-rustfmt
+  # style); clippy is the quality gate.
   build:
-    # self-hosted runners execute PR code in the host environment, so only branches
-    # from this repository may schedule them
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -70,7 +67,7 @@ jobs:
   # tests skip themselves when the runner has no adapter, so this passes on a
   # headless vm while still covering the platform layer, pty, and parser
   build-linux:
-    # self-hosted runners execute PR code in the host environment, so only branches
+    # keep fork PRs off the hosted runners so they cannot burn build minutes
     # from this repository may schedule them
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -144,7 +141,7 @@ jobs:
 
   # security advisory scan of the dependency tree (RUSTSEC database)
   audit:
-    # self-hosted runners execute PR code in the host environment, so only branches
+    # keep fork PRs off the hosted runners so they cannot burn build minutes
     # from this repository may schedule them
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
