@@ -8,6 +8,9 @@
 - Split panes meet on a single hairline. Focus dims the other panes instead of boxing the focused one, crossfading on every switch. A bell now pools a warm glow along the pane's inner edge.
 - The status bar shows the focused pane's directory, a live timer while a command runs, then its result and duration. The grid size appears for a moment after a resize. The command palette lists each command's shortcut.
 - Hover fills fade in and fade out more slowly, the cursor blink eases in and out, and every positional animation becomes a plain fade when the system asks for reduced motion.
+- Secondary chrome text (status bar, labels, shortcut hints, inactive tabs) is lifted to at least 4.5:1 against its surface in every theme, including user color overrides. Selections in Koi, Paper, Gruvbox, Tokyo Night, and Nord are stronger while selected text stays above 4.5:1, and Koi's red and Paper's bright yellow are deepened for legibility.
+- The very first launch plays a short welcome: the badge settles in, winks, and dissolves, leaving three key hints that clear on the first keystroke. It never plays again, and never for an existing install.
+- The installer shares the app's palette and font, with rounded controls, switches instead of checkboxes, and a red close button.
 - Plugin widget colors accept `ok`, `err`, `warn`, `info`, and `ansi0` to `ansi15`. A raw hex color snaps to the active theme's nearest color, so widgets stay on-palette in every theme.
 - Hovered web links now show their destination in the status bar. Ctrl-click requires a reviewed target with a plain ASCII authority, rejects directional formatting, and pauses if the destination changes under the pointer.
 - Precision wheels and touchpads accumulate small zoom deltas and reset at gesture boundaries, giving each font-size step deliberate weight.

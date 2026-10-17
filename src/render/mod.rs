@@ -896,6 +896,9 @@ pub struct Renderer {
     size_flash: Option<Instant>,
     /// the context-menu row under the pointer and when it lit, for the fade-in
     menu_hover: Option<(usize, Instant)>,
+    /// the once-ever welcome: when it began, and when the first keystroke
+    /// dismissed its hints
+    welcome: Option<(Instant, Option<Instant>)>,
     /// (previous active tab index, start) so the active-tab accent rail slides
     /// to the newly selected tab instead of teleporting
     tab_slide: Option<(usize, Instant)>,
@@ -1642,6 +1645,7 @@ impl Renderer {
             tab_signal: Vec::new(),
             size_flash: None,
             menu_hover: None,
+            welcome: None,
             tab_slide: None,
             overlay_since: None,
             overlay_shown: false,
@@ -1763,7 +1767,7 @@ impl Renderer {
         if self.dock.is_empty() {
             0.0
         } else {
-            (224.0 * self.scale).round().min(self.config.width as f32 * 0.4)
+            tokens::px(tokens::DOCK_W, self.scale).min(self.config.width as f32 * 0.4)
         }
     }
 
@@ -1843,7 +1847,7 @@ impl Renderer {
     /// cursor-beam / scroll-thumb width in pixels (kept in one place so the
     /// painter and the scrollbar hit-test agree)
     fn beam_w(&self) -> f32 {
-        (2.0 * self.scale).round().max(1.0)
+        tokens::px(tokens::SPACE_2XS, self.scale).max(1.0)
     }
 
     /// scroll thumb geometry for a pane grid, or None when there is nothing to
@@ -2373,6 +2377,9 @@ impl Renderer {
             || live(self.focus_prev.map(|(_, t)| t), motion::FOCUS)
             || live(self.size_flash, 1.0)
             || (self.pane_menu_view.is_some() && live(self.menu_hover.map(|(_, t)| t), motion::HOVER_IN))
+            || self.welcome.is_some_and(|(start, gone)| {
+                live(Some(start), motion::WELCOME_DISSOLVE_AT + motion::WELCOME_DISSOLVE) || live(gone, motion::WELCOME_OUT)
+            })
             || self
                 .tab_signal
                 .iter()
@@ -2402,6 +2409,53 @@ impl Renderer {
         } else {
             let next = [0.50, 0.88, 1.50].into_iter().find(|&edge| edge > p).unwrap_or(1.50);
             (((next - p) * motion::CURSOR_PERIOD * 1000.0) as u64).max(1)
+        }
+    }
+
+    /// play the once-ever welcome over the first window's content
+    pub fn start_welcome(&mut self) {
+        self.welcome = Some((Instant::now(), None));
+    }
+
+    /// skip the power-on reveal and finish any hover fade, so a headless
+    /// capture is the same frame no matter how long staging took
+    #[cfg(any(test, debug_assertions))]
+    pub fn settle_reveal(&mut self) {
+        self.reveal_start = Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap_or_else(Instant::now);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub fn settle_hover(&mut self) {
+        self.hover_since = self.hover_since.and_then(|t| t.checked_sub(std::time::Duration::from_secs(1)));
+        self.hover_prev = None;
+    }
+
+    /// freeze the welcome `t` seconds in, for headless captures
+    #[cfg(any(test, debug_assertions))]
+    pub fn welcome_at(&mut self, t: f32) {
+        let start = Instant::now().checked_sub(std::time::Duration::from_secs_f32(t)).unwrap_or_else(Instant::now);
+        self.welcome = Some((start, None));
+    }
+
+    /// freeze a background tab's finish signal `t` seconds in, for captures
+    #[cfg(any(test, debug_assertions))]
+    pub fn tab_signal_at(&mut self, i: usize, t: f32) {
+        if let Some(slot) = self.tab_signal.get_mut(i) {
+            *slot = Instant::now().checked_sub(std::time::Duration::from_secs_f32(t));
+        }
+    }
+
+    /// freeze an opening overlay `t` seconds into its bloom, for captures
+    #[cfg(any(test, debug_assertions))]
+    pub fn overlay_at(&mut self, t: f32) {
+        self.overlay_shown = true;
+        self.overlay_since = Instant::now().checked_sub(std::time::Duration::from_secs_f32(t));
+    }
+
+    /// the first keystroke fades the welcome's hints out
+    pub fn dismiss_welcome(&mut self) {
+        if let Some((_, gone @ None)) = &mut self.welcome {
+            *gone = Some(Instant::now());
         }
     }
 
@@ -2439,7 +2493,7 @@ impl Renderer {
         let swatch = if swatches { t(tokens::SPACE_M) + t(tokens::SPACE_S) } else { 0.0 };
         let w = self.config.width as f32;
         let h = self.config.height as f32;
-        let mw = (widest + swatch + t(tokens::SPACE_M) * 2.0 + pad * 2.0).clamp(t(tokens::MENU_W), t(360.0).min(w - t(tokens::SPACE_S) * 2.0)).round();
+        let mw = (widest + swatch + t(tokens::SPACE_M) * 2.0 + pad * 2.0).clamp(t(tokens::MENU_W), t(tokens::MENU_MAX_W).min(w - t(tokens::SPACE_S) * 2.0)).round();
         let mh = row_h * items.len() as f32 + pad * 2.0;
         let edge = t(tokens::SPACE_XS);
         let bx = mx.min(w - mw - edge).max(edge).round();
@@ -2512,7 +2566,7 @@ impl Renderer {
     }
 
     fn badge_size(&self) -> f32 {
-        tokens::px(20.0, self.scale)
+        tokens::px(tokens::BADGE, self.scale)
     }
 
     /// where the wordmark ends and tabs begin
@@ -2535,7 +2589,7 @@ impl Renderer {
         let h = self.title_bar_h;
         let cw = t(tokens::CONTROL_W);
         let newtab_w = t(tokens::SPACE_2XL);
-        let chev_w = t(20.0);
+        let chev_w = t(tokens::SPACE_XL - tokens::SPACE_XS);
         let start = self.tabs_start_x();
         // reserve all 7 title-bar control buttons (control_rects starts at w-7cw,
         // the SplitV slot) so the new-tab '+' and its chevron never overrun the
@@ -2607,36 +2661,39 @@ impl Renderer {
         let h = self.config.height as f32;
         let scroll = self.settings_scroll;
 
-        let panel_w = (0.6 * w).clamp(460.0 * s, 760.0 * s).min((w - 160.0 * s).max(360.0 * s));
+        let t = |pt| tokens::px(pt, s);
+        let panel_w = (0.6 * w)
+            .clamp(t(tokens::SETTINGS_MIN_W), t(tokens::SETTINGS_MAX_W))
+            .min((w - t(tokens::SETTINGS_GUTTER)).max(t(tokens::SETTINGS_FLOOR_W)));
         let panel_top = self.title_bar_h;
         let panel_h = (h - self.title_bar_h - self.status_bar_h).max(1.0);
         let panel_x = (w - panel_w * self.settings_p).round();
 
-        let pad = 22.0 * s;
+        let pad = t(tokens::SPACE_XL);
         let content_x = panel_x + pad;
         let content_w = panel_w - pad * 2.0;
-        let val_x = content_x + 152.0 * s;
-        let bw = (30.0 * s).round();
-        let bh = (26.0 * s).round();
-        let val_w = (60.0 * s).round();
+        let val_x = content_x + t(tokens::SETTINGS_LABEL_W);
+        let bw = t(tokens::SPACE_2XL);
+        let bh = t(tokens::CONTROL_H);
+        let val_w = t(tokens::STEPPER_VALUE_W);
         let cluster = bw * 2.0 + val_w;
 
-        let head_y = panel_top + 22.0 * s;
-        let close_sz = 26.0 * s;
-        let close_btn = (panel_x + panel_w - pad - close_sz, head_y - 3.0 * s, close_sz, close_sz);
-        let body_top = panel_top + 60.0 * s;
-        let body_bottom = panel_top + panel_h - 14.0 * s;
+        let head_y = panel_top + t(tokens::SPACE_XL);
+        let close_sz = t(tokens::CONTROL_H);
+        let close_btn = (panel_x + panel_w - pad - close_sz, head_y - t(tokens::SPACE_XS), close_sz, close_sz);
+        let body_top = panel_top + t(tokens::SPACE_2XL + tokens::SPACE_XL + tokens::SPACE_XS);
+        let body_bottom = panel_top + panel_h - t(tokens::SPACE_M);
 
         // body laid out in local space (y from 0), converted to absolute below
-        let row = 38.0 * s;
-        let lh = 30.0 * s;
-        let sec_gap = 24.0 * s;
-        let hdr_adv = 32.0 * s;
-        let chip_h = 42.0 * s;
-        let key_row = 22.0 * s;
+        let row = t(tokens::SPACE_2XL + tokens::SPACE_S);
+        let lh = t(tokens::SPACE_2XL);
+        let sec_gap = t(tokens::SPACE_XL);
+        let hdr_adv = t(tokens::SPACE_2XL);
+        let chip_h = t(tokens::SPACE_2XL + tokens::SPACE_S);
+        let key_row = t(tokens::SPACE_XL);
         // top headroom so the first row isn't clipped by the body scissor at
         // body_top — the browse button sits a few px above its label row
-        let mut y = 8.0 * s;
+        let mut y = t(tokens::SPACE_S);
         // PLUGINS first so the marketplace is the first thing in the gear menu
         let sec_plugins = y;
         y += hdr_adv;
@@ -2668,7 +2725,7 @@ impl Renderer {
         y += lh;
         let theme_chip_l = y;
         // two rows of four chips
-        y += (chip_h + 8.0 * s) * 2.0 + 2.0 * s;
+        y += (chip_h + t(tokens::SPACE_S)) * 2.0 + t(tokens::SPACE_2XS);
         y += sec_gap;
         let sec_beh = y;
         y += hdr_adv;
@@ -2696,8 +2753,8 @@ impl Renderer {
         let sec_about = y;
         y += hdr_adv;
         let about_start_l = y;
-        y += 28.0 * s * 3.0;
-        let content_h = y + 12.0 * s;
+        y += t(tokens::CONTROL_H) * 3.0;
+        let content_h = y + t(tokens::SPACE_M);
 
         let ay = |yl: f32| body_top - scroll + yl;
         let stepper = |x: f32, yl: f32| {
@@ -2721,7 +2778,7 @@ impl Renderer {
         let close_action_btn = (val_x, ay(close_l), cluster, bh);
         let backend_btn = (val_x, ay(backend_l), cluster, bh);
         // "browse" store button right-aligned in the PLUGINS header row
-        let plugins_btn = (content_x + content_w - cluster, ay(sec_plugins) - 4.0 * s, cluster, bh);
+        let plugins_btn = (content_x + content_w - cluster, ay(sec_plugins) - t(tokens::SPACE_XS), cluster, bh);
         // one row per installed plugin: (name, enabled, toggle rect, row baseline)
         let plugin_rows: Vec<(String, bool, Rect, f32)> = self
             .plugins_installed
@@ -2733,7 +2790,7 @@ impl Renderer {
             })
             .collect();
 
-        let chip_gap = 8.0 * s;
+        let chip_gap = t(tokens::SPACE_S);
         let chip_w = ((content_w - chip_gap * 3.0) / 4.0).floor();
         let mut theme_chips = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); ThemeId::ALL.len() + 1];
         for (i, chip) in theme_chips.iter_mut().enumerate() {
@@ -2892,7 +2949,7 @@ impl Renderer {
             }
         }
 
-        let e = (6.0 * self.scale).max(4.0);
+        let e = tokens::px(tokens::RESIZE_EDGE, self.scale).max(4.0);
         let left = x <= e;
         let right = x >= w - e;
         let top = y <= e;
@@ -3941,6 +3998,7 @@ impl Renderer {
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
         let BG = self.palette.bg;
+        let QUIET = self.quiet(self.palette.ink0);
 
         let pad = self.pad;
         let w = self.config.width as f32;
@@ -3952,7 +4010,7 @@ impl Renderer {
         // follow the clock even when the configured default is steady
         let blink_phase = motion::cursor_blink(self.start.elapsed().as_secs_f32());
         let blink_on = if self.cursor_blink { blink_phase } else { 1.0 };
-        let beam_w = (2.0 * self.scale).round().max(1.0);
+        let beam_w = self.beam_w();
 
         // reuse the persistent scratch buffer: keeps its capacity across frames
         // so a steady-state paint does no heap allocation for the instance list
@@ -4166,6 +4224,8 @@ impl Renderer {
             return out;
         }
 
+        self.draw_welcome(&mut out);
+
         // ---- plugin dock (Tier-1 widgets) on the right of the content area ----
         if !self.dock.is_empty() {
             self.draw_dock(&mut out, track);
@@ -4262,8 +4322,13 @@ impl Renderer {
             } else {
                 label
             };
-            let la = if *active { 1.0 } else { tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha };
-            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, TEXT_2, la, track);
+            let lc = if *active {
+                TEXT_2
+            } else {
+                let mix = BG.lerp(TEXT_2, tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha);
+                crate::color::apply_min_contrast(mix, BG, tokens::TEXT_CONTRAST)
+            };
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, lc, 1.0, track);
 
             let signal = if *active { None } else { self.tab_signal_phase(*i) };
             if let Some((reach, rail_a, _)) = signal
@@ -4280,7 +4345,7 @@ impl Renderer {
                 }
                 let base = if *active { MUTE } else { MUTE.lerp(BG, 0.3) };
                 let c = base.lerp(TEXT_2, *close_ha);
-                Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(8.0), stroke, c, 1.0);
+                Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(tokens::ICON_SMALL), stroke, c, 1.0);
             } else if let Some((dot, da)) = self.status_dot(*attn) {
                 let dot_a = signal.map_or(1.0, |(_, _, d)| d);
                 if dot_a > 0.0 {
@@ -4324,7 +4389,7 @@ impl Renderer {
                 .map(|tab| tab.1.0)
                 .or_else(|| tab_items.last().map(|tab| tab.1.0 + tab.1.2))
                 .unwrap_or(tl.newtab.0);
-            let marker_w = t(3.0).max(hair * 2.0);
+            let marker_w = t(tokens::SPACE_XS).max(hair * 2.0);
             let my = t(tokens::SPACE_S);
             Self::push_round(&mut out, x - marker_w / 2.0, my, marker_w, tbh - my * 2.0, marker_w / 2.0, PAPER, 1.0);
         }
@@ -4334,7 +4399,7 @@ impl Renderer {
         for (rect, hot, glyph) in [(tl.newtab, Hot::NewTab, Icon::Plus), (tl.newtab_menu, Hot::NewTabMenu, Icon::Chevron)] {
             let a = self.hover_a(hot);
             let (x, _, bw, _) = rect;
-            let chip_h = t(26.0);
+            let chip_h = t(tokens::CONTROL_H - tokens::SPACE_2XS);
             let chip = (x + t(tokens::SPACE_2XS), ((tbh - chip_h) / 2.0).round(), bw - t(tokens::SPACE_XS), chip_h);
             if a > 0.0 {
                 Self::push_shape(&mut out, chip, [t(tokens::RADIUS_ROW), 0.0, 0.0], INK_3, a);
@@ -4345,7 +4410,7 @@ impl Renderer {
         // title-bar buttons: split right|left, split top/bottom, pane mode,
         // gear, min, max, close. full-height hover fills, the platform's
         // convention; close goes red
-        let close_red = Rgb::new(tokens::CLOSE_RED.0, tokens::CLOSE_RED.1, tokens::CLOSE_RED.2);
+        let close_red = Rgb::from_triple(crate::instrument::CLOSE_RED);
         for (c, x0, x1) in self.control_rects() {
             let a = self.hover_a(c);
             let pinned = (c == Hot::Gear && self.settings_open) || (c == Hot::PaneMode && self.pane_mode);
@@ -4386,7 +4451,7 @@ impl Renderer {
         let sw = small.cell_w + st_track;
         let gap = t(tokens::SPACE_L);
         let ig = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
-        let sicon = t(9.0);
+        let sicon = t(tokens::ICON_STATUS);
         let sbar = (0.0, sb_y, 0.0, self.status_bar_h);
         let keyed_w = |r: &Self, key: &str, val: &str| r.text_w(FontId::Small, key, key_track) + t(tokens::SPACE_S) + r.text_w(FontId::Small, val, st_track);
 
@@ -4415,12 +4480,12 @@ impl Renderer {
                     continue;
                 }
                 sx += action_gap;
-                sx = self.status_keyed(&mut out, sx, st_top, key, value, PAPER, MUTE);
+                sx = self.status_keyed(&mut out, sx, st_top, key, value, PAPER, QUIET);
             }
             if sx > pad {
                 sx += gap;
             }
-            self.status_keyed(&mut out, sx, st_top, "ESC", "done", PAPER, MUTE)
+            self.status_keyed(&mut out, sx, st_top, "ESC", "done", PAPER, QUIET)
         } else {
             let mut sx = pad;
             if self.elevated {
@@ -4486,23 +4551,23 @@ impl Renderer {
                 let value_w = preview.fitted_chars as f32 * sw;
                 let x = rx - key_w - key_gap - value_w;
                 if key.is_empty() {
-                    let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &value, MUTE, 1.0, st_track);
+                    let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &value, QUIET, 1.0, st_track);
                 } else {
-                    let _ = self.status_keyed(&mut out, x, st_top, key, &value, PAPER, MUTE);
+                    let _ = self.status_keyed(&mut out, x, st_top, key, &value, PAPER, QUIET);
                 }
             }
         } else if let Some(&(key, value)) =
             drag_hint_variants(self.hovered).iter().find(|&&(key, value)| keyed_w(self, key, value) <= room)
         {
             let x = rx - keyed_w(self, key, value);
-            let _ = self.status_keyed(&mut out, x, st_top, key, value, PAPER, MUTE);
+            let _ = self.status_keyed(&mut out, x, st_top, key, value, PAPER, QUIET);
         } else {
             let (mode, mode_c, mode_a) = if self.pane_mode {
                 ("PANE MODE", PAPER, 1.0)
             } else if self.mark_mode {
                 ("MARK MODE", PAPER, 1.0)
             } else {
-                ("READY", TEXT_2, tokens::KEY_LABEL)
+                ("READY", self.quiet(INK_0).lerp(TEXT_2, 0.25), 1.0)
             };
             let mw = self.text_w(FontId::Small, mode, key_track);
             rx -= mw;
@@ -4533,7 +4598,7 @@ impl Renderer {
                         let dy = (sb_y + (self.status_bar_h - d) / 2.0).round();
                         Self::push_round(&mut out, (mark_rect.0 + (sicon - d) / 2.0).round(), dy, d, d, d / 2.0, c, a);
                     }
-                    let tc = if mark == 4 { self.palette.ansi_color(1) } else { MUTE };
+                    let tc = if mark == 4 { self.palette.ansi_color(1) } else { QUIET };
                     let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &text, tc, 1.0, st_track);
                 }
             }
@@ -4636,7 +4701,7 @@ impl Renderer {
                 .round();
             let card = (box_x, box_y, box_w, box_h);
             let r = t(tokens::RADIUS_ROW + 2.0);
-            Self::push_shadow(&mut out, card, r, t(14.0), t(6.0), INK_0, 0.45);
+            Self::push_shadow(&mut out, card, r, t(tokens::SPACE_L), t(tokens::SPACE_XS + tokens::SPACE_2XS), INK_0, 0.45);
             Self::push_shape(&mut out, card, [r, 0.0, 0.0], INK_3, 0.98);
             Self::push_ring(&mut out, card, r, hair, RULE_2, 1.0);
             let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
@@ -4685,6 +4750,7 @@ impl Renderer {
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
+        let QUIET = self.quiet(INK_1);
         let s = self.scale;
         let hair = s.max(1.0);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
@@ -4719,7 +4785,7 @@ impl Renderer {
         if qa > 0.0 {
             Self::push_shape(out, g.close_btn, [t(tokens::RADIUS_CHIP + 2.0), 0.0, 0.0], self.palette.ink3, qa);
         }
-        Self::draw_icon(&mut self.atlas, out, Icon::Close, g.close_btn, t(9.0), hair, MUTE.lerp(TEXT_2, qa), 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, g.close_btn, t(tokens::ICON_STATUS), hair, MUTE.lerp(TEXT_2, qa), 1.0);
         Self::push_rect(out, cx, g.body_top - t(tokens::SPACE_M), cw, hair, RULE, 1.0);
 
         // ── scrollable body: everything after this index is scissor-clipped ──
@@ -4735,7 +4801,7 @@ impl Renderer {
         self.section_label(out, cx, g.sec_plugins_y, plug_rule_w, "PLUGINS");
         self.cycle_btn(out, g.plugins_btn, "browse", Hot::OpenPlugins, track);
         if g.plugin_rows.is_empty() {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.sec_plugins_y + t(tokens::SPACE_2XL)), "no plugins installed", MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.sec_plugins_y + t(tokens::SPACE_2XL)), "no plugins installed", QUIET, 1.0, track);
         } else {
             for (i, (name, on, rect, ry)) in g.plugin_rows.iter().enumerate() {
                 let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(*ry), name, TEXT_2, 1.0, track);
@@ -4797,7 +4863,7 @@ impl Renderer {
         let (bbx, _, bbw, _) = g.backend_btn;
         let small_h = self.atlas.metrics(FontId::Small).cell_h;
         let small_track = self.track_for(FontId::Small);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - small_h) / 2.0).round(), "applies on restart", MUTE, 1.0, small_track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - small_h) / 2.0).round(), "applies on restart", QUIET, 1.0, small_track);
 
         // KEYBINDINGS (two sub-columns)
         self.section_label(out, cx, g.sec_keys_y, cw, "KEYBINDINGS");
@@ -4815,9 +4881,9 @@ impl Renderer {
             ("Ctrl+,", "settings"),
             ("Esc", "close"),
         ];
-        let key_row = t(22.0);
+        let key_row = t(tokens::SPACE_XL);
         let sub2 = cx + cw / 2.0;
-        let desc_dx = t(108.0);
+        let desc_dx = t(tokens::SETTINGS_LABEL_W - tokens::SPACE_2XL - tokens::SPACE_M);
         for (i, (k, d)) in keys.into_iter().enumerate() {
             let (kx, ky) = if i < 6 {
                 (cx, g.keys_start_y + i as f32 * key_row)
@@ -4825,7 +4891,7 @@ impl Renderer {
                 (sub2, g.keys_start_y + (i - 6) as f32 * key_row)
             };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, kx, ky + (chrome_h - small_h) / 2.0, k, TEXT_2, 1.0, small_track);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, kx + desc_dx, ky, d, MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, kx + desc_dx, ky, d, QUIET, 1.0, track);
         }
 
         // ABOUT
@@ -4835,11 +4901,11 @@ impl Renderer {
             ("VERSION", concat!("termie ", env!("CARGO_PKG_VERSION"))),
             ("RENDERER", self.backend_label),
         ];
-        let about_dx = t(120.0);
+        let about_dx = t(tokens::SETTINGS_LABEL_W - tokens::SPACE_2XL);
         let key_track = self.key_track();
         for (i, (k, v)) in about.into_iter().enumerate() {
-            let ya = g.about_start_y + i as f32 * t(28.0);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx, ya + (chrome_h - small_h) / 2.0, k, MUTE, 1.0, key_track);
+            let ya = g.about_start_y + i as f32 * t(tokens::CONTROL_H);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx, ya + (chrome_h - small_h) / 2.0, k, QUIET, 1.0, key_track);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx + about_dx, ya, v, TEXT_2, 1.0, track);
         }
     }
@@ -4854,7 +4920,7 @@ impl Renderer {
         };
         let s = self.scale;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let pad = (8.0 * s).round();
+        let pad = tokens::px(tokens::SPACE_S, s);
         let tw = self.text_w(FontId::Chrome, &line, track);
         let (bw, bh) = (tw + pad * 2.0, chrome_h + pad);
         let bx = pad;
@@ -4879,7 +4945,7 @@ impl Renderer {
         let INK_1 = self.palette.ink1;
         let RULE = self.palette.rule;
         let TEXT_2 = self.palette.text2;
-        let MUTE = self.palette.mute;
+        let QUIET = self.quiet(INK_1);
 
         // panel ground + a left hairline that reads as the seam to the terminal
         Self::push_rect(out, dx, cy, dw, ch, INK_1, 1.0);
@@ -4901,7 +4967,7 @@ impl Renderer {
             // widget titles read like the settings section heads: small caps
             let small_h = self.atlas.metrics(FontId::Small).cell_h;
             let key_track = self.key_track();
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, dx + pad, (y + (chrome_h - small_h) / 2.0).round(), &title.to_uppercase(), MUTE, 1.0, key_track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, dx + pad, (y + (chrome_h - small_h) / 2.0).round(), &title.to_uppercase(), QUIET, 1.0, key_track);
             y += row;
             // Tier-2 canvas: paint the plugin's immediate-mode primitives in a
             // bounded box, each clipped so a plugin can't paint outside its widget
@@ -4984,6 +5050,69 @@ impl Renderer {
 
     /// right-click pane context menu: a small panel of pane actions at the click
     #[allow(non_snake_case)]
+    /// the welcome: the app badge settles in at the center of the content,
+    /// winks once, and dissolves; three key hints fade in under it and stay
+    /// until the first keystroke
+    fn draw_welcome(&mut self, out: &mut Vec<Instance>) {
+        let Some((start, gone)) = self.welcome else {
+            return;
+        };
+        let t = start.elapsed().as_secs_f32();
+        let out_a = gone.map_or(1.0, |g| 1.0 - motion::ease_out(motion::progress(g, motion::WELCOME_OUT)));
+        if out_a <= 0.0 {
+            self.welcome = None;
+            return;
+        }
+        let px = |pt| tokens::px(pt, self.scale);
+        let (cx, cy, cw, ch) = self.content_rect();
+        let mid_x = cx + cw / 2.0;
+        let badge = px(tokens::WELCOME_BADGE);
+        let badge_y = (cy + ch * 0.40 - badge / 2.0).round();
+
+        let dissolve = ((t - motion::WELCOME_DISSOLVE_AT) / motion::WELCOME_DISSOLVE).clamp(0.0, 1.0);
+        let badge_a = motion::ease_out((t / motion::WELCOME_IN).min(1.0)) * (1.0 - motion::ease_out(dissolve)) * out_a;
+        if badge_a > 0.0 {
+            // the wink: the mark squeezes shut and opens again, once
+            let w = (t - motion::WELCOME_WINK_AT) / motion::WELCOME_WINK;
+            let squash = if motion::reduced() || !(0.0..1.0).contains(&w) { 1.0 } else { 1.0 - 0.8 * (w * std::f32::consts::PI).sin() };
+            // settling in and dissolving both drift the mark a touch smaller
+            let grow = if motion::reduced() { 1.0 } else { 0.94 + 0.06 * motion::ease_out((t / motion::WELCOME_IN).min(1.0)) - 0.08 * dissolve };
+            let (bw, bh) = (badge * grow, badge * grow * squash);
+            out.push(Instance {
+                pos: [(mid_x - bw / 2.0).round(), (badge_y + (badge - bh) / 2.0).round()],
+                size: [bw, bh],
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                color: [1.0, 1.0, 1.0, badge_a],
+                kind: 2,
+                shape: [0.0; 3],
+            });
+        }
+
+        let hints_a = motion::ease_out(((t - motion::WELCOME_HINTS_AT) / 0.3).clamp(0.0, 1.0)) * out_a;
+        if hints_a <= 0.0 {
+            return;
+        }
+        let hints = [("Ctrl+P", "commands"), ("Ctrl+Shift+E", "split"), ("Ctrl+,", "settings")];
+        let small_track = self.track_for(FontId::Small);
+        let key_track = self.key_track();
+        let inner = px(tokens::SPACE_S);
+        let gap = px(tokens::SPACE_XL);
+        let widths: Vec<f32> = hints
+            .iter()
+            .map(|(k, v)| self.text_w(FontId::Small, k, key_track) + inner + self.text_w(FontId::Small, v, small_track))
+            .collect();
+        let total = widths.iter().sum::<f32>() + gap * (hints.len() as f32 - 1.0);
+        let mut x = (mid_x - total / 2.0).round();
+        let y = (badge_y + badge + px(tokens::SPACE_XL)).round();
+        let (key_c, val_c) = (self.palette.text2, self.quiet(self.palette.bg));
+        for ((k, v), w) in hints.iter().zip(&widths) {
+            let vx = Self::draw_text(&mut self.atlas, out, FontId::Small, x, y, k, key_c, hints_a, key_track) + inner;
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, vx, y, v, val_c, hints_a, small_track);
+            x += w + gap;
+        }
+    }
+
     /// the shared overlay surface: a layered soft shadow, rounded fill,
     /// hairline edge, and a faint highlight along the top lip
     fn overlay_frame(&self, out: &mut Vec<Instance>, rect: Rect, r: f32) {
@@ -4991,7 +5120,7 @@ impl Renderer {
         let hair = self.scale.max(1.0);
         let p = &self.palette;
         Self::push_shadow(out, rect, r, t(tokens::SPACE_XL), t(tokens::SPACE_S), p.ink0, 0.35);
-        Self::push_shadow(out, rect, r, t(tokens::SPACE_2XS), t(1.0), p.ink0, 0.25);
+        Self::push_shadow(out, rect, r, t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), p.ink0, 0.25);
         Self::push_shape(out, rect, [r, 0.0, 0.0], p.ink1, 1.0);
         Self::push_ring(out, rect, r, hair, p.rule2, 1.0);
         let (x, y, w, _) = rect;
@@ -5005,7 +5134,7 @@ impl Renderer {
         let inset = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
         Self::push_shape(
             out,
-            (x + inset, y + t(1.0), w - inset * 2.0, h - t(2.0)),
+            (x + inset, y + t(tokens::SPACE_3XS), w - inset * 2.0, h - t(tokens::SPACE_2XS)),
             [t(tokens::RADIUS_ROW), 0.0, 0.0],
             self.palette.ink3,
             alpha,
@@ -5084,6 +5213,7 @@ impl Renderer {
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
+        let QUIET = self.quiet(self.palette.ink1);
         let s = self.scale;
         let t = |pt| tokens::px(pt, s);
         let hair = s.max(1.0);
@@ -5114,7 +5244,7 @@ impl Renderer {
         Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, icon, row_h), icon, hair, MUTE, 1.0);
         let tag = scope.to_ascii_uppercase();
         let tag_x = bx + pad + icon + t(tokens::SPACE_M);
-        let qx = Self::draw_text(&mut self.atlas, out, FontId::Small, tag_x, (by + (row_h - small_h) / 2.0).round(), &tag, MUTE, 1.0, key_track)
+        let qx = Self::draw_text(&mut self.atlas, out, FontId::Small, tag_x, (by + (row_h - small_h) / 2.0).round(), &tag, QUIET, 1.0, key_track)
             + t(tokens::SPACE_M);
         let qend = if query.is_empty() {
             let hint = match scope {
@@ -5122,12 +5252,12 @@ impl Renderer {
                 "fonts" => "pick a font",
                 _ => "type a command",
             };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx + t(tokens::SPACE_XS), iy, hint, MUTE, 0.7, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx + t(tokens::SPACE_XS), iy, hint, QUIET, 1.0, track);
             qx
         } else {
             Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &query, TEXT_2, 1.0, track)
         };
-        Self::push_round(out, qend + t(1.0), iy + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), PAPER, 1.0);
+        Self::push_round(out, qend + t(tokens::SPACE_3XS), iy + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), PAPER, 1.0);
         Self::push_rect(out, bx + hair, by + row_h, bw - hair * 2.0, hair, RULE_2, 0.7);
 
         if items.is_empty() {
@@ -5138,7 +5268,7 @@ impl Renderer {
                 _ => "commands",
             };
             let msg = format!("No {noun} match \"{}\"", truncate_tail(&query, 32));
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &msg, MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &msg, QUIET, 1.0, track);
         }
         for (idx, (lbl, hint)) in items.iter().enumerate() {
             let ry = by + row_h * (idx as f32 + 1.0) + t(tokens::SPACE_XS);
@@ -5154,7 +5284,7 @@ impl Renderer {
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &shown, TEXT_2, if is_sel { 1.0 } else { 0.8 }, track);
             if hint_w > 0.0 {
                 let hy = (ry + (row_h - small_h) / 2.0).round();
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hint_w, hy, hint, MUTE, if is_sel { 1.0 } else { 0.8 }, small_track);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hint_w, hy, hint, QUIET, 1.0, small_track);
             }
         }
         if font_preview {
@@ -5172,7 +5302,7 @@ impl Renderer {
             let hint = format!("{}/{}", selected + 1, total);
             let hw = self.text_w(FontId::Small, &hint, small_track);
             let ty = (by + (row_h - small_h) / 2.0).round();
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hw, ty, &hint, MUTE, 1.0, small_track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hw, ty, &hint, QUIET, 1.0, small_track);
         }
     }
 
@@ -5195,6 +5325,7 @@ impl Renderer {
         let TEXT_2 = self.palette.text2;
         let MUTE = self.palette.mute;
         let PAPER = self.palette.paper;
+        let QUIET = self.quiet(INK_1);
         let s = self.scale;
         let t = |pt| tokens::px(pt, s);
         let hair = s.max(1.0);
@@ -5202,7 +5333,7 @@ impl Renderer {
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let small_h = self.atlas.metrics(FontId::Small).cell_h;
         let small_track = self.track_for(FontId::Small);
-        let bw = t(560.0).min(w - t(tokens::SPACE_2XL) * 2.0);
+        let bw = t(tokens::FIND_W).min(w - t(tokens::SPACE_2XL) * 2.0);
         let bx = ((w - bw) / 2.0).round();
         let by = (self.title_bar_h + t(tokens::SPACE_M)).round();
         let bh = chrome_h + t(tokens::SPACE_L) + t(tokens::SPACE_XS);
@@ -5225,11 +5356,11 @@ impl Renderer {
         }
         let rx_text = ".*";
         let rw = self.text_w(FontId::Small, rx_text, small_track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, if regex_on { INK_1 } else { MUTE }, 1.0, small_track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, if regex_on { INK_1 } else { QUIET }, 1.0, small_track);
         let icon = t(tokens::ICON - 1.0);
         Self::draw_icon(&mut self.atlas, out, Icon::ChevronUp, prev_r, icon, hair, MUTE, 1.0);
         Self::draw_icon(&mut self.atlas, out, Icon::Chevron, next_r, icon, hair, MUTE, 1.0);
-        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(8.0), hair, MUTE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(tokens::ICON_SMALL), hair, MUTE, 1.0);
         let info = if bad {
             "bad pattern".to_string()
         } else if count == 0 {
@@ -5254,9 +5385,9 @@ impl Renderer {
         let avail = (right_edge - iw - t(tokens::SPACE_M)) - qx;
         let shown = truncate_head(&query, (avail / cw).floor().max(2.0) as usize);
         let qend = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &shown, if bad { self.palette.ansi_color(1) } else { TEXT_2 }, 1.0, track);
-        Self::push_round(out, qend + t(1.0), iy + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), PAPER, 1.0);
+        Self::push_round(out, qend + t(tokens::SPACE_3XS), iy + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), PAPER, 1.0);
         if !info.is_empty() {
-            let c = if bad { self.palette.ansi_color(1) } else { MUTE };
+            let c = if bad { self.palette.ansi_color(1) } else { QUIET };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, right_edge - iw, (by + (bh - small_h) / 2.0).round(), &info, c, 1.0, small_track);
         }
     }
@@ -5335,7 +5466,7 @@ impl Renderer {
             .text_w(FontId::Chrome, title, track)
             .max(self.text_w(FontId::Small, hint, small_track))
             .max(field.map_or(0.0, |f| self.text_w(FontId::Chrome, f, track) + t(tokens::SPACE_L) * 2.0));
-        let bw = (content_w + pad * 2.0).clamp(t(300.0), t(520.0).min(w - t(tokens::SPACE_2XL) * 2.0)).round();
+        let bw = (content_w + pad * 2.0).clamp(t(tokens::DIALOG_MIN_W), t(tokens::DIALOG_MAX_W).min(w - t(tokens::SPACE_2XL) * 2.0)).round();
         let bh = (pad * 2.0 + chrome_h + gap + small_h + field.map_or(0.0, |_| field_h + gap)).round();
         let bx = ((w - bw) / 2.0).round();
         let by = ((h - bh) / 2.0).round().max(self.title_bar_h + t(tokens::SPACE_M));
@@ -5352,10 +5483,11 @@ impl Renderer {
             let shown = truncate_head(text, ((fr.2 - t(tokens::SPACE_L) * 2.0) / cw).floor().max(2.0) as usize);
             let ty = (y + (field_h - chrome_h) / 2.0).round();
             let end = Self::draw_text(&mut self.atlas, out, FontId::Chrome, fr.0 + t(tokens::SPACE_M), ty, &shown, self.palette.text2, 1.0, track);
-            Self::push_round(out, end + t(1.0), ty + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), self.palette.paper, 1.0);
+            Self::push_round(out, end + t(tokens::SPACE_3XS), ty + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), self.palette.paper, 1.0);
             y += field_h + gap;
         }
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + pad, y, hint, self.palette.mute, 1.0, small_track);
+        let quiet = self.quiet(self.palette.ink1);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + pad, y, hint, quiet, 1.0, small_track);
     }
 
     /// plugins marketplace overlay: a centered panel listing installed + catalog
@@ -5395,6 +5527,7 @@ impl Renderer {
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
+        let QUIET = self.quiet(INK_3);
         let s = self.scale;
         let hair = s.max(1.0);
         let w = self.config.width as f32;
@@ -5414,10 +5547,10 @@ impl Renderer {
         let key_track = self.key_track();
 
         // centered content column
-        let col_w = (940.0 * s).min(w - 96.0 * s);
+        let col_w = t(tokens::MARKET_W).min(w - t(tokens::SPACE_2XL) * 3.0);
         let col_x = ((w - col_w) / 2.0).round();
-        let pad = 24.0 * s;
-        let line = chrome_h + 6.0 * s; // text line advance within a card
+        let pad = t(tokens::SPACE_XL);
+        let line = chrome_h + t(tokens::SPACE_S); // text line advance within a card
 
         // ---- header band: title + counts + close, subtitle, rule ----
         let title_y = (top + t(tokens::SPACE_2XL)).round();
@@ -5425,22 +5558,22 @@ impl Renderer {
         let close_sz = (chrome_h + t(tokens::SPACE_S)).round();
         let close_r = (col_x + col_w - close_sz, (title_y + (chrome_h - close_sz) / 2.0).round(), close_sz, close_sz);
         Self::push_shape(out, close_r, [chip_r, 0.0, 0.0], INK_3, 0.6);
-        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(8.0), hair, MUTE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(tokens::ICON_SMALL), hair, MUTE, 1.0);
         self.market_hits.push((close_r, MarketHit::Close));
         let count = format!("{n_installed} installed \u{b7} {n_avail} available");
         let count_w = self.text_w(FontId::Small, &count, small_track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, close_r.0 - t(tokens::SPACE_L) - count_w, (title_y + (chrome_h - small_h) / 2.0).round(), &count, MUTE, 1.0, small_track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, close_r.0 - t(tokens::SPACE_L) - count_w, (title_y + (chrome_h - small_h) / 2.0).round(), &count, QUIET, 1.0, small_track);
         let sub_y = (title_y + chrome_h + t(tokens::SPACE_S)).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, sub_y, "Browse and manage plugins. Each runs as its own sandboxed process.", MUTE, 1.0, track);
-        let rule_y = (sub_y + chrome_h + 14.0 * s).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, sub_y, "Browse and manage plugins. Each runs as its own sandboxed process.", QUIET, 1.0, track);
+        let rule_y = (sub_y + chrome_h + t(tokens::SPACE_L)).round();
         Self::push_rect(out, col_x, rule_y, col_w, hair, RULE_2, 1.0);
 
         // ---- body region (scroll-capped cards) ----
-        let foot_h = chrome_h + 22.0 * s;
-        let body_top = rule_y + 20.0 * s;
+        let foot_h = chrome_h + t(tokens::SPACE_XL);
+        let body_top = rule_y + t(tokens::SPACE_XL);
         let body_bottom = bottom - foot_h;
-        let card_h = (chrome_h * 3.0 + 34.0 * s).round();
-        let gap = 12.0 * s;
+        let card_h = (chrome_h * 2.0 + line + t(tokens::SPACE_2XL)).round();
+        let gap = t(tokens::SPACE_M);
         let stride = card_h + gap;
         let max_visible = (((body_bottom - body_top + gap) / stride).floor().max(1.0)) as usize;
         let visible = rows.len().clamp(1, max_visible);
@@ -5460,7 +5593,7 @@ impl Renderer {
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + (col_w - mw) / 2.0, my, msg, TEXT_2, 1.0, track);
             if !hint.is_empty() {
                 let hw = self.text_w(FontId::Chrome, hint, track);
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + (col_w - hw) / 2.0, my + line, hint, MUTE, 1.0, track);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + (col_w - hw) / 2.0, my + line, hint, QUIET, 1.0, track);
             }
         }
 
@@ -5482,12 +5615,12 @@ impl Renderer {
             Self::push_ring(out, card, card_r, hair, if sel { MUTE } else { RULE_2 }, 1.0);
             let inner = col_x + pad;
             // line 1: name + version (left), action chip (right)
-            let l1 = (ry + 13.0 * s).round();
+            let l1 = (ry + t(tokens::SPACE_L)).round();
             let name_col = if sel { PAPER } else { TEXT_2 };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner, l1, &r.name, name_col, 1.0, track);
             let nw = self.text_w(FontId::Chrome, &r.name, track);
             let ver = format!("v{}", r.version);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner + nw + 10.0 * s, l1, &ver, MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner + nw + t(tokens::SPACE_S), l1, &ver, QUIET, 1.0, track);
             let (chip, chip_fill, chip_fg, chip_border) = if !r.installed {
                 ("INSTALL", true, INK_0, PAPER)
             } else if r.enabled {
@@ -5525,11 +5658,11 @@ impl Renderer {
             } else {
                 r.desc.clone()
             };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner, l2, &desc, MUTE, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner, l2, &desc, QUIET, 1.0, track);
             // line 3: permission badges, or a note when there are none
             let l3 = (l2 + line).round();
             if r.perms.is_empty() {
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, inner, (l3 + (chrome_h - small_h) / 2.0).round(), "no special permissions", MUTE, 0.7, small_track);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, inner, (l3 + (chrome_h - small_h) / 2.0).round(), "no special permissions", QUIET, 1.0, small_track);
             } else {
                 let mut px = inner;
                 let ph = small_h + t(tokens::SPACE_XS);
@@ -5541,22 +5674,22 @@ impl Renderer {
                     let pr = (px, (l3 + (chrome_h - ph) / 2.0).round(), pw, ph);
                     Self::push_shape(out, pr, [chip_r, 0.0, 0.0], INK_1, 0.8);
                     Self::push_ring(out, pr, chip_r, hair, RULE_2, 1.0);
-                    let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, px + t(6.0), (pr.1 + (ph - small_h) / 2.0).round(), p, TEXT_2, 1.0, small_track);
-                    px += pw + t(6.0);
+                    let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, px + t(tokens::SPACE_XS + tokens::SPACE_2XS), (pr.1 + (ph - small_h) / 2.0).round(), p, TEXT_2, 1.0, small_track);
+                    px += pw + t(tokens::SPACE_XS + tokens::SPACE_2XS);
                 }
             }
             self.market_hits.push(((col_x, ry, col_w, card_h), MarketHit::Card(idx)));
         }
 
         // ---- footer: status (left) + key hints (right) ----
-        Self::push_rect(out, col_x, body_bottom + 6.0 * s, col_w, hair, RULE_2, 1.0);
-        let fy = (body_bottom + 6.0 * s + (foot_h - chrome_h) / 2.0).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, fy, &status, MUTE, 1.0, track);
+        Self::push_rect(out, col_x, body_bottom + t(tokens::SPACE_S), col_w, hair, RULE_2, 1.0);
+        let fy = (body_bottom + t(tokens::SPACE_S) + (foot_h - chrome_h) / 2.0).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, fy, &status, QUIET, 1.0, track);
         let hints = "\u{2191}\u{2193} select  \u{b7}  enter install/toggle  \u{b7}  r remove  \u{b7}  esc close";
         let hints_w = self.text_w(FontId::Small, hints, small_track);
         let status_w = self.text_w(FontId::Chrome, &status, track);
         if hints_w + status_w + t(tokens::SPACE_XL) < col_w {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, col_x + col_w - hints_w, (fy + (chrome_h - small_h) / 2.0).round(), hints, MUTE, 0.8, small_track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, col_x + col_w - hints_w, (fy + (chrome_h - small_h) / 2.0).round(), hints, QUIET, 1.0, small_track);
         }
     }
 
@@ -5566,7 +5699,8 @@ impl Renderer {
         let key_track = self.key_track();
         let tw = self.text_w(FontId::Small, text, key_track);
         let (chrome_h, small_h) = (self.atlas.metrics(FontId::Chrome).cell_h, self.atlas.metrics(FontId::Small).cell_h);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (y + (chrome_h - small_h) / 2.0).round(), text, self.palette.mute, 1.0, key_track);
+        let quiet = self.quiet(self.palette.ink1);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (y + (chrome_h - small_h) / 2.0).round(), text, quiet, 1.0, key_track);
         let hair = self.scale.max(1.0);
         let ry = (y + chrome_h / 2.0).round();
         let rx = x + tw + tokens::px(tokens::SPACE_M, self.scale);
@@ -5577,7 +5711,8 @@ impl Renderer {
     fn setting_label(&mut self, out: &mut Vec<Instance>, x: f32, row_y: f32, bh: f32, text: &str) {
         let small_h = self.atlas.metrics(FontId::Small).cell_h;
         let key_track = self.key_track();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (row_y + (bh - small_h) / 2.0).round(), text, self.palette.mute, 1.0, key_track);
+        let quiet = self.quiet(self.palette.ink1);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (row_y + (bh - small_h) / 2.0).round(), text, quiet, 1.0, key_track);
     }
 
     /// a rounded field that cycles its value on click, with a chevron
@@ -5611,7 +5746,7 @@ impl Renderer {
         let t = |pt| tokens::px(pt, self.scale);
         let (bx, by, _bw, bh) = rect;
         let he = self.hover_a(hot);
-        let (sw, sh) = (t(32.0), t(18.0));
+        let (sw, sh) = (t(tokens::SWITCH_W), t(tokens::SWITCH_H));
         let track_r = (bx, (by + (bh - sh) / 2.0).round(), sw, sh);
         let knob = sh - t(tokens::SPACE_XS);
         let kx = if on { track_r.0 + sw - knob - t(tokens::SPACE_2XS) } else { track_r.0 + t(tokens::SPACE_2XS) };
@@ -5638,21 +5773,21 @@ impl Renderer {
         let he = self.hover_a(Hot::ThemeAuto);
         self.chip_frame(out, rect, active, he);
         let name = "auto";
-        let maxc = (((bw - 8.0 * s) / (cw + track)).floor().max(1.0)) as usize;
+        let maxc = (((bw - tokens::px(tokens::SPACE_S, s)) / (cw + track)).floor().max(1.0)) as usize;
         let t: String = name.chars().take(maxc).collect();
         let tw = self.text_w(FontId::Chrome, &t, track);
         let col = if active { self.palette.paper } else { self.palette.text2.lerp(self.palette.paper, he) };
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + 6.0 * s).round(), &t, col, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + tokens::px(tokens::SPACE_XS + tokens::SPACE_2XS, s)).round(), &t, col, 1.0, track);
         // half-and-half swatch: the dark default's bg beside the light one's
         let dark = Palette::from_theme(ThemeId::Instrument);
         let light = Palette::from_theme(ThemeId::Paper);
-        let gap = 3.0 * s;
-        let inset = 9.0 * s;
+        let gap = tokens::px(tokens::SPACE_XS, s);
+        let inset = tokens::px(tokens::SPACE_S, s);
         let strip_w = (bw - inset * 2.0).max(1.0);
         let half_w = ((strip_w - gap) / 2.0).max(1.0);
-        let sh = 11.0 * s;
-        let sy = by + bh - sh - 6.0 * s;
-        let r = tokens::px(2.0, s);
+        let sh = tokens::px(tokens::SPACE_M, s);
+        let sy = by + bh - sh - tokens::px(tokens::SPACE_XS + tokens::SPACE_2XS, s);
+        let r = tokens::px(tokens::SPACE_2XS, s);
         Self::push_round(out, bx + inset, sy, half_w, sh, r, dark.bg, 1.0);
         Self::push_round(out, bx + inset + half_w + gap, sy, half_w, sh, r, light.bg, 1.0);
         Self::push_ring(out, (bx + inset, sy, strip_w, sh), r, 1.0, self.palette.rule2, 1.0);
@@ -5667,7 +5802,7 @@ impl Renderer {
         self.chip_frame(out, rect, active, he);
         // theme name (truncated to fit), centered at the top
         let name = id.name();
-        let maxc = (((bw - 8.0 * s) / (cw + track)).floor().max(1.0)) as usize;
+        let maxc = (((bw - tokens::px(tokens::SPACE_S, s)) / (cw + track)).floor().max(1.0)) as usize;
         let t: String = if name.chars().count() > maxc {
             name.chars().take(maxc).collect()
         } else {
@@ -5675,7 +5810,7 @@ impl Renderer {
         };
         let tw = self.text_w(FontId::Chrome, &t, track);
         let col = if active { self.palette.paper } else { self.palette.text2.lerp(self.palette.paper, he) };
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + 6.0 * s).round(), &t, col, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + tokens::px(tokens::SPACE_XS + tokens::SPACE_2XS, s)).round(), &t, col, 1.0, track);
 
         // swatch strip: bg · fg · accent · ansi red · ansi blue
         let pal = Palette::from_theme(id);
@@ -5687,13 +5822,13 @@ impl Renderer {
             pal.resolve_fg(Color::Indexed(4)),
         ];
         let n = sw.len() as f32;
-        let gap = 3.0 * s;
-        let inset = 9.0 * s;
+        let gap = tokens::px(tokens::SPACE_XS, s);
+        let inset = tokens::px(tokens::SPACE_S, s);
         let strip_w = (bw - inset * 2.0).max(1.0);
         let cell_w = ((strip_w - gap * (n - 1.0)) / n).max(1.0);
-        let sh = 11.0 * s;
-        let sy = by + bh - sh - 6.0 * s;
-        let r = tokens::px(2.0, s);
+        let sh = tokens::px(tokens::SPACE_M, s);
+        let sy = by + bh - sh - tokens::px(tokens::SPACE_XS + tokens::SPACE_2XS, s);
+        let r = tokens::px(tokens::SPACE_2XS, s);
         for (i, c) in sw.into_iter().enumerate() {
             let sx = bx + inset + i as f32 * (cell_w + gap);
             Self::push_round(out, sx, sy, cell_w, sh, r, c, 1.0);
@@ -5762,6 +5897,11 @@ impl Renderer {
         let px = Self::draw_text(&mut self.atlas, out, FontId::Small, x, y_top, key, key_c, 1.0, key_track)
             + tokens::px(tokens::SPACE_S, self.scale);
         Self::draw_text(&mut self.atlas, out, FontId::Small, px, y_top, val, val_c, 1.0, track)
+    }
+
+    /// the muted text color lifted to the chrome text floor on `surface`
+    fn quiet(&self, surface: Rgb) -> Rgb {
+        crate::color::apply_min_contrast(self.palette.mute, surface, tokens::TEXT_CONTRAST)
     }
 
     /// color and alpha of a command/attention dot: 1 running (breathing),
@@ -6040,7 +6180,7 @@ impl Renderer {
 
     /// dev capture harness: render the scene into the offscreen target and write
     /// it to `path` as a PNG. only valid on a renderer from `new_headless`
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub fn render_png(
         &mut self,
         panes: &[PaneView],
@@ -6049,6 +6189,13 @@ impl Renderer {
         bare: bool,
         path: &str,
     ) -> std::io::Result<()> {
+        let rgba = self.render_rgba(panes, focused, maximized, bare)?;
+        crate::render::preview::write_png(path, self.config.width, self.config.height, &rgba)
+    }
+
+    /// render one frame offscreen and read it back as tightly packed rgba
+    #[cfg(any(test, debug_assertions))]
+    pub fn render_rgba(&mut self, panes: &[PaneView], focused: bool, maximized: bool, bare: bool) -> std::io::Result<Vec<u8>> {
         use std::io::Error;
         let instances = self.build(panes, focused, maximized, bare);
         self.upload_atlas();
@@ -6162,7 +6309,7 @@ impl Renderer {
         drop(data);
         readback.unmap();
         self.scratch = instances;
-        crate::render::preview::write_png(path, width, height, &rgba)
+        Ok(rgba)
     }
 }
 
@@ -6878,6 +7025,15 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         .ok()
     })
     .clone()
+}
+
+/// a headless renderer on the shared test device, holding the gpu lock for
+/// as long as the guard lives; None when the machine has no adapter
+#[cfg(test)]
+pub(crate) fn headless_for_tests(w: u32, h: u32, scale: f32) -> Option<(Renderer, std::sync::MutexGuard<'static, ()>)> {
+    let guard = gpu_serial();
+    let (device, queue) = test_device()?;
+    Some((Renderer::new_headless_on(device, queue, w, h, 14.0, tokens::CHROME_PT, scale), guard))
 }
 
 #[cfg(test)]

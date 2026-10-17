@@ -13,6 +13,15 @@ pub const SIGNAL_SETTLE: f32 = 0.30;
 pub const RUNNING_PULSE: f32 = 1.2;
 pub const BELL: f32 = 0.60;
 pub const CURSOR_PERIOD: f32 = 1.06;
+/// the once-ever welcome: the badge settles in, winks, then dissolves while
+/// the key hints stay until the first keystroke
+pub const WELCOME_IN: f32 = 0.25;
+pub const WELCOME_WINK_AT: f32 = 0.60;
+pub const WELCOME_WINK: f32 = 0.16;
+pub const WELCOME_DISSOLVE_AT: f32 = 1.50;
+pub const WELCOME_DISSOLVE: f32 = 0.40;
+pub const WELCOME_HINTS_AT: f32 = 0.35;
+pub const WELCOME_OUT: f32 = 0.20;
 
 static REDUCED: AtomicBool = AtomicBool::new(false);
 

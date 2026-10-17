@@ -6,6 +6,10 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    pub const fn from_triple(c: [u8; 3]) -> Self {
+        Self::new(c[0], c[1], c[2])
+    }
+
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Rgb { r, g, b }
     }
@@ -347,18 +351,19 @@ impl Palette {
             Rgb::new(0x84, 0xc6, 0xc2),
             Rgb::new(0xf0, 0xf0, 0xf0),
         ];
+        use crate::instrument as i;
         Palette {
-            ink0: Rgb::new(0x05, 0x05, 0x05),
-            ink1: Rgb::new(0x0d, 0x0d, 0x0d),
-            ink3: Rgb::new(0x1c, 0x1c, 0x1c),
-            ink4: Rgb::new(0x26, 0x26, 0x26),
-            rule: Rgb::new(0x2a, 0x2a, 0x2a),
-            rule2: Rgb::new(0x3a, 0x3a, 0x3a),
-            mute: Rgb::new(0x6f, 0x6f, 0x6f),
-            text2: Rgb::new(0xed, 0xed, 0xed),
-            paper: Rgb::new(0xf5, 0xf5, 0xf5),
-            fg: Rgb::new(0xc8, 0xc8, 0xc8),
-            bg: Rgb::new(0x14, 0x14, 0x14),
+            ink0: Rgb::from_triple(i::INK0),
+            ink1: Rgb::from_triple(i::INK1),
+            ink3: Rgb::from_triple(i::INK3),
+            ink4: Rgb::from_triple(i::INK4),
+            rule: Rgb::from_triple(i::RULE),
+            rule2: Rgb::from_triple(i::RULE2),
+            mute: Rgb::from_triple(i::MUTE),
+            text2: Rgb::from_triple(i::TEXT2),
+            paper: Rgb::from_triple(i::PAPER),
+            fg: Rgb::from_triple(i::FG),
+            bg: Rgb::from_triple(i::BG),
             bg2: Rgb::new(0x0d, 0x0e, 0x10),
             cursor: Rgb::new(0xf5, 0xf5, 0xf5),
             sel: Rgb::new(0x35, 0x52, 0x7a),
@@ -371,7 +376,7 @@ impl Palette {
         // blues dusty, so the ff5b22 accent feels native
         let base16 = [
             Rgb::new(0x24, 0x1e, 0x16),
-            Rgb::new(0xd1, 0x51, 0x2f),
+            Rgb::new(0xdc, 0x5a, 0x36),
             Rgb::new(0x7c, 0x96, 0x56),
             Rgb::new(0xd4, 0x9a, 0x3f),
             Rgb::new(0x5f, 0x82, 0x90),
@@ -401,7 +406,7 @@ impl Palette {
             bg: Rgb::new(0x1a, 0x16, 0x12),
             bg2: Rgb::new(0x12, 0x0d, 0x09),
             cursor: Rgb::new(0xff, 0x5b, 0x22),
-            sel: Rgb::new(0x5a, 0x3a, 0x24),
+            sel: Rgb::new(0x6e, 0x46, 0x2a),
             ansi: fill_ansi(base16),
         }
     }
@@ -421,7 +426,7 @@ impl Palette {
             Rgb::new(0x6a, 0x64, 0x56),
             Rgb::new(0xc2, 0x4a, 0x30),
             Rgb::new(0x5f, 0x85, 0x40),
-            Rgb::new(0xb5, 0x86, 0x2a),
+            Rgb::new(0xa4, 0x78, 0x1f),
             Rgb::new(0x3f, 0x6e, 0xa0),
             Rgb::new(0x9a, 0x56, 0x80),
             Rgb::new(0x3a, 0x84, 0x80),
@@ -442,7 +447,7 @@ impl Palette {
             bg: Rgb::new(0xe8, 0xe3, 0xd6),
             bg2: Rgb::new(0xde, 0xd7, 0xc6),
             cursor: Rgb::new(0xb5, 0x53, 0x2a),
-            sel: Rgb::new(0x9a, 0xb0, 0xd2),
+            sel: Rgb::new(0x7b, 0x9c, 0xd0),
             ansi: fill_ansi(base16),
         }
     }
@@ -523,7 +528,7 @@ impl Palette {
             bg: Rgb::new(0x28, 0x28, 0x28),
             bg2: Rgb::new(0x1f, 0x21, 0x21),
             cursor: Rgb::new(0xeb, 0xdb, 0xb2),
-            sel: Rgb::new(0x50, 0x49, 0x45),
+            sel: Rgb::new(0x64, 0x59, 0x53),
             ansi: fill_ansi(base16),
         }
     }
@@ -562,7 +567,7 @@ impl Palette {
             bg: Rgb::new(0x1a, 0x1b, 0x26),
             bg2: Rgb::new(0x16, 0x16, 0x1e),
             cursor: Rgb::new(0xc0, 0xca, 0xf5),
-            sel: Rgb::new(0x33, 0x46, 0x7c),
+            sel: Rgb::new(0x38, 0x4f, 0x8d),
             ansi: fill_ansi(base16),
         }
     }
@@ -601,7 +606,7 @@ impl Palette {
             bg: Rgb::new(0x2e, 0x34, 0x40),
             bg2: Rgb::new(0x29, 0x2e, 0x39),
             cursor: Rgb::new(0xd8, 0xde, 0xe9),
-            sel: Rgb::new(0x43, 0x4c, 0x5e),
+            sel: Rgb::new(0x5a, 0x66, 0x7e),
             ansi: fill_ansi(base16),
         }
     }
@@ -702,5 +707,34 @@ mod tests {
         assert_eq!(Palette::bold_bright(Color::Indexed(1), false, true), Color::Indexed(1));
         assert_eq!(Palette::bold_bright(Color::Indexed(1), true, false), Color::Indexed(1));
         assert_eq!(Palette::bold_bright(Color::Default, true, true), Color::Default);
+    }
+
+    #[test]
+    fn every_theme_keeps_text_and_selection_readable() {
+        for id in ThemeId::ALL {
+            let p = Palette::from_theme(id);
+            let name = id.name();
+            assert!(ratio(p.fg, p.bg) >= 7.0, "{name}: body text");
+            // selection is painted at 0.9 over the background
+            let sel = p.bg.lerp(p.sel, 0.9);
+            assert!(ratio(sel, p.bg) >= 2.0, "{name}: selection reads against the background");
+            assert!(ratio(p.fg, sel) >= 4.5, "{name}: text stays readable on the selection");
+            // secondary chrome text is lifted to 4.5:1 on each surface it sits on
+            for surface in [p.ink0, p.ink1, p.bg] {
+                let lifted = apply_min_contrast(p.mute, surface, crate::render::tokens::TEXT_CONTRAST);
+                assert!(ratio(lifted, surface) >= 4.5, "{name}: muted text");
+            }
+        }
+    }
+
+    #[test]
+    fn house_themes_keep_ansi_colors_legible() {
+        // third-party themes keep their published colors; min_contrast covers them
+        for id in [ThemeId::Instrument, ThemeId::Koi, ThemeId::Paper] {
+            let p = Palette::from_theme(id);
+            for n in (1..8).chain(9..16) {
+                assert!(ratio(p.ansi_color(n), p.bg) >= 3.0, "{} ansi {n}", id.name());
+            }
+        }
     }
 }

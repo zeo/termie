@@ -10,6 +10,7 @@ mod fxhash;
 mod image;
 mod grid;
 mod input;
+mod instrument;
 mod instance;
 mod plugin;
 mod pty;
@@ -3451,6 +3452,22 @@ fn home_dir() -> Option<std::ffi::OsString> {
     return std::env::var_os("HOME");
 }
 
+/// true exactly once per user: on the very first launch, before any config
+/// or saved session exists. leaves a `welcomed` marker so the welcome never
+/// plays again, and never plays for someone who has used termie before
+fn take_first_launch() -> bool {
+    let (Some(config), Some(dir)) = (config_path(), app_dir()) else {
+        return false;
+    };
+    let marker = dir.join("welcomed");
+    let used_before = config.exists() || session_path().is_some_and(|p| p.exists());
+    if used_before || marker.exists() {
+        return false;
+    }
+    let _ = ensure_user_dir(&dir);
+    std::fs::write(&marker, b"").is_ok()
+}
+
 /// the `config` file under app_dir() — a simple key=value store for every setting
 fn config_path() -> Option<std::path::PathBuf> {
     Some(app_dir()?.join("config"))
@@ -4785,8 +4802,12 @@ impl App {
         self.warm_pool();
         // start the power-on reveal clock now so the whole animation plays once
         // the window is visible, not during the (invisible) gpu-init wait
+        let welcome = self.drive.is_none() && take_first_launch();
         if let Some(r) = self.pw.renderer.as_mut() {
             r.begin_reveal();
+            if welcome {
+                r.start_welcome();
+            }
         }
         self.paint();
         window.set_visible(true);
@@ -12465,6 +12486,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(ime) => self.on_ime(ime),
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed
+                    && let Some(r) = self.pw.renderer.as_mut()
+                {
+                    r.dismiss_welcome();
+                }
                 // while composing, the IME owns text input; swallow only key
                 // presses (releases must pass so kitty release-reporting + held
                 // modifiers don't get stuck)

@@ -3,7 +3,7 @@
 //! an installer must come up on any machine). the same paint function drives
 //! the live window and the headless --preview PNG harness
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -11,9 +11,10 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, GetTextExtentPoint32W, InvalidateRect,
-    SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, TextOutW, BITMAPINFO,
+    AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetTextExtentPoint32W,
+    InvalidateRect, SelectObject, SetBkMode, SetPixelV, SetTextCharacterExtra, SetTextColor,
+    TextOutW, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DIB_RGB_COLORS, FW_BOLD, FW_NORMAL, HBITMAP,
     HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
@@ -31,20 +32,68 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::engine::{self, Options};
 use crate::payload;
 
-// instrument ladder (termie's default theme); GDI COLORREF is 0x00BBGGRR
-const INK0: COLORREF = rgb(0x05, 0x05, 0x05);
-const BG: COLORREF = rgb(0x14, 0x14, 0x14);
-const SURFACE: COLORREF = rgb(0x1c, 0x1c, 0x1c);
-const RULE: COLORREF = rgb(0x2a, 0x2a, 0x2a);
-const RULE2: COLORREF = rgb(0x3a, 0x3a, 0x3a);
-const MUTE: COLORREF = rgb(0x6f, 0x6f, 0x6f);
-const TEXT: COLORREF = rgb(0xc8, 0xc8, 0xc8);
-const TEXT2: COLORREF = rgb(0xed, 0xed, 0xed);
-const PAPER: COLORREF = rgb(0xf5, 0xf5, 0xf5);
+// the app's instrument ladder, shared by path so the installer can't drift
+// from the theme it introduces; not every shade is used here
+#[allow(dead_code)]
+#[path = "../../src/instrument.rs"]
+mod instrument;
+
+// GDI COLORREF is 0x00BBGGRR
+const INK0: COLORREF = cref(instrument::INK0);
+const BG: COLORREF = cref(instrument::BG);
+const SURFACE: COLORREF = cref(instrument::INK3);
+const RULE: COLORREF = cref(instrument::RULE);
+const RULE2: COLORREF = cref(instrument::RULE2);
+const TEXT: COLORREF = cref(instrument::FG);
+const TEXT2: COLORREF = cref(instrument::TEXT2);
+const PAPER: COLORREF = cref(instrument::PAPER);
+const CLOSE_RED: COLORREF = cref(instrument::CLOSE_RED);
+// the app lifts muted text to 4.5:1 on its surface; this is that lift on BG
+const MUTE: COLORREF = rgb(0x7e, 0x7e, 0x7e);
 const PAPER_DIM: COLORREF = rgb(0xdc, 0xdc, 0xdc);
+const WHITE: COLORREF = rgb(0xff, 0xff, 0xff);
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(((b as u32) << 16) | ((g as u32) << 8) | r as u32)
+}
+
+const fn cref(c: [u8; 3]) -> COLORREF {
+    rgb(c[0], c[1], c[2])
+}
+
+fn channels(c: COLORREF) -> [f32; 3] {
+    [(c.0 & 0xff) as f32, ((c.0 >> 8) & 0xff) as f32, ((c.0 >> 16) & 0xff) as f32]
+}
+
+fn mix(under: COLORREF, over: COLORREF, a: f32) -> COLORREF {
+    let (u, o) = (channels(under), channels(over));
+    let m = |i: usize| (u[i] + (o[i] - u[i]) * a).round() as u8;
+    rgb(m(0), m(1), m(2))
+}
+
+/// the face every label uses: the app's own bundled font, registered privately
+/// from the payload this installer carries; Consolas when the payload is empty
+/// (dev builds) or registration fails
+fn face() -> PCWSTR {
+    static FACE: OnceLock<Vec<u16>> = OnceLock::new();
+    let name = FACE.get_or_init(|| {
+        let mut loaded = false;
+        for e in payload::entries() {
+            if !(e.name.ends_with("MapleMono-NF-Regular.ttf") || e.name.ends_with("MapleMono-NF-Bold.ttf")) {
+                continue;
+            }
+            if let Ok(bytes) = e.decompress() {
+                let mut fonts = 0u32;
+                // the font is copied into gdi's private table; the buffer can drop
+                // gdi writes the face count through this pointer
+                let h = unsafe { AddFontMemResourceEx(bytes.as_ptr().cast(), bytes.len() as u32, None, (&raw mut fonts).cast_const()) };
+                loaded |= !h.0.is_null() && fonts > 0;
+            }
+        }
+        let family = if loaded { "Maple Mono NF" } else { "Consolas" };
+        family.encode_utf16().chain(std::iter::once(0)).collect()
+    });
+    PCWSTR(name.as_ptr())
 }
 
 pub const WIN_W: i32 = 560;
@@ -208,12 +257,62 @@ impl Painter {
         }
     }
 
-    fn stroke(&self, x: i32, y: i32, w: i32, h: i32, c: COLORREF) {
-        let t = 1;
-        self.fill(x, y, w, t, c);
-        self.fill(x, y + h - t, w, t, c);
-        self.fill(x, y, t, h, c);
-        self.fill(x + w - t, y, t, h, c);
+    /// an anti-aliased rounded rect over a flat `under` color: the straight
+    /// runs go through FillRect, and only the corner pixels are blended
+    #[allow(clippy::too_many_arguments)]
+    fn round(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: COLORREF, under: COLORREF) {
+        let (x, y, w, h, r) = (x * self.dpi, y * self.dpi, w * self.dpi, h * self.dpi, (r * self.dpi).min(w * self.dpi / 2.0).min(h * self.dpi / 2.0));
+        let (x0, y0, x1, y1) = (x.round() as i32, y.round() as i32, (x + w).round() as i32, (y + h).round() as i32);
+        let ri = r.ceil() as i32;
+        unsafe {
+            let b = CreateSolidBrush(c);
+            for rect in [
+                RECT { left: x0 + ri, top: y0, right: x1 - ri, bottom: y1 },
+                RECT { left: x0, top: y0 + ri, right: x0 + ri, bottom: y1 - ri },
+                RECT { left: x1 - ri, top: y0 + ri, right: x1, bottom: y1 - ri },
+            ] {
+                if rect.right > rect.left && rect.bottom > rect.top {
+                    FillRect(self.hdc, &rect, b);
+                }
+            }
+            let _ = DeleteObject(b.into());
+            let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+            let corners = [(x0, y0), (x1 - ri, y0), (x0, y1 - ri), (x1 - ri, y1 - ri)];
+            for (ox, oy) in corners {
+                for py in oy..oy + ri {
+                    for px in ox..ox + ri {
+                        let (qx, qy) = ((px as f32 + 0.5 - cx).abs() - (hw - r), (py as f32 + 0.5 - cy).abs() - (hh - r));
+                        let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+                        let a = (0.5 - d).clamp(0.0, 1.0);
+                        if a > 0.0 {
+                            let _ = SetPixelV(self.hdc, px, py, mix(under, c, a));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// a rounded outline one device pixel wide, filled with `inner`
+    #[allow(clippy::too_many_arguments)]
+    fn ring(&self, x: f32, y: f32, w: f32, h: f32, r: f32, edge: COLORREF, inner: COLORREF, under: COLORREF) {
+        self.round(x, y, w, h, r, edge, under);
+        let t = 1.0 / self.dpi;
+        self.round(x + t, y + t, w - t * 2.0, h - t * 2.0, r - t, inner, edge);
+    }
+
+    /// an on/off switch: a pill track with a round knob
+    fn switch(&self, x: i32, y: i32, on: bool, hovered: bool) {
+        let (w, h) = (30.0, 16.0);
+        let (x, y) = (x as f32, y as f32);
+        let knob = h - 4.0;
+        if on {
+            self.round(x, y, w, h, h / 2.0, if hovered { PAPER } else { PAPER_DIM }, BG);
+            self.round(x + w - knob - 2.0, y + 2.0, knob, knob, knob / 2.0, INK0, PAPER_DIM);
+        } else {
+            self.ring(x, y, w, h, h / 2.0, if hovered { MUTE } else { RULE2 }, SURFACE, BG);
+            self.round(x + 2.0, y + 2.0, knob, knob, knob / 2.0, if hovered { TEXT } else { MUTE }, SURFACE);
+        }
     }
 
     fn font(&self, px: i32, bold: bool) -> isize {
@@ -232,7 +331,7 @@ impl Painter {
                 Default::default(),
                 CLEARTYPE_QUALITY,
                 Default::default(),
-                w!("Cascadia Mono"),
+                face(),
             );
             f.0 as isize
         }
@@ -277,12 +376,13 @@ impl Painter {
     }
 
     fn button(&self, rect: UiRect, label: &str, primary: bool, hovered: bool) {
+        let (x, y, w, h) = (rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32);
         if primary {
-            self.fill(rect.x, rect.y, rect.w, rect.h, if hovered { PAPER } else { PAPER_DIM });
+            self.round(x, y, w, h, 6.0, if hovered { PAPER } else { PAPER_DIM }, BG);
             let tw = self.text_w(label, 13, false, 3);
             self.text(rect.x + (rect.w - tw) / 2, rect.y + (rect.h - 16) / 2, label, TextStyle { px_size: 13, color: INK0, bold: false, track: 3 });
         } else {
-            self.stroke(rect.x, rect.y, rect.w, rect.h, if hovered { PAPER } else { RULE2 });
+            self.ring(x, y, w, h, 6.0, if hovered { MUTE } else { RULE2 }, if hovered { SURFACE } else { BG }, BG);
             let tw = self.text_w(label, 13, false, 3);
             self.text(
                 rect.x + (rect.w - tw) / 2,
@@ -302,16 +402,16 @@ pub fn paint(hdc: HDC, dpi: f32, s: &State) {
     p.fill(0, WIN_H - 36, WIN_W, 36, INK0);
     p.rule(0, WIN_H - 36, WIN_W, RULE);
 
-    // wordmark: the app's inverted ">-<" badge + name (matches the title bar)
-    p.fill(24, 18, 40, 26, PAPER);
+    // wordmark: the app's inverted ">_<" badge + name (matches the title bar)
+    p.round(24.0, 18.0, 40.0, 26.0, 5.0, PAPER, BG);
     p.text(31, 22, ">_<", text_style(13, INK0, true, 0));
     p.text(76, 21, "termie", text_style(17, TEXT2, false, 0));
-    // close ×
+    // close ×, red on hover like the app's own window control
     let close_hover = s.hover == Some(Hit::Close);
     if close_hover {
-        p.fill(WIN_W - 44, 12, 32, 32, SURFACE);
+        p.round((WIN_W - 44) as f32, 12.0, 32.0, 32.0, 6.0, CLOSE_RED, BG);
     }
-    p.text_centered(WIN_W - 28, 19, "\u{00d7}", text_style(15, if close_hover { TEXT2 } else { MUTE }, false, 0));
+    p.text_centered(WIN_W - 28, 19, "\u{00d7}", text_style(15, if close_hover { WHITE } else { MUTE }, false, 0));
 
     p.rule(0, 64, WIN_W, RULE);
     p.text(24, 80, "GPU TERMINAL MULTIPLEXER", text_style(11, MUTE, false, 3));
@@ -340,11 +440,8 @@ pub fn paint(hdc: HDC, dpi: f32, s: &State) {
             {
                 let y = 180 + i as i32 * 26;
                 let hov = s.hover == Some(hit);
-                p.stroke(40, y, 14, 14, if hov || on { PAPER } else { RULE2 });
-                if on {
-                    p.fill(43, y + 3, 8, 8, PAPER);
-                }
-                p.text(66, y - 1, label, text_style(13, if hov { TEXT2 } else { TEXT }, false, 0));
+                p.switch(40, y - 1, on, hov);
+                p.text(82, y - 1, label, text_style(13, if hov { TEXT2 } else { TEXT }, false, 0));
             }
             if s.old_msi {
                 p.text(40, 288, "an older MSI install will be removed first", text_style(10, MUTE, false, 0));
@@ -356,8 +453,11 @@ pub fn paint(hdc: HDC, dpi: f32, s: &State) {
             // hairline track + paper fill
             let tx = 60;
             let tw = WIN_W - 120;
-            p.fill(tx, 190, tw, 3, RULE);
-            p.fill(tx, 190, (tw as f32 * s.progress.clamp(0.0, 1.0)) as i32, 3, PAPER);
+            p.round(tx as f32, 189.0, tw as f32, 4.0, 2.0, RULE, BG);
+            let filled = tw as f32 * s.progress.clamp(0.0, 1.0);
+            if filled >= 4.0 {
+                p.round(tx as f32, 189.0, filled, 4.0, 2.0, PAPER, RULE);
+            }
             p.text_centered(WIN_W / 2, 214, &s.detail, text_style(11, MUTE, false, 0));
         }
         Page::Done => {
