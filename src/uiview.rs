@@ -28,8 +28,12 @@ pub fn maybe_run() -> bool {
     let h = val("--h").and_then(|v| v.parse().ok()).unwrap_or(680u32).clamp(240, 3000);
     let scale = val("--scale").and_then(|v| v.parse().ok()).unwrap_or(2.0f32).clamp(1.0, 3.0);
 
-    let mut r = render::Renderer::new_headless(w, h, 14.0, 12.5, scale);
+    let mut r = render::Renderer::new_headless(w, h, 14.0, render::tokens::CHROME_PT, scale);
     r.set_tabs(vec!["backend".into(), "web-ui".into(), "infra".into()], 0);
+    r.set_status(render::StatusView {
+        cwd: Some("~/src/termie".into()),
+        command: render::CommandState::Finished { code: Some(0), took: std::time::Duration::from_millis(18_400) },
+    });
 
     // chrome state varies by scene so each capture isolates one feature
     match scene.as_str() {
@@ -111,6 +115,14 @@ pub fn maybe_run() -> bool {
                     "close pane".into(),
                     "new tab".into(),
                     "toggle broadcast".into(),
+                ],
+                hints: vec![
+                    "Ctrl+Shift+E".into(),
+                    "Ctrl+Shift+O".into(),
+                    "Ctrl+Shift+P".into(),
+                    "Ctrl+Shift+W".into(),
+                    "Ctrl+T".into(),
+                    "Ctrl+Shift+B".into(),
                 ],
                 selected: 1,
                 scope: "commands",

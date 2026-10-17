@@ -47,7 +47,7 @@ use render::{Hit, Hot, PaneDropSide, PaneView, Renderer};
 use term::Terminal;
 
 const CONTENT_PT: f32 = 14.0;
-const CHROME_PT: f32 = 12.5;
+const CHROME_PT: f32 = render::tokens::CHROME_PT;
 /// one pre-warmed shell kept ready so the next split or tab opens instantly
 const POOL_TARGET: usize = 1;
 /// stop respawning after this many consecutive shell-spawn failures so a broken
@@ -240,6 +240,10 @@ struct Pane {
     /// OSC 133-derived command status for the pane badge: running while a
     /// command executes, done (with exit) until the pane is next viewed
     status: PaneStatus,
+    /// when the running command started, and how the last one ended (exit
+    /// code, duration), for the status-bar readout
+    cmd_started: Option<Instant>,
+    last_cmd: Option<(Option<i32>, Duration)>,
 }
 
 /// what a pane's shell is doing, for the corner badge + tab strip rollup —
@@ -305,8 +309,39 @@ impl Pane {
         if queued && was_prompt {
             self.term.cmd_running = true;
             self.status = PaneStatus::Running;
+            self.cmd_started = Some(Instant::now());
         }
         queued
+    }
+
+    /// fold the terminal's OSC 133 events into the badge status, timing each
+    /// command; a pane the user is looking at skips the done badge
+    fn settle_status(&mut self, viewed: bool) -> PaneStatus {
+        if self.term.cmd_running {
+            self.term.cmd_done = None;
+            self.cmd_started.get_or_insert_with(Instant::now);
+            PaneStatus::Running
+        } else if let Some(code) = self.term.cmd_done.take() {
+            if let Some(t) = self.cmd_started.take() {
+                self.last_cmd = Some((code, t.elapsed()));
+            }
+            if viewed { PaneStatus::Idle } else { PaneStatus::Done(code) }
+        } else if self.status == PaneStatus::Running {
+            // the C..D window closed without a done event: no exit to report
+            self.cmd_started = None;
+            PaneStatus::Idle
+        } else {
+            self.status
+        }
+    }
+
+    /// the status bar's command readout for this pane
+    fn command_state(&self) -> render::CommandState {
+        match (self.status, self.cmd_started, self.last_cmd) {
+            (PaneStatus::Running, Some(t), _) => render::CommandState::Running(t),
+            (_, _, Some((code, took))) => render::CommandState::Finished { code, took },
+            _ => render::CommandState::Idle,
+        }
     }
 }
 
@@ -1146,6 +1181,23 @@ fn cwd_path(cwd: Option<&str>) -> Option<String> {
     Some(path.replace("%20", " "))
 }
 
+/// a path with the home directory folded to `~`, slashes normalized to `/`
+fn home_relative(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let Some(home) = home_dir().map(|h| h.to_string_lossy().replace('\\', "/")) else {
+        return path;
+    };
+    let home = home.trim_end_matches('/');
+    let under = path.len() >= home.len()
+        && path.is_char_boundary(home.len())
+        && if cfg!(windows) { path[..home.len()].eq_ignore_ascii_case(home) } else { path[..home.len()] == *home };
+    match under.then(|| &path[home.len()..]) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path,
+    }
+}
+
 /// parse a color as #rrggbb, #rgb, or r,g,b
 fn parse_color(s: &str) -> Option<color::Rgb> {
     let s = s.trim();
@@ -1307,6 +1359,32 @@ fn key_label(key: &Key) -> Option<String> {
         },
         _ => None,
     }
+}
+
+/// a keybindings.conf combo as people write it on a keycap: "Ctrl+Shift+PgUp"
+fn display_combo(combo: &str) -> String {
+    combo
+        .split('+')
+        .map(|part| match part {
+            "ctrl" => "Ctrl".to_string(),
+            "shift" => "Shift".to_string(),
+            "alt" => "Alt".to_string(),
+            "super" => if cfg!(windows) { "Win" } else { "Super" }.to_string(),
+            "pageup" => "PgUp".to_string(),
+            "pagedown" => "PgDn".to_string(),
+            "up" => "\u{2191}".to_string(),
+            "down" => "\u{2193}".to_string(),
+            "left" => "\u{2190}".to_string(),
+            "right" => "\u{2192}".to_string(),
+            "esc" => "Esc".to_string(),
+            p if p.chars().count() == 1 => p.to_uppercase(),
+            p => {
+                let mut c = p.chars();
+                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// format a chord back to a keybindings.conf combo like "ctrl+shift+t"; None when
@@ -2912,6 +2990,8 @@ fn build_pane(
         flash: None,
         apc: apc::ApcScanner::default(),
         status: PaneStatus::Idle,
+        cmd_started: None,
+        last_cmd: None,
     })
 }
 
@@ -4118,6 +4198,7 @@ struct App {
     /// past the pane edge, plus the next tick deadline (about_to_wait drives it)
     sel_autoscroll: Option<isize>,
     sel_scroll_at: Option<Instant>,
+
     /// dragging the scroll thumb: (pane id, pointer-y offset from the thumb top)
     sb_drag: Option<(usize, f32)>,
     last_click: Option<(Instant, f64, f64)>,
@@ -4168,7 +4249,6 @@ struct App {
     settings_anim: Option<Instant>,
     /// set when the focused pane changes, so its accent border eases in instead
     /// of snapping; cleared once the ease settles
-    focus_anim: Option<Instant>,
     /// debug-only: TERMIE_BENCH=N auto-opens N tabs after startup to measure
     /// warm-pool tab-open latency via the TERMIE_TIMING log
     #[cfg(debug_assertions)]
@@ -4384,7 +4464,6 @@ impl App {
             plugin_widgets: Vec::new(),
             plugin_subs: Vec::new(),
             settings_anim: None,
-            focus_anim: None,
             #[cfg(debug_assertions)]
             bench_left: std::env::var("TERMIE_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             #[cfg(debug_assertions)]
@@ -4809,6 +4888,8 @@ impl App {
             flash: None,
             apc: apc::ApcScanner::default(),
             status: PaneStatus::Idle,
+            cmd_started: None,
+            last_cmd: None,
         };
         pane.resize(rows, cols);
         self.start_reader(&mut pane);
@@ -4868,7 +4949,7 @@ impl App {
         let mut any = false;
         for s in &self.satellites {
             if let (Some(w), Some(r)) = (s.window.as_ref(), s.renderer.as_ref())
-                && (r.startup_fading() || r.hover_animating() || r.tab_animating() || r.overlay_animating())
+                && r.animating()
             {
                 w.request_redraw();
                 any = true;
@@ -4903,7 +4984,7 @@ impl App {
         let mut any = false;
         each_pane(root, &mut |p| {
             // keep ticking through the fade-out tail (see PaneView.flash easing)
-            if p.flash.map(|t| t.elapsed().as_millis() < 220).unwrap_or(false) {
+            if p.flash.is_some_and(|t| t.elapsed().as_secs_f32() < render::motion::BELL) {
                 any = true;
             }
         });
@@ -6240,26 +6321,30 @@ impl App {
             let (_, has_link) = self.refresh_hovered_link();
             self.set_hover_pointer(has_link);
         }
-        let clock = win::local_hm();
-        let focus_ease = self.focus_ease();
-        let sessions = self.pw.tabs.len();
+        let status = self.status_view();
         // the font picker reuses the palette overlay box: when it's open, feed
         // build_palette the filtered font list instead of the action list
         let palette_view = if let Some(fp) = self.font_pick.as_ref() {
             Some(render::PaletteView {
                 query: fp.query.clone(),
                 items: self.font_pick_filter(&fp.query),
+                hints: Vec::new(),
                 selected: fp.selected,
                 scope: "fonts",
             })
         } else {
             self.palette.as_ref().map(|p| {
-                let items: Vec<String> =
-                    self.palette_choices(p.mode, &p.query).into_iter().map(|(l, _)| l).collect();
+                let defaults = default_keybindings();
+                let (items, hints): (Vec<String>, Vec<String>) = self
+                    .palette_choices(p.mode, &p.query)
+                    .into_iter()
+                    .map(|(l, a)| (l, self.shortcut_hint(a, &defaults)))
+                    .unzip();
                 render::PaletteView {
                     query: p.query.clone(),
                     selected: p.selected.min(items.len().saturating_sub(1)),
                     items,
+                    hints,
                     scope: match p.mode {
                         PaletteMode::Commands => "commands",
                         PaletteMode::Tabs => "tabs",
@@ -6331,7 +6416,7 @@ impl App {
         let hud = if self.persisted.latency_hud { self.lat.hud() } else { None };
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_latency_hud(hud);
-            r.set_status(None, clock, sessions);
+            r.set_status(status);
             r.set_palette(palette_view);
             r.set_pane_menu(pane_menu_view);
             r.set_find(find_view);
@@ -6409,11 +6494,7 @@ impl App {
                                     sel: selection.filter(|s| s.pane == *id).and_then(|s| sel_view_span(&p.term.grid, &s)),
                                     flash: p
                                         .flash
-                                        .map(|t| {
-                                            // hold full for 120ms, then ease to 0 by 220ms
-                                            let e = t.elapsed().as_millis() as f32;
-                                            (1.0 - (e - 120.0) / 100.0).clamp(0.0, 1.0)
-                                        })
+                                        .map(|t| 1.0 - render::motion::ease_out(render::motion::progress(t, render::motion::BELL)))
                                         .unwrap_or(0.0),
                                     link: if *id == tab.focused { *link } else { None },
                                     theme: persisted
@@ -6432,7 +6513,7 @@ impl App {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            match r.render(&views, *focused, *maximized, focus_ease, false) {
+            match r.render(&views, *focused, *maximized, false) {
                 Ok(()) => present_now = Some(Instant::now()),
                 Err(e) => log::error!("render error: {e:#}"),
             }
@@ -6806,6 +6887,25 @@ impl App {
         cwd_path(p.term.cwd.as_deref())
     }
 
+    /// the chord that runs `action`, formatted for display ("Ctrl+Shift+E");
+    /// a user binding wins, and a built-in chord the user took for something
+    /// else no longer counts
+    fn shortcut_hint(&self, action: PaletteAction, defaults: &[(ModifiersState, Key, PaletteAction)]) -> String {
+        if action == PaletteAction::PaneMode {
+            return "Ctrl+Shift+P".to_string();
+        }
+        let user = self.keybindings.iter().find(|(_, _, a)| *a == action);
+        let builtin = || {
+            defaults
+                .iter()
+                .find(|(m, k, a)| *a == action && !self.keybindings.iter().any(|(um, uk, _)| um == m && uk == k))
+        };
+        user.or_else(builtin)
+            .and_then(|(m, k, _)| combo_label(m, k))
+            .map(|combo| display_combo(&combo))
+            .unwrap_or_default()
+    }
+
     fn tab_cwd(&self, tab: usize) -> Option<String> {
         let tab = self.pw.tabs.get(tab)?;
         let pane = find_pane(tab.root.as_ref()?, tab.focused)?;
@@ -7009,16 +7109,21 @@ impl App {
         if self.pw.settings_open { 0.14 } else { 0.22 }
     }
 
-    /// 0→1 fade for the focused-pane accent border after a focus change, so it
-    /// eases in rather than snapping (1.0 once settled)
-    fn focus_ease(&self) -> f32 {
-        const DUR: f32 = 0.16;
-        match self.focus_anim {
-            None => 1.0,
-            Some(t) => {
-                let e = (t.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0);
-                1.0 - (1.0 - e).powi(3)
-            }
+    /// the status bar's view of the focused pane: where it is and what its
+    /// shell is doing. the path is display-only: terminal-reported paths never
+    /// trigger filesystem or repository reads
+    fn status_view(&self) -> render::StatusView {
+        let Some(pane) = self
+            .pw
+            .tabs
+            .get(self.pw.active_tab)
+            .and_then(|t| t.root.as_ref().and_then(|root| find_pane(root, t.focused)))
+        else {
+            return render::StatusView::default();
+        };
+        render::StatusView {
+            cwd: cwd_path(pane.term.cwd.as_deref()).map(|d| home_relative(&d)),
+            command: pane.command_state(),
         }
     }
 
@@ -8567,7 +8672,6 @@ impl App {
             tab.focused = new_id;
         }
         // ease the new pane's accent border in
-        self.focus_anim = Some(Instant::now());
         self.relayout_all();
         self.sync_tabs();
         self.after_focus_context_change(before);
@@ -8588,7 +8692,6 @@ impl App {
                 tab.focused = first_leaf(&node);
                 tab.root = Some(node);
                 // ease the surviving pane's accent border in
-                self.focus_anim = Some(Instant::now());
                 self.relayout_all();
                 self.sync_tabs();
                 self.after_focus_context_change(before);
@@ -8697,7 +8800,6 @@ impl App {
         };
         if changed {
             // tab label + git track the focused pane; ease the accent border in
-            self.focus_anim = Some(Instant::now());
             self.sync_tabs();
             self.after_focus_context_change(before);
             if let (Some(id), false) = (hit, self.plugins.is_empty()) {
@@ -9431,7 +9533,6 @@ impl App {
             && tab.focused != id
         {
             tab.focused = id;
-            self.focus_anim = Some(Instant::now());
             self.sync_tabs();
             self.after_focus_context_change(before);
         }
@@ -11336,7 +11437,6 @@ impl App {
                 tab.focused = id;
             }
             // ease the accent border in on the newly focused pane
-            self.focus_anim = Some(Instant::now());
             self.sync_tabs();
             self.after_focus_context_change(before);
         }
@@ -11745,17 +11845,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // seen, so it never earns a done badge
                             let viewed =
                                 self.pw.focused && ti == active_tab && tab.focused == id;
-                            let status = if p.term.cmd_running {
-                                p.term.cmd_done = None;
-                                PaneStatus::Running
-                            } else if let Some(code) = p.term.cmd_done.take() {
-                                if viewed { PaneStatus::Idle } else { PaneStatus::Done(code) }
-                            } else if p.status == PaneStatus::Running {
-                                // the C..D window closed without a done event
-                                PaneStatus::Idle
-                            } else {
-                                p.status
-                            };
+                            let status = p.settle_status(viewed);
                             if status != p.status {
                                 p.status = status;
                                 status_changed = true;
@@ -11826,16 +11916,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // to the swapped-in satellite's focus state
                             let viewed =
                                 self.pw.focused && ti == self.pw.active_tab && tab.focused == id;
-                            let status = if p.term.cmd_running {
-                                p.term.cmd_done = None;
-                                PaneStatus::Running
-                            } else if let Some(code) = p.term.cmd_done.take() {
-                                if viewed { PaneStatus::Idle } else { PaneStatus::Done(code) }
-                            } else if p.status == PaneStatus::Running {
-                                PaneStatus::Idle
-                            } else {
-                                p.status
-                            };
+                            let status = p.settle_status(viewed);
                             if status != p.status {
                                 p.status = status;
                                 sat_status = true;
@@ -12629,14 +12710,6 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             self.sel_scroll_at = None;
         }
-        // startup reveal fade: drive it at ~60fps until it settles
-        if self.pw.renderer.as_ref().map(|r| r.startup_fading()).unwrap_or(false) {
-            self.redraw();
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-            return;
-        }
         // settings slide: redraw at ~60fps until the transition settles
         if let Some(t) = self.settings_anim {
             if t.elapsed().as_secs_f32() >= self.settings_anim_dur() {
@@ -12649,37 +12722,9 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
-        // focused-pane accent border ease: drive ~60fps until it settles, then
-        // fall back to the idle (event-driven) cadence
-        if let Some(t) = self.focus_anim {
-            if t.elapsed().as_secs_f32() >= 0.16 {
-                self.focus_anim = None;
-            } else {
-                self.redraw();
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(16),
-                ));
-                return;
-            }
-        }
-        // chrome-button hover fade-in: drive ~60fps only while it's in flight
-        if self.pw.renderer.as_ref().is_some_and(|r| r.hover_animating()) {
-            self.redraw();
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-            return;
-        }
-        // active-tab accent rail slide: drive ~60fps only while it's in flight
-        if self.pw.renderer.as_ref().is_some_and(|r| r.tab_animating()) {
-            self.redraw();
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-            return;
-        }
-        // overlay (palette/find/market/menu) bloom-in: drive while in flight
-        if self.pw.renderer.as_ref().is_some_and(|r| r.overlay_animating()) {
+        // any renderer-owned animation (reveal, hover, tab rail, overlay bloom,
+        // focus crossfade, tab signals): drive ~60fps only while in flight
+        if self.pw.renderer.as_ref().is_some_and(|r| r.animating()) {
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -12712,27 +12757,20 @@ impl ApplicationHandler<UserEvent> for App {
         // already request redraws from their own events (pty output, keys, resize)
         // the main window's idle wakeup need (ms), or None when it can fully sleep
         let main_ms: Option<u64> = if self.any_flash() {
-            // fade the bell flash out quickly
+            // the bell glow decays smoothly
             self.redraw();
-            Some(60)
-        } else if self.pw.focused && self.blinking_cursor_on_screen() {
-            self.redraw();
-            Some(530)
-        } else if self.pw.focused {
-            // keep the status-bar clock current without busy-redrawing: wake
-            // coarsely and only repaint when the displayed minute actually rolls
-            let now_hm = win::local_hm();
-            let stale = self
-                .pw.renderer
-                .as_ref()
-                .map(|r| r.status_clock() != now_hm)
-                .unwrap_or(false);
-            if stale {
+            Some(16)
+        } else {
+            // the soft cursor blink only wakes for its fades; a running
+            // command's dot and timer wake slowly; otherwise sleep
+            let r = self.pw.renderer.as_ref();
+            let blink = (self.pw.focused && self.blinking_cursor_on_screen())
+                .then(|| r.map_or(530, |r| r.cursor_wake_ms().max(33)));
+            let ms = blink.into_iter().chain(r.and_then(|r| r.ambient_wake_ms())).min();
+            if ms.is_some() {
                 self.redraw();
             }
-            Some(5000)
-        } else {
-            None
+            ms
         };
         // a torn-off window mid-animation needs ~60fps wakeups; take the soonest
         // of the main window's need and the satellite tick so neither is starved
@@ -12898,6 +12936,7 @@ fn main() -> Result<()> {
             launch_proxy.send_event(UserEvent::Launch { request, _permit: permit }).is_ok()
         });
     }
+    std::thread::spawn(|| render::motion::set_reduced(win::reduced_motion()));
     let mut app = App::new(proxy);
     #[cfg(windows)]
     {
@@ -14241,6 +14280,8 @@ mod tests {
             flash: None,
             apc: apc::ApcScanner::default(),
             status: PaneStatus::Idle,
+            cmd_started: None,
+            last_cmd: None,
         }
     }
     fn leaf(id: usize) -> Node {

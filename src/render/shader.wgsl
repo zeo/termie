@@ -18,6 +18,7 @@ struct InstanceIn {
     @location(3) uv_max: vec2<f32>,
     @location(4) color: vec4<f32>,
     @location(5) kind: u32,
+    @location(6) shape: vec3<f32>,
 };
 
 struct VsOut {
@@ -25,6 +26,8 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) kind: u32,
+    @location(3) @interpolate(flat) box_size: vec2<f32>,
+    @location(4) @interpolate(flat) shape: vec3<f32>,
 };
 
 @vertex
@@ -46,7 +49,14 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
     out.uv = mix(inst.uv_min, inst.uv_max, corner);
     out.color = inst.color;
     out.kind = inst.kind;
+    out.box_size = inst.size;
+    out.shape = inst.shape;
     return out;
+}
+
+fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - b + vec2<f32>(r);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
 // premultiplied-alpha output so the surface composes correctly when the window
@@ -55,6 +65,24 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == 0u) {
         return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+    }
+    // kind 4: rounded rect in local pixels (uv); shape = (radius, blur, ring
+    // width). a blurred one is a soft shadow whose rect sits `blur` inside the quad
+    if (in.kind == 4u) {
+        let blur = in.shape.y;
+        let half = in.box_size * 0.5 - vec2<f32>(blur);
+        let r = min(in.shape.x, min(half.x, half.y));
+        let d = sd_round_box(in.uv - in.box_size * 0.5, half, r);
+        var cov: f32;
+        if (blur > 0.0) {
+            cov = 1.0 - smoothstep(-blur, blur, d);
+        } else if (in.shape.z > 0.0) {
+            cov = clamp(0.5 - (abs(d + in.shape.z * 0.5) - in.shape.z * 0.5), 0.0, 1.0);
+        } else {
+            cov = clamp(0.5 - d, 0.0, 1.0);
+        }
+        let ra = in.color.a * cov;
+        return vec4<f32>(in.color.rgb * ra, ra);
     }
     // kind 2: full-color app-icon texture (straight alpha -> premultiplied)
     if (in.kind == 2u) {

@@ -9,8 +9,10 @@ use cosmic_text::{
 pub enum FontId {
     /// terminal grid content (Iosevka)
     Content,
-    /// window chrome: wordmark, meta, controls (Departure Mono)
+    /// window chrome: wordmark, tabs, overlays
     Chrome,
+    /// status bar and secondary chrome text, one point under Chrome
+    Small,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +91,7 @@ pub struct GlyphAtlas {
 
     content: FontMetrics,
     chrome: FontMetrics,
+    small: FontMetrics,
     /// the bundled default content family, used when no override is present
     default_family: &'static str,
 
@@ -109,6 +112,8 @@ pub struct GlyphAtlas {
     system_loaded: bool,
 
     cache: FxHashMap<GlyphKey, Option<AtlasGlyph>>,
+    /// rasterized chrome icons keyed by (icon, box px, stroke in quarter px)
+    icon_cache: FxHashMap<(super::icons::Icon, u32, u32), Option<AtlasGlyph>>,
     /// composited grapheme-cluster glyphs, keyed by a string whose first char
     /// encodes bold/italic so the lookup borrows `&str` (no per-hit allocation)
     cluster_cache: FxHashMap<String, Option<AtlasGlyph>>,
@@ -176,6 +181,7 @@ impl GlyphAtlas {
                 family: chrome_family,
                 weight: Weight::NORMAL,
             },
+            small: small_metrics(chrome_pt, scale, chrome_family),
             default_family: maple,
             data: vec![0u8; 0],
             dim: 1024,
@@ -188,6 +194,7 @@ impl GlyphAtlas {
             color_shelf: Shelf::new(),
             system_loaded: false,
             cache: FxHashMap::default(),
+            icon_cache: FxHashMap::default(),
             cluster_cache: FxHashMap::default(),
             cluster_key: String::new(),
             image_cache: FxHashMap::default(),
@@ -198,6 +205,7 @@ impl GlyphAtlas {
 
         atlas.content = atlas.measure(atlas.content);
         atlas.chrome = atlas.measure(atlas.chrome);
+        atlas.small = atlas.measure(atlas.small);
         atlas
     }
 
@@ -211,6 +219,7 @@ impl GlyphAtlas {
         match font {
             FontId::Content => self.content,
             FontId::Chrome => self.chrome,
+            FontId::Small => self.small,
         }
     }
 
@@ -368,8 +377,10 @@ impl GlyphAtlas {
             family: self.chrome.family,
             weight: self.chrome.weight,
         };
+        self.small = small_metrics(chrome_pt, scale, self.chrome.family);
         self.content = self.measure(self.content);
         self.chrome = self.measure(self.chrome);
+        self.small = self.measure(self.small);
         // discard the old rasterized glyphs and repack from scratch (same dim)
         self.repack_at(self.dim);
     }
@@ -388,6 +399,7 @@ impl GlyphAtlas {
             self.color_data.iter_mut().for_each(|b| *b = 0);
         }
         self.cache.clear();
+        self.icon_cache.clear();
         self.cluster_cache.clear();
         self.image_cache.clear();
         self.mono_shelf = Shelf::new();
@@ -1063,6 +1075,42 @@ impl GlyphAtlas {
         self.color_dirty = true;
     }
 
+    /// a chrome icon as a coverage glyph `size` px square, drawn like any
+    /// other mono glyph (tinted by the instance color)
+    pub fn get_icon(&mut self, icon: super::icons::Icon, size: u32, stroke: f32) -> Option<AtlasGlyph> {
+        let key = (icon, size, (stroke * 4.0).round() as u32);
+        if let Some(g) = self.icon_cache.get(&key) {
+            return *g;
+        }
+        let size = size.max(1);
+        let pixels = super::icons::rasterize(icon, size, stroke);
+        let (x, y) = match self.alloc_mono(size, size) {
+            Some(pos) => pos,
+            None => {
+                self.repack_at(2048);
+                self.alloc_mono(size, size)?
+            }
+        };
+        for row in 0..size {
+            let dst = ((y + row) * self.dim + x) as usize;
+            let src = (row * size) as usize;
+            self.data[dst..dst + size as usize].copy_from_slice(&pixels[src..src + size as usize]);
+        }
+        self.mark_dirty_rows(y, y + size);
+        let d = self.dim as f32;
+        let g = AtlasGlyph {
+            uv_min: [x as f32 / d, y as f32 / d],
+            uv_max: [(x + size) as f32 / d, (y + size) as f32 / d],
+            width: size as f32,
+            height: size as f32,
+            left: 0.0,
+            top: 0.0,
+            color: false,
+        };
+        self.icon_cache.insert(key, Some(g));
+        Some(g)
+    }
+
     fn alloc_mono(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         self.mono_shelf.alloc(self.dim, w, h)
     }
@@ -1142,6 +1190,20 @@ fn load_bundled_fonts(fs: &mut FontSystem) -> (&'static str, &'static str) {
         "monospace"
     };
     (family, family)
+}
+
+fn small_metrics(chrome_pt: f32, scale: f32, family: &'static str) -> FontMetrics {
+    let px = ((chrome_pt - 1.0) * scale).round().max(6.0);
+    let lh = (px * 1.4).round();
+    FontMetrics {
+        cell_w: px * 0.5,
+        cell_h: lh,
+        ascent: px,
+        px,
+        line_height: lh,
+        family,
+        weight: Weight::NORMAL,
+    }
 }
 
 /// true if a font family with this name is present in the db (case-insensitive)

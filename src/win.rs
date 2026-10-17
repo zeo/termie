@@ -903,6 +903,77 @@ pub fn wheel_scroll_lines() -> u32 {
     3
 }
 
+/// the user turned off window animations ("animation effects" in windows
+/// settings)
+#[cfg(windows)]
+pub fn reduced_motion() -> bool {
+    use windows::core::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = BOOL(1);
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut BOOL as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    ok.is_ok() && !on.as_bool()
+}
+
+/// kde's animation speed slider at "instant", or gnome's animations switch
+/// off (read through the settings portal); blocking, so call it off the ui thread
+#[cfg(target_os = "linux")]
+pub fn reduced_motion() -> bool {
+    let kdeglobals = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|dir| dir.join("kdeglobals"));
+    if let Some(text) = kdeglobals.and_then(|p| std::fs::read_to_string(p).ok())
+        && let Some(factor) = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("AnimationDurationFactor="))
+            .and_then(|v| v.trim().parse::<f32>().ok())
+    {
+        return factor <= 0.0;
+    }
+    gnome_animations_off().unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_animations_off() -> Option<bool> {
+    use zbus::zvariant::{OwnedValue, Value};
+    let connection = zbus::blocking::Connection::session().ok()?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+    )
+    .ok()?;
+    let key = ("org.gnome.desktop.interface", "enable-animations");
+    let value: OwnedValue = proxy
+        .call("ReadOne", &key)
+        .or_else(|_| proxy.call("Read", &key))
+        .ok()?;
+    let mut v: &Value = &value;
+    while let Value::Value(inner) = v {
+        v = inner;
+    }
+    match v {
+        Value::Bool(on) => Some(!on),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn reduced_motion() -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub fn local_hm() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;

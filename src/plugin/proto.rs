@@ -15,8 +15,10 @@ pub const API_VERSION: u32 = 2;
 /// an immediate-mode draw primitive (Tier-2, `api_version` >= 2). coordinates are
 /// normalized 0..1 within the widget's canvas box, so a plugin is scale- and
 /// resolution-independent and can never address outside its own widget. `color`
-/// is a palette role ("paper", "text", "mute", "rule", "ink", "accent") or a
-/// "#rrggbb" / "#rgb" hex string; an unknown spec falls back to the dock body color
+/// is a palette role ("paper", "accent", "text", "mute", "rule", "ink", "ok",
+/// "err", "warn", "info", "ansi0".."ansi15") or a "#rrggbb" / "#rgb" hex string,
+/// which snaps to the active theme's nearest color so widgets stay on-palette;
+/// an unknown spec falls back to the dock body color
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrawCmd {
     Rect { x: f32, y: f32, w: f32, h: f32, color: String },

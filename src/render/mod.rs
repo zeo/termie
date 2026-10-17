@@ -1,5 +1,8 @@
 mod atlas;
 mod boxdraw;
+mod icons;
+pub mod motion;
+pub mod tokens;
 #[cfg(any(test, debug_assertions))]
 pub mod preview;
 
@@ -15,6 +18,7 @@ use crate::color::{Color, Palette, Rgb, ThemeId};
 use crate::grid::CursorShape;
 use crate::term::Terminal;
 pub(crate) use atlas::{FontId, GlyphAtlas, GlyphKey};
+use icons::Icon;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -32,16 +36,18 @@ struct Instance {
     uv_max: [f32; 2],
     color: [f32; 4],
     kind: u32,
-    _pad: [u32; 3],
+    /// kind 4 only: (corner radius, shadow blur, ring width) in pixels
+    shape: [f32; 3],
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
     2 => Float32x2,
     3 => Float32x2,
     4 => Float32x4,
     5 => Uint32,
+    6 => Float32x3,
 ];
 
 /// build a full mip chain from a 32bpp RGBA base via 2x2 box downsample;
@@ -191,6 +197,8 @@ pub(crate) fn preedit_cell_offset(text: &str, at: usize) -> usize {
 pub struct PaletteView {
     pub query: String,
     pub items: Vec<String>,
+    /// parallel to `items`: the row's shortcut ("Ctrl+Shift+E"), empty if none
+    pub hints: Vec<String>,
     pub selected: usize,
     pub scope: &'static str,
 }
@@ -314,6 +322,24 @@ pub enum Hit {
     Content,
 }
 
+/// what the focused pane's shell is doing, for the status bar
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum CommandState {
+    #[default]
+    Idle,
+    Running(Instant),
+    Finished { code: Option<i32>, took: std::time::Duration },
+}
+
+/// the status bar's left cluster and command readout, fed by the app from the
+/// focused pane
+#[derive(Clone, Default)]
+pub struct StatusView {
+    /// home-abbreviated working directory
+    pub cwd: Option<String>,
+    pub command: CommandState,
+}
+
 /// scroll thumb + track rectangle for a pane, in window pixels. shared by the
 /// painter and the input hit-test so the grabbable strip is exactly what's drawn
 #[derive(Clone, Copy)]
@@ -361,7 +387,8 @@ type Rect = (f32, f32, f32, f32);
 /// a tab in the title bar: (session index, tab rect, close-icon rect)
 type TabEntry = (usize, Rect, Rect);
 /// resolved per-pane paint origin: (origin x, origin y, focused, pane rect)
-type PaneInfo = (f32, f32, bool, Rect);
+/// grid origin x/y, focused, rect, and the background the pane paints with
+type PaneInfo = (f32, f32, bool, Rect, Rgb);
 /// a selection span in viewport cells: (start, end, block) — block marks an
 /// alt+drag rectangular selection
 pub type SelSpan = ((usize, usize), (usize, usize), bool);
@@ -377,7 +404,8 @@ fn liga_char(c: char) -> bool {
 /// snapshot of a tab row for painting: index, tab rect, close rect, label,
 /// active, hovered, close-hovered, badge severity (0 none .. 4 failed),
 /// user-picked tint (ansi palette index)
-type TabItem = (usize, Rect, Rect, String, bool, bool, bool, u8, Option<u8>);
+/// index, rect, close rect, label, active, hover, close hover, status, tint
+type TabItem = (usize, Rect, Rect, String, bool, f32, f32, u8, Option<u8>);
 
 /// GPU backend choice for compatibility; persisted + applied at startup
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -522,6 +550,101 @@ pub(crate) struct A11yChromeLayout {
     pub new_tab: (f32, f32, f32, f32),
     pub new_tab_menu: (f32, f32, f32, f32),
     pub controls: Vec<(Hot, (f32, f32, f32, f32))>,
+}
+
+/// an overlay opening: fade everything in, and grow the surfaces from 98% about
+/// their shared center (full-width scrims and pages only fade, and reduced
+/// motion keeps just the fade)
+fn bloom(range: &mut [Instance], p: f32, window_w: f32) {
+    let full = |i: &Instance| i.size[0] >= window_w;
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for i in range.iter().filter(|i| !full(i)) {
+        x0 = x0.min(i.pos[0]);
+        y0 = y0.min(i.pos[1]);
+        x1 = x1.max(i.pos[0] + i.size[0]);
+        y1 = y1.max(i.pos[1] + i.size[1]);
+    }
+    let k = if motion::reduced() || x0 > x1 { 1.0 } else { 0.98 + 0.02 * p };
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    for i in range.iter_mut() {
+        i.color[3] *= p;
+        if k < 1.0 && !full(i) {
+            i.pos = [cx + (i.pos[0] - cx) * k, cy + (i.pos[1] - cy) * k];
+            i.size = [i.size[0] * k, i.size[1] * k];
+            if i.kind == 4 {
+                i.uv_max = i.size;
+                i.shape = [i.shape[0] * k, i.shape[1] * k, i.shape[2] * k];
+            }
+        }
+    }
+}
+
+/// the shared edge between two tiled panes as a hairline rect, if they touch
+/// along a side (within `tol` px of each other)
+fn pane_seam(a: Rect, b: Rect, tol: f32, hair: f32) -> Option<Rect> {
+    for (l, r) in [(a, b), (b, a)] {
+        let gap = r.0 - (l.0 + l.2);
+        let (y0, y1) = (l.1.max(r.1), (l.1 + l.3).min(r.1 + r.3));
+        if (-0.5..=tol).contains(&gap) && y1 > y0 {
+            return Some(((l.0 + l.2 + gap / 2.0 - hair / 2.0).round(), y0, hair, y1 - y0));
+        }
+        let gap = r.1 - (l.1 + l.3);
+        let (x0, x1) = (l.0.max(r.0), (l.0 + l.2).min(r.0 + r.2));
+        if (-0.5..=tol).contains(&gap) && x1 > x0 {
+            return Some((x0, (l.1 + l.3 + gap / 2.0 - hair / 2.0).round(), x1 - x0, hair));
+        }
+    }
+    None
+}
+
+/// compact elapsed time: 3.2s, 42s, 3m 05s, 1h 02m
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..10 => format!("{:.1}s", d.as_secs_f32()),
+        10..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs / 60 % 60),
+    }
+}
+
+/// keep the tail of a path that's too long: "…/src/render"
+fn truncate_head(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    std::iter::once('\u{2026}').chain(s.chars().skip(n - keep)).collect()
+}
+
+fn truncate_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).chain(std::iter::once('\u{2026}')).collect()
+}
+
+/// shrink tab widths to fit `avail`: lower a shared cap until the total fits
+/// (widest give way first), and never go below an even share
+fn fit_widths(natural: &[f32], avail: f32) -> Vec<f32> {
+    let total: f32 = natural.iter().sum();
+    if total <= avail || natural.is_empty() {
+        return natural.to_vec();
+    }
+    let mut sorted = natural.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mut rest = avail;
+    let mut cap = avail / natural.len() as f32;
+    for (i, w) in sorted.iter().enumerate() {
+        let share = rest / (sorted.len() - i) as f32;
+        if *w > share {
+            cap = share;
+            break;
+        }
+        rest -= w;
+    }
+    natural.iter().map(|w| w.min(cap).max(1.0)).collect()
 }
 
 fn in_rect(x: f32, y: f32, r: (f32, f32, f32, f32)) -> bool {
@@ -760,6 +883,19 @@ pub struct Renderer {
     hovered: Option<Hot>,
     /// when the current hovered target was entered, for the hover fade-in
     hover_since: Option<Instant>,
+    /// the target the pointer just left, fading its hover back out
+    hover_prev: Option<(Hot, Instant)>,
+    /// the focused pane's rect last frame, and the previously focused rect
+    /// with when it lost focus, so focus crossfades instead of snapping
+    focus_rect: Option<Rect>,
+    focus_prev: Option<(Rect, Instant)>,
+    /// parallel to `tabs`: when a background tab's command finished, so its
+    /// rail draws in, holds, and settles into a dot
+    tab_signal: Vec<Option<Instant>>,
+    /// when the grid size last changed, for the transient size readout
+    size_flash: Option<Instant>,
+    /// the context-menu row under the pointer and when it lit, for the fade-in
+    menu_hover: Option<(usize, Instant)>,
     /// (previous active tab index, start) so the active-tab accent rail slides
     /// to the newly selected tab instead of teleporting
     tab_slide: Option<(usize, Instant)>,
@@ -815,9 +951,7 @@ pub struct Renderer {
     /// parallel to `tabs`: user-picked tint (ansi palette index 1-6)
     tab_colors: Vec<Option<u8>>,
     active_tab: usize,
-    status_git: Option<String>,
-    status_clock: String,
-    status_sessions: usize,
+    status: StatusView,
     /// transient program-notification text shown in the status bar's right
     /// cluster in place of READY (the app expires it after a few seconds)
     notice: Option<String>,
@@ -827,9 +961,9 @@ pub struct Renderer {
     update_chip: Option<String>,
     update_hit: Option<(f32, f32, f32, f32)>,
     /// cached status-bar strings so the per-frame paint doesn't re-format them:
-    /// (cols, rows, "W×H") and (sessions, "n")
+    /// (cols, rows, "W×H") and (command-state key, text)
     status_size: (usize, usize, String),
-    status_tabs: (usize, String),
+    status_cmd: (u64, String),
     /// installed plugins (display name, enabled) for the settings PLUGINS panel
     plugins_installed: Vec<(String, bool)>,
     palette_view: Option<PaletteView>,
@@ -1436,10 +1570,9 @@ impl Renderer {
         } = build_gpu_resources(&device, &queue, atlas.dim, format);
         crate::timing("  gpu: resources built");
 
-        let pad = (10.0 * scale).round();
-        let chrome_h = atlas.metrics(FontId::Chrome).cell_h;
-        let title_bar_h = (chrome_h + (14.0 * scale)).round();
-        let status_bar_h = (chrome_h + (8.0 * scale)).round();
+        let pad = tokens::px(tokens::WINDOW_PAD, scale);
+        let title_bar_h = tokens::px(tokens::TITLE_BAR, scale);
+        let status_bar_h = tokens::px(tokens::STATUS_BAR, scale);
 
         // arm device-lost recovery before `device` moves into the struct; the
         // callback fires on a driver reset / TDR (not on our own teardown) and
@@ -1503,6 +1636,12 @@ impl Renderer {
             reveal_start: Instant::now(),
             hovered: None,
             hover_since: None,
+            hover_prev: None,
+            focus_rect: None,
+            focus_prev: None,
+            tab_signal: Vec::new(),
+            size_flash: None,
+            menu_hover: None,
             tab_slide: None,
             overlay_since: None,
             overlay_shown: false,
@@ -1534,15 +1673,13 @@ impl Renderer {
             tab_status: Vec::new(),
             tab_colors: Vec::new(),
             active_tab: 0,
-            status_git: None,
-            status_clock: String::new(),
-            status_sessions: 1,
+            status: StatusView::default(),
             notice: None,
             link_preview: None,
             update_chip: None,
             update_hit: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
-            status_tabs: (usize::MAX, String::new()),
+            status_cmd: (u64::MAX, String::new()),
             plugins_installed: Vec::new(),
             palette_view: None,
             palette_geom: None,
@@ -1568,8 +1705,13 @@ impl Renderer {
         let chrome = self.title_bar_h + self.status_bar_h;
         let usable_w = (self.config.width as f32 - self.pad * 2.0).max(m.cell_w);
         let usable_h = (self.config.height as f32 - chrome - self.pad).max(m.cell_h);
-        self.cols = (usable_w / m.cell_w).floor().max(1.0) as usize;
-        self.rows = (usable_h / m.cell_h).floor().max(1.0) as usize;
+        let (cols, rows) = ((usable_w / m.cell_w).floor().max(1.0) as usize, (usable_h / m.cell_h).floor().max(1.0) as usize);
+        // the size readout only means something once a first size exists
+        if (cols, rows) != (self.cols, self.rows) && self.cols > 0 {
+            self.size_flash = Some(Instant::now());
+        }
+        self.cols = cols;
+        self.rows = rows;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> (usize, usize) {
@@ -1771,28 +1913,34 @@ impl Renderer {
     pub fn set_hovered(&mut self, h: Option<Hot>) -> bool {
         let changed = self.hovered != h;
         if changed {
-            // restart the fade-in when entering a target; clear it when leaving
-            self.hover_since = h.is_some().then(Instant::now);
+            let now = Instant::now();
+            // the target being left fades out from wherever its fade-in got to
+            self.hover_prev = self.hovered.map(|old| {
+                let shown = self.hover_since.map_or(1.0, |t| motion::progress(t, motion::HOVER_IN));
+                let skip = (1.0 - shown) * motion::HOVER_OUT;
+                (old, now.checked_sub(std::time::Duration::from_secs_f32(skip)).unwrap_or(now))
+            });
+            self.hover_since = h.is_some().then_some(now);
         }
         self.hovered = h;
         changed
     }
 
-    /// hover fade-in factor (0..1) for the currently hovered chrome target
-    fn hover_ease(&self) -> f32 {
-        const DUR: f32 = 0.11;
-        match self.hover_since {
-            None => 1.0,
-            Some(t) => {
-                let e = (t.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0);
-                1.0 - (1.0 - e).powi(3)
-            }
+    /// hover strength (0..1) of one chrome target: eased in while hovered,
+    /// eased out over a longer tail once the pointer leaves
+    fn hover_a(&self, hot: Hot) -> f32 {
+        if self.hovered == Some(hot) {
+            return self.hover_since.map_or(1.0, |t| motion::ease_out(motion::progress(t, motion::HOVER_IN)));
+        }
+        match self.hover_prev {
+            Some((prev, t)) if prev == hot => 1.0 - motion::ease_out(motion::progress(t, motion::HOVER_OUT)),
+            _ => 0.0,
         }
     }
 
-    /// true while the hover fade-in is still in flight (drives redraws)
-    pub fn hover_animating(&self) -> bool {
-        self.hover_since.is_some_and(|t| t.elapsed().as_secs_f32() < 0.11)
+    fn hover_animating(&self) -> bool {
+        self.hover_since.is_some_and(|t| t.elapsed().as_secs_f32() < motion::HOVER_IN)
+            || self.hover_prev.is_some_and(|(_, t)| t.elapsed().as_secs_f32() < motion::HOVER_OUT)
     }
 
     pub fn set_pane_mode(&mut self, on: bool) {
@@ -1942,11 +2090,9 @@ impl Renderer {
         self.scale = scale;
         // re-raster glyphs at the new device scale (clears + repacks the atlas)
         self.atlas.reconfigure(self.content_pt, self.chrome_pt, scale, self.content_font, self.content_line_height, self.content_weight);
-        // pad + bar heights are all scale-derived; recompute from the new metrics
-        self.pad = (10.0 * scale).round();
-        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        self.title_bar_h = (chrome_h + (14.0 * scale)).round();
-        self.status_bar_h = (chrome_h + (8.0 * scale)).round();
+        self.pad = tokens::px(tokens::WINDOW_PAD, scale);
+        self.title_bar_h = tokens::px(tokens::TITLE_BAR, scale);
+        self.status_bar_h = tokens::px(tokens::STATUS_BAR, scale);
         self.recompute_grid_size();
     }
 
@@ -2140,6 +2286,17 @@ impl Renderer {
     /// bell / running / finished command shows a colored dot where its close
     /// icon would sit (0 none, 1 running, 2 done, 3 bell, 4 failed)
     pub fn set_tab_status(&mut self, status: Vec<u8>) {
+        if self.tab_signal.len() != status.len() {
+            self.tab_signal = vec![None; status.len()];
+        }
+        // a background tab's command just finished: its rail draws in
+        if self.tab_status.len() == status.len() {
+            for (i, &s) in status.iter().enumerate() {
+                if (s == 2 || s == 4) && self.tab_status[i] != s && i != self.active_tab {
+                    self.tab_signal[i] = Some(Instant::now());
+                }
+            }
+        }
         self.tab_status = status;
     }
 
@@ -2171,6 +2328,7 @@ impl Renderer {
         if tabs.len() != self.tabs.len() {
             // a tab opened/closed — every rect shifts, so don't slide across it
             self.tab_slide = None;
+            self.tab_signal = vec![None; tabs.len()];
         } else if active != self.active_tab && !self.tabs.is_empty() {
             // a pure switch: slide the accent rail from the old tab to the new
             self.tab_slide = Some((self.active_tab, Instant::now()));
@@ -2179,44 +2337,76 @@ impl Renderer {
         self.active_tab = active;
     }
 
-    const TAB_SLIDE: f32 = 0.13;
-
-    /// eased 0→1 progress of the active-tab rail slide, with the source index;
+    /// spring progress of the active-tab rail slide, with the source index;
     /// None once settled (the rail just sits on the active tab)
     fn tab_slide_p(&self) -> Option<(usize, f32)> {
         let (old, t) = self.tab_slide?;
-        let e = (t.elapsed().as_secs_f32() / Self::TAB_SLIDE).clamp(0.0, 1.0);
-        if e >= 1.0 {
-            None
+        let p = motion::spring(t);
+        (p < 1.0).then_some((old, p))
+    }
+
+    /// a background tab whose command just finished: (rail width 0..1, rail
+    /// alpha, dot alpha) as the rail draws in, holds, then settles into the dot
+    fn tab_signal_phase(&self, i: usize) -> Option<(f32, f32, f32)> {
+        let t = self.tab_signal.get(i).copied().flatten()?.elapsed().as_secs_f32();
+        let held = motion::SIGNAL_DRAW + motion::SIGNAL_HOLD;
+        if t < motion::SIGNAL_DRAW {
+            Some((motion::travel(t / motion::SIGNAL_DRAW), 1.0, 0.0))
+        } else if t < held {
+            Some((1.0, 1.0, 0.0))
+        } else if t < held + motion::SIGNAL_SETTLE {
+            let q = motion::ease_out((t - held) / motion::SIGNAL_SETTLE);
+            Some((1.0, 1.0 - q, q))
         } else {
-            Some((old, 1.0 - (1.0 - e).powi(3)))
+            None
         }
     }
 
-    pub fn tab_animating(&self) -> bool {
-        self.tab_slide
-            .map(|(_, t)| t.elapsed().as_secs_f32() < Self::TAB_SLIDE)
-            .unwrap_or(false)
+    /// any renderer-owned animation is in flight, so the caller keeps a ~60fps
+    /// tick alive until everything settles
+    pub fn animating(&self) -> bool {
+        let live = |since: Option<Instant>, dur: f32| since.is_some_and(|t| t.elapsed().as_secs_f32() < dur);
+        self.startup_fading()
+            || self.hover_animating()
+            || live(self.tab_slide.map(|(_, t)| t), motion::TAB_RAIL)
+            || (self.overlay_shown && live(self.overlay_since, motion::OVERLAY))
+            || live(self.focus_prev.map(|(_, t)| t), motion::FOCUS)
+            || live(self.size_flash, 1.0)
+            || (self.pane_menu_view.is_some() && live(self.menu_hover.map(|(_, t)| t), motion::HOVER_IN))
+            || self
+                .tab_signal
+                .iter()
+                .any(|s| live(*s, motion::SIGNAL_DRAW + motion::SIGNAL_HOLD + motion::SIGNAL_SETTLE))
     }
 
-    const OVERLAY_FADE: f32 = 0.11;
-
-    pub fn overlay_animating(&self) -> bool {
-        self.overlay_shown
-            && self
-                .overlay_since
-                .map(|t| t.elapsed().as_secs_f32() < Self::OVERLAY_FADE)
-                .unwrap_or(false)
+    /// slow ambient wakeups the idle loop still owes: the running dot's breath
+    /// and the command timer. None when nothing on screen moves on its own
+    pub fn ambient_wake_ms(&self) -> Option<u64> {
+        let running = self.tab_status.contains(&1) || matches!(self.status.command, CommandState::Running(_));
+        if !running {
+            None
+        } else if motion::reduced() {
+            Some(1000)
+        } else {
+            Some(50)
+        }
     }
 
-    pub fn set_status(&mut self, git: Option<String>, clock: String, sessions: usize) {
-        self.status_git = git;
-        self.status_clock = clock;
-        self.status_sessions = sessions;
+    /// the soft cursor blink only needs frames while it fades; between fades
+    /// it can sleep until the next one starts
+    pub fn cursor_wake_ms(&self) -> u64 {
+        let p = (self.start.elapsed().as_secs_f32() % motion::CURSOR_PERIOD) / motion::CURSOR_PERIOD;
+        let fading = (0.50..0.62).contains(&p) || p >= 0.88;
+        if fading && !motion::reduced() {
+            16
+        } else {
+            let next = [0.50, 0.88, 1.50].into_iter().find(|&edge| edge > p).unwrap_or(1.50);
+            (((next - p) * motion::CURSOR_PERIOD * 1000.0) as u64).max(1)
+        }
     }
 
-    pub fn status_clock(&self) -> &str {
-        &self.status_clock
+    pub fn set_status(&mut self, status: StatusView) {
+        self.status = status;
     }
 
     pub fn set_palette(&mut self, p: Option<PaletteView>) {
@@ -2229,6 +2419,8 @@ impl Renderer {
     #[cfg(any(test, debug_assertions))]
     pub fn settle_overlay(&mut self) {
         self.overlay_shown = true;
+        let past = Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        self.menu_hover = self.pane_menu_view.as_ref().and_then(|m| m.hovered).map(|i| (i, past));
     }
 
     pub fn set_pane_menu(&mut self, m: Option<PaneMenuView>) {
@@ -2237,17 +2429,21 @@ impl Renderer {
 
     /// clamped (x, y, width, row_h, pad) of the context menu, shared by the
     /// renderer and the hit-test so the two never drift
-    fn pane_menu_geom(&self, mx: f32, my: f32, rows: usize) -> (f32, f32, f32, f32, f32) {
-        let s = self.scale;
+    fn pane_menu_geom(&self, mx: f32, my: f32, items: &[String], swatches: bool) -> (f32, f32, f32, f32, f32) {
+        let t = |pt| tokens::px(pt, self.scale);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let row_h = chrome_h + 10.0 * s;
-        let pad = 8.0 * s;
-        let mw = (172.0 * s).round();
-        let mh = row_h * rows as f32 + pad * 2.0;
+        let row_h = chrome_h + t(tokens::SPACE_M);
+        let pad = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
+        let track = self.track_for(FontId::Chrome);
+        let widest = items.iter().map(|i| self.text_w(FontId::Chrome, i, track)).fold(0.0, f32::max);
+        let swatch = if swatches { t(tokens::SPACE_M) + t(tokens::SPACE_S) } else { 0.0 };
         let w = self.config.width as f32;
         let h = self.config.height as f32;
-        let bx = mx.min(w - mw - 4.0 * s).max(0.0).round();
-        let by = my.min(h - mh - 4.0 * s).max(self.title_bar_h).round();
+        let mw = (widest + swatch + t(tokens::SPACE_M) * 2.0 + pad * 2.0).clamp(t(tokens::MENU_W), t(360.0).min(w - t(tokens::SPACE_S) * 2.0)).round();
+        let mh = row_h * items.len() as f32 + pad * 2.0;
+        let edge = t(tokens::SPACE_XS);
+        let bx = mx.min(w - mw - edge).max(edge).round();
+        let by = my.min(h - mh - edge).max(self.title_bar_h).round();
         (bx, by, mw, row_h, pad)
     }
 
@@ -2255,7 +2451,7 @@ impl Renderer {
     pub fn pane_menu_item_at(&self, px: f32, py: f32) -> Option<usize> {
         let v = self.pane_menu_view.as_ref()?;
         let rows = v.items.len();
-        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v.x, v.y, rows);
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v.x, v.y, &v.items, !v.accents.is_empty());
         if px < bx || px >= bx + mw || py < by + pad || py >= by + pad + row_h * rows as f32 {
             return None;
         }
@@ -2290,13 +2486,9 @@ impl Renderer {
         self.rename_view = r;
     }
 
-    fn chrome_track(&self) -> f32 {
-        (0.06 * self.atlas.metrics(FontId::Chrome).cell_w).max(0.5)
-    }
-
-    /// title-bar buttons, left→right: splitV, splitH, gear, minimize, maximize, close
+    /// title-bar buttons, left→right: splitV, splitH, pane mode, gear, minimize, maximize, close
     fn control_rects(&self) -> [(Hot, f32, f32); 7] {
-        let cw = (46.0 * self.scale).round();
+        let cw = tokens::px(tokens::CONTROL_W, self.scale);
         let w = self.config.width as f32;
         [
             (Hot::SplitV, w - cw * 7.0, w - cw * 6.0),
@@ -2309,55 +2501,76 @@ impl Renderer {
         ]
     }
 
+    /// chrome text tracking for a font: a hair of air between monospace cells
+    fn track_for(&self, font: FontId) -> f32 {
+        (0.04 * self.atlas.metrics(font).cell_w).max(0.5)
+    }
+
+    /// wide tracking for small-caps key labels (status bar keys, section heads)
+    fn key_track(&self) -> f32 {
+        (tokens::KEY_TRACK_EM * self.atlas.metrics(FontId::Small).px).max(1.0)
+    }
+
+    fn badge_size(&self) -> f32 {
+        tokens::px(20.0, self.scale)
+    }
+
     /// where the wordmark ends and tabs begin
     fn tabs_start_x(&self) -> f32 {
-        let m = self.atlas.metrics(FontId::Chrome);
-        let s = self.scale;
+        let t = |pt| tokens::px(pt, self.scale);
         self.pad
-            + m.cell_w                                       // logo mark
-            + (10.0 * s)
-            + self.text_w(FontId::Chrome, "termie", self.chrome_track())
-            + (18.0 * s)
+            + self.badge_size()
+            + t(tokens::SPACE_S)
+            + self.text_w(FontId::Chrome, "termie", self.track_for(FontId::Chrome))
+            + t(tokens::SPACE_M)
     }
 
     fn window_tabs_rect(&self) -> Rect {
-        let badge = (self.title_bar_h * 0.6).round();
-        (0.0, 0.0, self.pad + badge + 6.0 * self.scale, self.title_bar_h)
+        (0.0, 0.0, self.pad + self.badge_size() + tokens::px(tokens::SPACE_XS, self.scale), self.title_bar_h)
     }
 
     fn tab_layout(&self) -> TabLayout {
         let s = self.scale;
+        let t = |pt| tokens::px(pt, s);
         let h = self.title_bar_h;
-        let cw = (46.0 * s).round();
-        let newtab_w = (40.0 * s).round();
-        let chev_w = (16.0 * s).round();
+        let cw = t(tokens::CONTROL_W);
+        let newtab_w = t(tokens::SPACE_2XL);
+        let chev_w = t(20.0);
         let start = self.tabs_start_x();
         // reserve all 7 title-bar control buttons (control_rects starts at w-7cw,
         // the SplitV slot) so the new-tab '+' and its chevron never overrun the
         // split icon
         let controls_start = self.config.width as f32 - cw * 7.0;
-        let avail = (controls_start - start - newtab_w - chev_w - 4.0 * s).max(0.0);
-        let n = self.tabs.len();
+        let avail = (controls_start - start - newtab_w - chev_w - t(tokens::SPACE_S)).max(0.0);
 
+        // each tab sizes to its label plus the insets and the close slot,
+        // clamped; when the strip overflows the widest tabs give way first, and
+        // past that every tab shares the room evenly (labels truncate) so all
+        // stay visible and clickable
+        let cc = t(tokens::SPACE_L);
+        let track = self.track_for(FontId::Chrome);
+        let natural: Vec<f32> = self
+            .tabs
+            .iter()
+            .map(|label| {
+                let label_w = self.text_w(FontId::Chrome, label, track);
+                (t(tokens::TAB_INSET) + label_w + t(tokens::SPACE_XS) + cc + t(tokens::SPACE_S))
+                    .clamp(t(tokens::TAB_MIN), t(tokens::TAB_MAX))
+            })
+            .collect();
+        let widths = fit_widths(&natural, avail);
         let mut tabs = Vec::new();
-        // shrink-to-fit: every tab stays visible and clickable no matter how
-        // many are open (a hard 54px floor used to slide the strip under the
-        // window controls and push the '+' off-screen)
-        let tab_w = if n == 0 {
-            0.0
-        } else {
-            (avail / n as f32).min(200.0 * s).max(1.0)
-        };
-        // below this the close target would eat the whole tab; drop it and
-        // give the label the full width (middle-click still closes)
-        let cc = if tab_w >= 34.0 * s { (18.0 * s).round() } else { 0.0 };
-        for i in 0..n {
-            let x = start + i as f32 * tab_w;
-            let rect = (x, 0.0, tab_w, h);
-            let close = (x + tab_w - cc - 6.0 * s, (h - cc) / 2.0, cc, cc);
+        let mut x = start;
+        for (i, &tab_w) in widths.iter().enumerate() {
+            // below this the close target would eat the whole tab; drop it and
+            // give the label the full width (middle-click still closes)
+            let c = if tab_w >= cc * 2.5 { cc } else { 0.0 };
+            let rect = (x.round(), 0.0, tab_w.round(), h);
+            let close = ((x + tab_w - c - t(tokens::SPACE_S)).round(), ((h - c) / 2.0).round(), c, c);
             tabs.push((i, rect, close));
+            x += tab_w;
         }
-        let newtab_x = start + n as f32 * tab_w + 4.0 * s;
+        let newtab_x = (x + t(tokens::SPACE_XS)).round();
         TabLayout {
             tabs,
             newtab: (newtab_x, 0.0, newtab_w, h),
@@ -2496,7 +2709,8 @@ impl Renderer {
         let (op_dec, op_inc) = stepper(val_x, opacity_l);
         let (lh_dec, lh_inc) = stepper(val_x, line_height_l);
         let (sb_dec, sb_inc) = stepper(val_x, scrollback_l);
-        let fontfam_btn = (val_x, ay(fontfam_l), cluster, bh);
+        // font names run long; this field gets more room than the steppers
+        let fontfam_btn = (val_x, ay(fontfam_l), (cluster * 1.6).round(), bh);
         let cursor_btn = (val_x, ay(cursor_l), cluster, bh);
         let blink_btn = (val_x, ay(blink_l), cluster, bh);
         let boldbright_btn = (val_x, ay(boldbright_l), cluster, bh);
@@ -2797,7 +3011,62 @@ impl Renderer {
             uv_max: [0.0, 0.0],
             color: [lin[0], lin[1], lin[2], alpha],
             kind: 0,
-            _pad: [0; 3],
+            shape: [0.0; 3],
+        });
+    }
+
+    // a flat geometry helper like push_rect; a struct would only add noise
+    #[allow(clippy::too_many_arguments)]
+    fn push_round(out: &mut Vec<Instance>, x: f32, y: f32, w: f32, h: f32, r: f32, rgb: Rgb, alpha: f32) {
+        Self::push_shape(out, (x, y, w, h), [r, 0.0, 0.0], rgb, alpha);
+    }
+
+    /// rounded outline `t` px wide, drawn inside the rect
+    #[allow(clippy::too_many_arguments)]
+    fn push_ring(out: &mut Vec<Instance>, rect: Rect, r: f32, t: f32, rgb: Rgb, alpha: f32) {
+        Self::push_shape(out, rect, [r, 0.0, t], rgb, alpha);
+    }
+
+    /// soft shadow under a rounded rect: the rect dropped by `dy` and blurred
+    /// over `blur` px on every side
+    #[allow(clippy::too_many_arguments)]
+    fn push_shadow(out: &mut Vec<Instance>, rect: Rect, r: f32, blur: f32, dy: f32, rgb: Rgb, alpha: f32) {
+        let (x, y, w, h) = rect;
+        let blur = blur.max(0.5);
+        Self::push_shape(out, (x - blur, y + dy - blur, w + blur * 2.0, h + blur * 2.0), [r, blur, 0.0], rgb, alpha);
+    }
+
+    fn push_shape(out: &mut Vec<Instance>, rect: Rect, shape: [f32; 3], rgb: Rgb, alpha: f32) {
+        let (x, y, w, h) = rect;
+        let lin = rgb.to_linear_f32();
+        out.push(Instance {
+            pos: [x, y],
+            size: [w, h],
+            uv_min: [0.0, 0.0],
+            uv_max: [w, h],
+            color: [lin[0], lin[1], lin[2], alpha],
+            kind: 4,
+            shape,
+        });
+    }
+
+    /// a chrome icon centered in `rect`, `size` px square
+    #[allow(clippy::too_many_arguments)]
+    fn draw_icon(atlas: &mut GlyphAtlas, out: &mut Vec<Instance>, icon: Icon, rect: Rect, size: f32, stroke: f32, rgb: Rgb, alpha: f32) {
+        let size = size.round().max(1.0);
+        let Some(g) = atlas.get_icon(icon, size as u32, stroke) else {
+            return;
+        };
+        let (x, y, w, h) = rect;
+        let lin = rgb.to_linear_f32();
+        out.push(Instance {
+            pos: [(x + (w - size) / 2.0).round(), (y + (h - size) / 2.0).round()],
+            size: [g.width, g.height],
+            uv_min: g.uv_min,
+            uv_max: g.uv_max,
+            color: [lin[0], lin[1], lin[2], alpha],
+            kind: 1,
+            shape: [0.0; 3],
         });
     }
 
@@ -2811,7 +3080,7 @@ impl Renderer {
             uv_max: [1.0, 1.0],
             color: [1.0, 1.0, 1.0, alpha],
             kind: 2,
-            _pad: [0; 3],
+            shape: [0.0; 3],
         });
     }
 
@@ -3026,7 +3295,7 @@ impl Renderer {
                 uv_max: [g.uv_max[0], g.uv_min[1] + uspan * uf1],
                 color: [0.0, 0.0, 0.0, 1.0],
                 kind: 3,
-                _pad: [0; 3],
+                shape: [0.0; 3],
             });
         }
     }
@@ -3084,7 +3353,7 @@ impl Renderer {
             uv_max: [g.uv_min[0] + us * (ix1 - fx) / fw, g.uv_min[1] + vs * (iy1 - fy) / fh],
             color: [0.0, 0.0, 0.0, 1.0],
             kind: 3,
-            _pad: [0; 3],
+            shape: [0.0; 3],
         });
     }
 
@@ -3098,8 +3367,8 @@ impl Renderer {
         ox: f32,
         oy: f32,
         focused: bool,
-        blink_on: bool,
-        blink_phase: bool,
+        blink_on: f32,
+        blink_phase: f32,
         beam_w: f32,
         style: CursorShape,
         sel: Option<SelSpan>,
@@ -3239,7 +3508,7 @@ impl Renderer {
                     fg = crate::color::apply_min_contrast(fg, bg, min_contrast);
                 }
                 // blinking cells hide their glyph + decorations on the off phase
-                let blink_hidden = cell.attrs.blink() && !blink_on;
+                let blink_hidden = cell.attrs.blink() && blink_on < 0.5;
 
                 let x = ox + c as f32 * cell_w;
                 let y = oy + r as f32 * cell_h;
@@ -3267,18 +3536,10 @@ impl Renderer {
                     // configured default is steady
                     let cur_on = match cur.shape_blink {
                         Some(true) => blink_phase,
-                        Some(false) => true,
+                        Some(false) => 1.0,
                         None => blink_on,
                     };
-                    let alpha = if focused {
-                        if cur_on {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.4
-                    };
+                    let alpha = if focused { cur_on } else { 0.4 };
                     // an app's DECSCUSR shape overrides the configured default
                     let shape = if cur.shape_set { cur.shape } else { style };
                     if alpha > 0.0 {
@@ -3299,7 +3560,7 @@ impl Renderer {
                                 };
                                 if focused {
                                     Self::push_rect(out, x, y, cw, cell_h, palette.cursor, alpha);
-                                    fg = palette.bg;
+                                    fg = fg.lerp(palette.bg, alpha);
                                 } else {
                                     // an unfocused pane shows a hollow block so
                                     // the glyph under it stays readable
@@ -3418,7 +3679,7 @@ impl Renderer {
                                     uv_max: g.uv_max,
                                     color: [lin[0], lin[1], lin[2], 1.0],
                                     kind: 1,
-                                    _pad: [0; 3],
+                                    shape: [0.0; 3],
                                 });
                                 liga_until = c + run_len;
                                 ran = true;
@@ -3454,7 +3715,7 @@ impl Renderer {
                                     uv_max: g.uv_max,
                                     color: [lin[0], lin[1], lin[2], 1.0],
                                     kind: if g.color { 3 } else { 1 },
-                                    _pad: [0; 3],
+                                    shape: [0.0; 3],
                                 });
                             }
                         }
@@ -3592,7 +3853,7 @@ impl Renderer {
                     uv_max: g.uv_max,
                     color: [fg_lin[0], fg_lin[1], fg_lin[2], 1.0],
                     kind: if g.color { 3 } else { 1 },
-                    _pad: [0; 3],
+                    shape: [0.0; 3],
                 });
             }
             off += w;
@@ -3653,7 +3914,7 @@ impl Renderer {
                         uv_max: g.uv_max,
                         color: [lin[0], lin[1], lin[2], alpha],
                         kind: if g.color { 3 } else { 1 },
-                        _pad: [0; 3],
+                        shape: [0.0; 3],
                     });
                 }
             x += m.cell_w + track;
@@ -3668,7 +3929,7 @@ impl Renderer {
     }
 
     #[allow(non_snake_case)]
-    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32, bare: bool) -> Vec<Instance> {
+    fn build(&mut self, panes: &[PaneView], focused: bool, maximized: bool, bare: bool) -> Vec<Instance> {
         self.atlas.begin_frame();
         // chrome colors come from the active theme's palette
         let INK_0 = self.palette.ink0;
@@ -3685,12 +3946,12 @@ impl Renderer {
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let hair = self.scale.max(1.0);
-        let track = (0.06 * self.atlas.metrics(FontId::Chrome).cell_w).max(0.5);
-        // slow blink ~1.06s period, on for the first ~600ms. the raw phase is
-        // kept separate so a DECSCUSR blinking-variant cursor can follow the
-        // clock even when the configured default is steady
-        let blink_phase = (self.start.elapsed().as_millis() % 1060) < 600;
-        let blink_on = !self.cursor_blink || blink_phase;
+        let track = self.track_for(FontId::Chrome);
+        // soft blink: the cursor eases out and back in once per period. the raw
+        // phase is kept separate so a DECSCUSR blinking-variant cursor can
+        // follow the clock even when the configured default is steady
+        let blink_phase = motion::cursor_blink(self.start.elapsed().as_secs_f32());
+        let blink_on = if self.cursor_blink { blink_phase } else { 1.0 };
         let beam_w = (2.0 * self.scale).round().max(1.0);
 
         // reuse the persistent scratch buffer: keeps its capacity across frames
@@ -3723,7 +3984,7 @@ impl Renderer {
                 uv_max: g.uv_max,
                 color: [0.0, 0.0, 0.0, self.bg_image_alpha],
                 kind: 3,
-                _pad: [0; 3],
+                shape: [0.0; 3],
             });
         }
 
@@ -3733,7 +3994,7 @@ impl Renderer {
         pane_info.clear();
         pane_info.extend(panes.iter().map(|p| {
             let (ox, oy, _, _) = self.pane_metrics(p.rect);
-            (ox, oy, p.focused, p.rect)
+            (ox, oy, p.focused, p.rect, self.palette.bg)
         }));
 
         // ---- terminal content (one grid per pane) ----
@@ -3760,7 +4021,7 @@ impl Renderer {
             let theme = self.theme;
             let atlas = &mut self.atlas;
             let find_view = self.find_view.as_ref();
-            for (pv, info) in panes.iter().zip(&pane_info) {
+            for (pv, info) in panes.iter().zip(pane_info.iter_mut()) {
                 let themed = pv.theme.filter(|&id| id != theme);
                 let mut pal = themed
                     .and_then(|id| pane_palettes.iter().find(|(t, _)| *t == id))
@@ -3774,6 +4035,7 @@ impl Renderer {
                     dyn_pal = pal.with_dyn(&pv.term.colors);
                     pal = &dyn_pal;
                 }
+                info.4 = pal.bg;
                 if themed.is_some() || pv.term.colors.bg.is_some() {
                     // an overridden pane owns its background: draw_grid skips
                     // default-bg cells, which would otherwise show the window
@@ -3814,72 +4076,72 @@ impl Renderer {
             }
         }
 
-        // dividers + focus border (only meaningful with more than one pane).
-        // the focused pane gets a dim PAPER-accent outline so it reads at a
-        // glance across a cockpit of panes; thinner than the bell flash
-        // (hair vs hair*2) so the two never read as the same signal
+        // panes meet on one shared hairline, and focus reads as the other
+        // panes settling back (a dim toward their background) rather than as
+        // a box drawn around the focused one
         if panes.len() > 1 {
-            for (_, _, _, rect) in &pane_info {
-                Self::stroke_rect(&mut out, *rect, hair, RULE);
+            let focus_now = pane_info.iter().find(|i| i.2).map(|i| i.3);
+            if focus_now != self.focus_rect {
+                // crossfade only between panes that both still exist; a split,
+                // close, or resize moves the rects and just snaps
+                self.focus_prev = self
+                    .focus_rect
+                    .filter(|r| pane_info.iter().any(|i| i.3 == *r))
+                    .map(|r| (r, Instant::now()));
+                self.focus_rect = focus_now;
             }
-            for (_, _, foc, rect) in &pane_info {
-                if *foc {
-                    // ease the accent border in on focus change (1.0 once settled)
-                    Self::stroke_rect_a(&mut out, *rect, hair, PAPER, 0.55 * focus_ease);
+            let swap = self.focus_prev.and_then(|(r, t)| motion::fade(Some(t), motion::FOCUS).map(|e| (r, e)));
+            if swap.is_none() {
+                self.focus_prev = None;
+            }
+            for info in &pane_info {
+                let dim = match swap {
+                    Some((_, e)) if info.2 => 1.0 - e,
+                    Some((r, e)) if r == info.3 => e,
+                    _ if info.2 => 0.0,
+                    _ => 1.0,
+                };
+                if dim > 0.0 {
+                    let (x, y, pw, ph) = info.3;
+                    Self::push_rect(&mut out, x, y, pw, ph, info.4, tokens::PANE_DIM * dim);
                 }
             }
-        }
-        if self.pane_mode {
-            for (_, _, focused, (x, y, pw, ph)) in &pane_info {
-                Self::stroke_rect_a(
-                    &mut out,
-                    (*x, *y, *pw, *ph),
-                    hair * 2.0,
-                    PAPER,
-                    if *focused { 0.85 } else { 0.4 },
-                );
-                let grip_w = (30.0 * self.scale).round().min((*pw - hair * 4.0).max(0.0));
-                let grip_h = (8.0 * self.scale).round();
-                if grip_w >= hair * 8.0 {
-                    let gx = (*x + (*pw - grip_w) / 2.0).round();
-                    Self::push_rect(&mut out, gx, *y, grip_w, grip_h, INK_0, 0.96);
-                    Self::stroke_rect_a(&mut out, (gx, *y, grip_w, grip_h), hair, PAPER, 0.8);
-                    let tick_h = (grip_h - hair * 4.0).max(hair);
-                    let gap = (4.0 * self.scale).round();
-                    let first = (gx + grip_w / 2.0 - gap * 1.5).round();
-                    for i in 0..4 {
-                        Self::push_rect(
-                            &mut out,
-                            first + i as f32 * gap,
-                            *y + hair * 2.0,
-                            hair,
-                            tick_h,
-                            PAPER,
-                            0.9,
-                        );
+            for (i, a) in pane_info.iter().enumerate() {
+                for b in &pane_info[i + 1..] {
+                    if let Some((x, y, sw, sh)) = pane_seam(a.3, b.3, pad * 2.0 + 1.0, hair) {
+                        Self::push_rect(&mut out, x, y, sw, sh, RULE, 1.0);
                     }
                 }
             }
         }
-        // bell flash: accent border on any pane that just rang (even single
-        // pane), its opacity eased out by the caller so it fades rather than snaps
+        if self.pane_mode {
+            for (_, _, focused, (x, y, pw, ph), _) in &pane_info {
+                Self::stroke_rect_a(&mut out, (*x, *y, *pw, *ph), hair, PAPER, if *focused { 0.9 } else { 0.35 });
+                let grip_w = tokens::px(tokens::SPACE_2XL, self.scale).min((*pw - hair * 4.0).max(0.0));
+                let grip_h = tokens::px(tokens::SPACE_XS, self.scale);
+                if grip_w >= hair * 8.0 {
+                    let gx = (*x + (*pw - grip_w) / 2.0).round();
+                    let gy = *y + tokens::px(tokens::SPACE_XS, self.scale);
+                    Self::push_round(&mut out, gx, gy, grip_w, grip_h, grip_h / 2.0, PAPER, if *focused { 0.9 } else { 0.45 });
+                }
+            }
+        }
+        let brass = self.palette.ansi_color(3);
+        let dot_d = tokens::px(tokens::DOT, self.scale).max(4.0);
+        let dot_inset = tokens::px(tokens::SPACE_S, self.scale);
         for (pv, info) in panes.iter().zip(&pane_info) {
+            // bell: a warm glow pooled along the pane's inner edge that decays,
+            // never a border, so it can't be mistaken for focus
             if pv.flash > 0.0 {
-                Self::stroke_rect_a(&mut out, info.3, hair * 2.0, PAPER, pv.flash);
+                for (width, a) in [(2.0, 0.22), (6.0, 0.12), (14.0, 0.06)] {
+                    Self::push_ring(&mut out, info.3, 0.0, tokens::px(width, self.scale), brass, a * pv.flash);
+                }
             }
             // command badge: a corner dot answering "which agents are still
             // working, which finished" at a glance across splits
-            if pv.status != 0 {
+            if let Some((dot, da)) = self.status_dot(pv.status) {
                 let (rx, ry, rw, _rh) = info.3;
-                let d = (6.0 * self.scale).round().max(4.0);
-                let pad = (6.0 * self.scale).round();
-                let (dot, da) = match pv.status {
-                    1 => (self.palette.mute, 0.9),
-                    2 => (self.palette.ansi_color(2), 1.0),
-                    4 => (self.palette.ansi_color(1), 1.0),
-                    _ => (PAPER, 1.0),
-                };
-                Self::push_rect(&mut out, rx + rw - d - pad, ry + pad, d, d, dot, da);
+                Self::push_round(&mut out, rx + rw - dot_d - dot_inset, ry + dot_inset, dot_d, dot_d, dot_d / 2.0, dot, da);
             }
         }
         if let Some(((x, y, w, h), side)) = self.pane_drop {
@@ -3889,8 +4151,11 @@ impl Renderer {
                 PaneDropSide::Top => (x, y, w, h / 2.0),
                 PaneDropSide::Bottom => (x, y + h / 2.0, w, h / 2.0),
             };
-            Self::push_rect(&mut out, target.0, target.1, target.2, target.3, PAPER, 0.16);
-            Self::stroke_rect_a(&mut out, target, hair * 2.0, PAPER, 0.9);
+            let r = tokens::px(tokens::RADIUS_ROW, self.scale);
+            let inset = tokens::px(tokens::SPACE_XS, self.scale);
+            let target = (target.0 + inset, target.1 + inset, target.2 - inset * 2.0, target.3 - inset * 2.0);
+            Self::push_shape(&mut out, target, [r, 0.0, 0.0], PAPER, 0.14);
+            Self::push_ring(&mut out, target, r, hair * 1.5, PAPER, 0.85);
         }
         // last use of pane_info — hand the buffer back so its capacity persists
         self.pane_scratch = pane_info;
@@ -3906,89 +4171,86 @@ impl Renderer {
             self.draw_dock(&mut out, track);
         }
 
+        let s = self.scale;
+        let t = |pt: f32| tokens::px(pt, s);
+        let tbh = self.title_bar_h;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let cw_c = self.atlas.metrics(FontId::Chrome).cell_w;
-        let text_top = ((self.title_bar_h - chrome_h) / 2.0).round();
-        let he = self.hover_ease();
+        let text_top = ((tbh - chrome_h) / 2.0).round();
+        let icon = t(tokens::ICON);
+        let stroke = hair;
 
         // ---- title bar (flat opaque instrument) ----
         // fill the bar with the content background, not a darker ink, so the bar
-        // never reads as a dark band above the content the way a darker fill does
-        // against the gradient's lighter top row (the two-tone trim still divides
-        // chrome from content)
-        Self::push_rect(&mut out, 0.0, 0.0, w, self.title_bar_h, BG, 1.0);
+        // never reads as a dark band above the content (the two-tone trim
+        // still divides chrome from content)
+        Self::push_rect(&mut out, 0.0, 0.0, w, tbh, BG, 1.0);
         // two-tone trim under the bar: a brighter seam over a darker shadow line
         // reads as a machined edge between chrome and content (instrument depth)
-        Self::push_rect(&mut out, 0.0, self.title_bar_h - hair * 2.0, w, hair, RULE_2, 1.0);
-        Self::push_rect(&mut out, 0.0, self.title_bar_h - hair, w, hair, RULE, 1.0);
+        Self::push_rect(&mut out, 0.0, tbh - hair * 2.0, w, hair, RULE_2, 1.0);
+        Self::push_rect(&mut out, 0.0, tbh - hair, w, hair, RULE, 1.0);
 
-        if self.hovered == Some(Hot::WindowTabs) {
+        let wa = self.hover_a(Hot::WindowTabs);
+        if wa > 0.0 {
             let (x, _, width, _) = self.window_tabs_rect();
-            Self::push_rect(&mut out, x, hair, width, self.title_bar_h - hair * 2.0, INK_3, he);
+            Self::push_rect(&mut out, x, 0.0, width, tbh - hair * 2.0, INK_3, wa);
         }
 
         // app-icon badge (the ">_<" mark) + wordmark
-        let badge = (self.title_bar_h * 0.6).round();
-        let badge_y = ((self.title_bar_h - badge) / 2.0).round();
+        let badge = self.badge_size();
+        let badge_y = ((tbh - badge) / 2.0).round();
         Self::push_icon(&mut out, pad, badge_y, badge, 1.0);
-        let wx = pad + badge + (9.0 * self.scale).round();
-        let _ = Self::draw_text(
-            &mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", TEXT_2, 1.0, track,
-        );
+        let wx = pad + badge + t(tokens::SPACE_S);
+        let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", TEXT_2, 1.0, track);
 
-        // tabs — snapshot to owned data so the atlas can be borrowed mutably
+        // tabs: snapshot to owned data so the atlas can be borrowed mutably
         let tl = self.tab_layout();
         let active_tab = self.active_tab;
-        let tab_items: Vec<TabItem> =
-            tl.tabs
-                .iter()
-                .map(|(i, rect, close)| {
-                    (
-                        *i,
-                        *rect,
-                        *close,
-                        self.tabs.get(*i).cloned().unwrap_or_default(),
-                        *i == active_tab,
-                        self.hovered == Some(Hot::Tab(*i)),
-                        self.hovered == Some(Hot::TabClose(*i)),
-                        self.tab_status.get(*i).copied().unwrap_or(0),
-                        self.tab_colors.get(*i).copied().flatten(),
-                    )
-                })
-                .collect();
-        let newtab_rect = tl.newtab;
-        let newtab_hover = self.hovered == Some(Hot::NewTab);
-        let newtab_menu_rect = tl.newtab_menu;
-        let newtab_menu_hover = self.hovered == Some(Hot::NewTabMenu);
-        for (_, rect, close, label, active, hov, close_hov, attn, tint) in &tab_items {
+        let tab_items: Vec<TabItem> = tl
+            .tabs
+            .iter()
+            .map(|(i, rect, close)| {
+                (
+                    *i,
+                    *rect,
+                    *close,
+                    self.tabs.get(*i).cloned().unwrap_or_default(),
+                    *i == active_tab,
+                    self.hover_a(Hot::Tab(*i)).max(self.hover_a(Hot::TabClose(*i))),
+                    self.hover_a(Hot::TabClose(*i)),
+                    self.tab_status.get(*i).copied().unwrap_or(0),
+                    self.tab_colors.get(*i).copied().flatten(),
+                )
+            })
+            .collect();
+        let bar_y = hair;
+        let bar_h = tbh - hair * 3.0;
+        let rail_h = t(tokens::TAB_RAIL).max(hair * 2.0);
+        let rail_y = tbh - hair * 2.0 - rail_h;
+        let rail_inset = t(tokens::SPACE_S);
+        let cw_c = self.atlas.metrics(FontId::Chrome).cell_w + track;
+        for (i, rect, close, label, active, ha, close_ha, attn, tint) in &tab_items {
             let (tx, _ty, tw, _th) = *rect;
             if *active {
-                Self::push_rect(&mut out, tx, hair, tw, self.title_bar_h - hair * 2.0, INK_4, 1.0);
-                // the accent underline is drawn after the loop so it can slide
-            } else if *hov {
-                Self::push_rect(&mut out, tx, hair, tw, self.title_bar_h - hair * 2.0, INK_3, he);
+                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, INK_4, 1.0);
+            } else if *ha > 0.0 {
+                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, INK_3, *ha);
             }
             // a user-picked tab color washes over the base fill, stronger on
             // the active tab so the tint reads without drowning the label
             if let Some(ci) = tint {
                 let c = self.palette.ansi_color(*ci);
-                let a = if *active { 0.28 } else { 0.14 };
-                Self::push_rect(&mut out, tx, hair, tw, self.title_bar_h - hair * 2.0, c, a);
+                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, c, if *active { 0.28 } else { 0.14 });
             }
-            Self::push_rect(&mut out, tx, hair, hair, self.title_bar_h - hair * 2.0, RULE, 1.0);
 
-            // the close icon shows only on the active or hovered tab, so an idle
-            // tab gives its whole width to the label — legible names instead of the
-            // one-char truncation a busy title bar / hidpi otherwise forces.
-            // very narrow tabs (a packed strip) drop the close target entirely
-            let show_close = (*active || *hov) && close.2 > 0.0;
-            let label_end = if show_close { close.0 } else { tx + tw - 8.0 * self.scale };
-            let avail = (label_end - (tx + 10.0 * self.scale)).max(0.0);
-            let maxc = (avail / cw_c).floor().max(0.0) as usize;
+            // the close slot is always reserved so a tab never changes width on
+            // hover; the close icon shows in it on the active or hovered tab,
+            // and a status dot holds it otherwise
+            let show_close = (*active || *ha > 0.0) && close.2 > 0.0;
+            let label_x = tx + t(tokens::TAB_INSET);
+            let label_end = if close.2 > 0.0 { close.0 - t(tokens::SPACE_XS) } else { tx + tw - t(tokens::SPACE_S) };
+            let maxc = ((label_end - label_x).max(0.0) / cw_c).floor() as usize;
             // borrow the already-owned snapshot label; only allocate when the
-            // label actually needs truncating (the common case fits as-is).
-            // a strip too packed even for "x…" keeps maxc chars bare — the old
-            // full-label fallback overflowed into every neighboring tab
+            // label actually needs truncating (the common case fits as-is)
             let truncated;
             let lab: &str = if label.chars().count() > maxc {
                 truncated = if maxc > 1 {
@@ -4000,41 +4262,49 @@ impl Renderer {
             } else {
                 label
             };
-            let lc = if *active { TEXT_2 } else { MUTE };
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, tx + 10.0 * self.scale, text_top, lab, lc, 1.0, track,
-            );
-            // close icon (nerd-font times), easing brighter on hover; only on the
-            // active or hovered tab so idle tabs keep their label space
+            let la = if *active { 1.0 } else { tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha };
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, TEXT_2, la, track);
+
+            let signal = if *active { None } else { self.tab_signal_phase(*i) };
+            if let Some((reach, rail_a, _)) = signal
+                && (*attn == 2 || *attn == 4)
+            {
+                let c = self.palette.ansi_color(if *attn == 4 { 1 } else { 2 });
+                let full = tw - rail_inset * 2.0;
+                Self::push_round(&mut out, tx + rail_inset, rail_y, full * reach, rail_h, rail_h / 2.0, c, rail_a);
+            }
             if show_close {
-                let (cx, cy, ccw, _cch) = *close;
-                let cbase = if *active { MUTE } else { RULE_2 };
-                let cc = if *close_hov { cbase.lerp(PAPER, he) } else { cbase };
-                let cgx = (cx + (ccw - cw_c) / 2.0).round();
-                let _ = Self::draw_text(
-                    &mut self.atlas, &mut out, FontId::Chrome, cgx, cy.round(), "\u{f00d}", cc, 1.0, track,
-                );
-            } else if *attn != 0 {
-                // badge dot in the close icon's slot, so it never shifts the
-                // label; hovering swaps it back for the close icon. color says
-                // what happened: bell keeps the classic paper dot, a finished
-                // command goes green (red when it failed), running stays dim
-                let d = (5.0 * self.scale).round().max(3.0);
-                let (cx, _cy, ccw, _cch) = *close;
-                let dx = (cx + (ccw - d) / 2.0).round();
-                let dy = ((self.title_bar_h - d) / 2.0).round();
-                let (dot, da) = match *attn {
-                    1 => (self.palette.mute, 0.9),
-                    2 => (self.palette.ansi_color(2), 1.0),
-                    4 => (self.palette.ansi_color(1), 1.0),
-                    _ => (PAPER, 1.0),
-                };
-                Self::push_rect(&mut out, dx, dy, d, d, dot, da);
+                let (cx, cy, ccw, cch) = *close;
+                if *close_ha > 0.0 {
+                    Self::push_round(&mut out, cx, cy, ccw, cch, t(tokens::RADIUS_CHIP), TEXT_2, 0.12 * close_ha);
+                }
+                let base = if *active { MUTE } else { MUTE.lerp(BG, 0.3) };
+                let c = base.lerp(TEXT_2, *close_ha);
+                Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(8.0), stroke, c, 1.0);
+            } else if let Some((dot, da)) = self.status_dot(*attn) {
+                let dot_a = signal.map_or(1.0, |(_, _, d)| d);
+                if dot_a > 0.0 {
+                    let d = t(tokens::DOT).max(4.0);
+                    let (cx, _cy, ccw, _cch) = *close;
+                    let slot = if ccw > 0.0 { cx + (ccw - d) / 2.0 } else { tx + tw - d - t(tokens::SPACE_S) };
+                    Self::push_round(&mut out, slot.round(), ((tbh - d) / 2.0).round(), d, d, d / 2.0, dot, da * dot_a);
+                }
+            }
+        }
+        // hairline dividers between neighboring inactive tabs; hidden beside
+        // the active or hovered tab so the lit tab stands on clean ground
+        let div_h = t(tokens::TAB_DIVIDER);
+        for pair in tab_items.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let quiet = 1.0 - a.5.max(b.5);
+            if !a.4 && !b.4 && quiet > 0.0 {
+                let x = (b.1.0 - hair / 2.0).round();
+                Self::push_rect(&mut out, x, ((tbh - div_h) / 2.0).round(), hair, div_h, RULE_2, 0.5 * quiet);
             }
         }
 
-        // active-tab accent rail: slides from the old tab to the new on a switch,
-        // otherwise sits on the active tab
+        // active-tab accent rail: a short rounded bar inset from the tab edges
+        // that springs from the old tab to the new on a switch
         if let Some(item) = tab_items.iter().find(|t| t.0 == active_tab) {
             let (ax, _, aw, _) = item.1;
             let (ux, uw) = match self
@@ -4046,184 +4316,85 @@ impl Renderer {
             };
             // a tinted active tab colors its rail too
             let rail = item.8.map(|ci| self.palette.ansi_color(ci)).unwrap_or(PAPER);
-            Self::push_rect(&mut out, ux, self.title_bar_h - hair * 2.0, uw, hair * 2.0, rail, 1.0);
+            Self::push_round(&mut out, ux + rail_inset, rail_y, uw - rail_inset * 2.0, rail_h, rail_h / 2.0, rail, 1.0);
         }
         if let Some(index) = self.tab_drop {
             let x = tab_items
                 .get(index)
                 .map(|tab| tab.1.0)
                 .or_else(|| tab_items.last().map(|tab| tab.1.0 + tab.1.2))
-                .unwrap_or(newtab_rect.0);
-            let marker_w = (3.0 * self.scale).round().max(hair * 2.0);
-            Self::push_rect(
-                &mut out,
-                x - marker_w / 2.0,
-                hair * 3.0,
-                marker_w,
-                self.title_bar_h - hair * 6.0,
-                PAPER,
-                1.0,
-            );
+                .unwrap_or(tl.newtab.0);
+            let marker_w = t(3.0).max(hair * 2.0);
+            let my = t(tokens::SPACE_S);
+            Self::push_round(&mut out, x - marker_w / 2.0, my, marker_w, tbh - my * 2.0, marker_w / 2.0, PAPER, 1.0);
         }
 
-        // new-tab button (nerd-font plus) and its profile-menu chevron; the two
-        // hover apart so the '+' keeps opening a default tab while the chevron
-        // drops the shell list
-        {
-            let (nx, _ny, nw, _nh) = newtab_rect;
-            if newtab_hover {
-                Self::push_rect(&mut out, nx, hair, nw, self.title_bar_h - hair * 2.0, INK_3, he);
+        // new-tab '+' and its profile chevron: rounded chips that hover apart
+        // so '+' keeps opening a default tab while the chevron drops the list
+        for (rect, hot, glyph) in [(tl.newtab, Hot::NewTab, Icon::Plus), (tl.newtab_menu, Hot::NewTabMenu, Icon::Chevron)] {
+            let a = self.hover_a(hot);
+            let (x, _, bw, _) = rect;
+            let chip_h = t(26.0);
+            let chip = (x + t(tokens::SPACE_2XS), ((tbh - chip_h) / 2.0).round(), bw - t(tokens::SPACE_XS), chip_h);
+            if a > 0.0 {
+                Self::push_shape(&mut out, chip, [t(tokens::RADIUS_ROW), 0.0, 0.0], INK_3, a);
             }
-            let ngx = (nx + (nw - cw_c) / 2.0).round();
-            let ncol = if newtab_hover { TEXT_2 } else { MUTE };
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, ngx, text_top, "\u{f067}", ncol, 1.0, track,
-            );
-            let (mx, _my, mw, _mh) = newtab_menu_rect;
-            if newtab_menu_hover {
-                Self::push_rect(&mut out, mx, hair, mw, self.title_bar_h - hair * 2.0, INK_3, he);
-            }
-            let mgx = (mx + (mw - cw_c) / 2.0).round();
-            let mcol = if newtab_menu_hover { TEXT_2 } else { MUTE };
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, mgx, text_top, "\u{f107}", mcol, 1.0, track,
-            );
+            Self::draw_icon(&mut self.atlas, &mut out, glyph, chip, icon, stroke, MUTE.lerp(TEXT_2, a), 1.0);
         }
 
-        // title-bar buttons: split right|left, split top/bottom, gear, min, max, close.
-        // the split icons are drawn procedurally below (like pane-mode), not glyphs
-        let glyphs = [
-            (Hot::SplitV, ""),
-            (Hot::SplitH, ""),
-            (Hot::PaneMode, ""),
-            (Hot::Gear, "\u{f013}"),
-            (Hot::Minimize, "\u{f2d1}"),
-            (Hot::Maximize, if maximized { "\u{f2d2}" } else { "\u{f2d0}" }),
-            (Hot::Close, "\u{f00d}"),
-        ];
-        for ((c, x0, x1), (_, glyph)) in self.control_rects().into_iter().zip(glyphs) {
-            Self::push_rect(&mut out, x0, hair, hair, self.title_bar_h - hair * 2.0, RULE, 1.0);
-            let is_hover = self.hovered == Some(c);
-            let active = is_hover
-                || (c == Hot::Gear && self.settings_open)
-                || (c == Hot::PaneMode && self.pane_mode);
-            if active {
-                // fade the hover fill in; a settings-pinned gear stays at full
-                let ha = if is_hover { he } else { 1.0 };
-                let hc = if c == Hot::Close { PAPER } else { INK_4 };
-                Self::push_rect(&mut out, x0, hair, x1 - x0, self.title_bar_h - hair * 2.0, hc, ha);
+        // title-bar buttons: split right|left, split top/bottom, pane mode,
+        // gear, min, max, close. full-height hover fills, the platform's
+        // convention; close goes red
+        let close_red = Rgb::new(tokens::CLOSE_RED.0, tokens::CLOSE_RED.1, tokens::CLOSE_RED.2);
+        for (c, x0, x1) in self.control_rects() {
+            let a = self.hover_a(c);
+            let pinned = (c == Hot::Gear && self.settings_open) || (c == Hot::PaneMode && self.pane_mode);
+            let fill = if c == Hot::Close { close_red } else { INK_4 };
+            let fa = if pinned { 1.0 } else { a };
+            if fa > 0.0 {
+                Self::push_rect(&mut out, x0, 0.0, x1 - x0, tbh - hair * 2.0, fill, fa);
             }
-            let gx = (x0 + (x1 - x0 - cw_c) / 2.0).round();
-            let color = if active && c == Hot::Close {
-                INK_0
-            } else if active {
-                TEXT_2
-            } else {
-                MUTE
+            let glyph = match c {
+                Hot::SplitV => Icon::SplitV,
+                Hot::SplitH => Icon::SplitH,
+                Hot::PaneMode => Icon::Grid,
+                Hot::Gear => Icon::Gear,
+                Hot::Minimize => Icon::Minimize,
+                Hot::Maximize if maximized => Icon::Restore,
+                Hot::Maximize => Icon::Maximize,
+                _ => Icon::Close,
             };
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, gx, text_top, glyph, color, 1.0, track,
-            );
-            // a clean "split view" mark à la Konsole: a landscape window frame
-            // divided into two panes, one pane tinted so it reads as a split
-            // view at a glance. no plus, no clutter (new-tab "+" is its own button)
-            if c == Hot::SplitV || c == Hot::SplitH {
-                let s = self.scale;
-                let th = hair;
-                let iw = (16.0 * s).round();
-                let ih = (12.0 * s).round();
-                let bx = ((x0 + x1) / 2.0 - iw / 2.0).round();
-                let by = (self.title_bar_h / 2.0 - ih / 2.0).round();
-                if c == Hot::SplitV {
-                    let half = (iw / 2.0).round();
-                    Self::push_rect(&mut out, bx, by, half, ih, color, 0.5);
-                    Self::push_rect(&mut out, (bx + half - th / 2.0).round(), by, th, ih, color, 1.0);
-                } else {
-                    let half = (ih / 2.0).round();
-                    Self::push_rect(&mut out, bx, by, iw, half, color, 0.5);
-                    Self::push_rect(&mut out, bx, (by + half - th / 2.0).round(), iw, th, color, 1.0);
-                }
-                Self::stroke_rect(&mut out, (bx, by, iw, ih), th, color);
-            }
-            // pane-mode toggle: a 2x2 grid of panes, lit while the mode is active
-            if c == Hot::PaneMode {
-                let sz = (10.0 * self.scale).round();
-                let gap = (2.0 * self.scale).max(1.0);
-                let cell = ((sz - gap) / 2.0).max(1.0);
-                let gx0 = ((x0 + x1) / 2.0 - sz / 2.0).round();
-                let gy0 = (self.title_bar_h / 2.0 - sz / 2.0).round();
-                for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                    Self::push_rect(&mut out, gx0 + dx * (cell + gap), gy0 + dy * (cell + gap), cell, cell, color, 1.0);
-                }
-            }
-            let s = self.scale;
-            let th = hair;
-            let sz = (10.0 * s).round();
-            let bx = ((x0 + x1) / 2.0 - sz / 2.0).round();
-            let by = (self.title_bar_h / 2.0 - sz / 2.0).round();
-            if c == Hot::Minimize {
-                let iw = (10.0 * s).round();
-                let min_x = ((x0 + x1) / 2.0 - iw / 2.0).round();
-                let min_y = (self.title_bar_h / 2.0 + 2.0 * s).round();
-                Self::push_rect(&mut out, min_x, min_y, iw, th.max(1.5), color, 1.0);
-            }
-            if c == Hot::Maximize {
-                if maximized {
-                    let off = (2.5 * s).round().max(2.0);
-                    Self::stroke_rect(&mut out, (bx + off, by - off, sz - off, sz - off), th, color);
-                    let bg_c = if active { INK_4 } else { BG };
-                    Self::push_rect(&mut out, bx, by, sz - off, sz - off, bg_c, 1.0);
-                    Self::stroke_rect(&mut out, (bx, by, sz - off, sz - off), th, color);
-                } else {
-                    Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
-                }
-            }
-            if c == Hot::Close {
-                for offset_i in 0..sz as usize {
-                    let off = offset_i as f32;
-                    Self::push_rect(&mut out, bx + off, by + off, th, th, color, 1.0);
-                    Self::push_rect(&mut out, bx + sz - off - th, by + off, th, th, color, 1.0);
-                }
-            }
-            if c == Hot::Gear {
-                Self::stroke_rect(&mut out, (bx, by, sz, sz), th, color);
-                let c_sz = (4.0 * s).round();
-                let c_x = ((x0 + x1) / 2.0 - c_sz / 2.0).round();
-                let c_y = (self.title_bar_h / 2.0 - c_sz / 2.0).round();
-                Self::push_rect(&mut out, c_x, c_y, c_sz, c_sz, color, 1.0);
-            }
+            let color = if c == Hot::Close {
+                MUTE.lerp(Rgb::new(255, 255, 255), a)
+            } else if c == Hot::PaneMode && self.pane_mode {
+                PAPER
+            } else {
+                MUTE.lerp(TEXT_2, fa)
+            };
+            let size = icon;
+            Self::draw_icon(&mut self.atlas, &mut out, glyph, (x0, 0.0, x1 - x0, tbh - hair * 2.0), size, stroke, color, 1.0);
         }
 
         // ---- status bar (flat) ----
         let sb_y = h - self.status_bar_h;
         Self::push_rect(&mut out, 0.0, sb_y, w, self.status_bar_h, INK_0, 1.0);
         Self::push_rect(&mut out, 0.0, sb_y, w, hair, RULE, 1.0);
-        let st_top = (sb_y + (self.status_bar_h - chrome_h) / 2.0).round();
-        let wide = (0.14 * cw_c).max(1.0);
+        let small = self.atlas.metrics(FontId::Small);
+        let st_top = (sb_y + (self.status_bar_h - small.cell_h) / 2.0).round();
+        let st_track = self.track_for(FontId::Small);
+        let key_track = self.key_track();
+        let sw = small.cell_w + st_track;
+        let gap = t(tokens::SPACE_L);
+        let ig = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
+        let sicon = t(9.0);
+        let sbar = (0.0, sb_y, 0.0, self.status_bar_h);
+        let keyed_w = |r: &Self, key: &str, val: &str| r.text_w(FontId::Small, key, key_track) + t(tokens::SPACE_S) + r.text_w(FontId::Small, val, st_track);
 
-        let gap = (14.0 * self.scale).round();
-        let scale = self.scale;
-
-        // rebuild the cached number strings only when they actually change, so
-        // the steady-state paint reformats nothing
         if self.status_size.0 != self.cols || self.status_size.1 != self.rows {
             self.status_size = (self.cols, self.rows, format!("{}\u{00d7}{}", self.cols, self.rows));
         }
-        if self.status_tabs.0 != self.status_sessions {
-            self.status_tabs = (self.status_sessions, self.status_sessions.to_string());
-        }
-        let draw_seg = |atlas: &mut GlyphAtlas,
-                        out: &mut Vec<Instance>,
-                        x,
-                        key,
-                        value,
-                        key_color,
-                        value_color| {
-            Self::seg(
-                atlas, out, x, st_top, key, value, track, wide, scale, key_color, value_color,
-            )
-        };
 
+        // left cluster: where you are (admin, cwd), or the pane-mode keys
         let left_end = if self.pane_mode {
             let actions = [
                 ("DRAG", "dock"),
@@ -4234,206 +4405,137 @@ impl Renderer {
                 ("Z", "zoom"),
                 ("O", "popout"),
             ];
-            let width = |renderer: &Self, key: &str, value: &str| {
-                renderer.text_w(FontId::Chrome, key, wide)
-                    + (7.0 * scale).round()
-                    + renderer.text_w(FontId::Chrome, value, track)
-            };
-            let done_w = width(self, "ESC", "done");
+            let done_w = keyed_w(self, "ESC", "done");
             let limit = w * 0.64;
             let mut sx = pad;
             for (key, value) in actions {
-                let action_w = width(self, key, value);
+                let action_w = keyed_w(self, key, value);
                 let action_gap = if sx > pad { gap } else { 0.0 };
                 if sx + action_gap + action_w + gap + done_w > limit {
                     continue;
                 }
                 sx += action_gap;
-                sx = draw_seg(&mut self.atlas, &mut out, sx, key, value, PAPER, MUTE);
+                sx = self.status_keyed(&mut out, sx, st_top, key, value, PAPER, MUTE);
             }
             if sx > pad {
                 sx += gap;
             }
-            draw_seg(&mut self.atlas, &mut out, sx, "ESC", "done", PAPER, MUTE)
+            self.status_keyed(&mut out, sx, st_top, "ESC", "done", PAPER, MUTE)
         } else {
-            // the normal status cluster keeps terminal state visible between modes
-            let mut sx = draw_seg(
-                &mut self.atlas, &mut out, pad, "SIZE", &self.status_size.2, RULE_2, TEXT_2,
-            );
-            sx += gap;
-            sx = draw_seg(&mut self.atlas, &mut out, sx, "ENC", "utf-8", RULE_2, MUTE);
-            if let Some(branch) = &self.status_git {
-                let truncated;
-                let branch = if branch.chars().count() > 24 {
-                    truncated = branch.chars().take(23).collect::<String>() + "\u{2026}";
-                    &truncated
-                } else {
-                    branch
-                };
-                sx += gap;
-                sx = Self::seg(
-                    &mut self.atlas,
-                    &mut out,
-                    sx,
-                    st_top,
-                    "\u{f126}",
-                    branch,
-                    track,
-                    wide,
-                    scale,
-                    RULE_2,
-                    TEXT_2,
-                );
-            }
+            let mut sx = pad;
             if self.elevated {
-                sx += gap;
-                sx = draw_seg(&mut self.atlas, &mut out, sx, "\u{f132}", "admin", PAPER, PAPER);
+                Self::draw_icon(&mut self.atlas, &mut out, Icon::Shield, (sx, sbar.1, sicon, sbar.3), sicon, stroke, PAPER, 1.0);
+                sx += sicon + ig;
+                sx = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, sx, st_top, "admin", PAPER, 1.0, st_track) + gap;
             }
-            sx += gap;
-            draw_seg(&mut self.atlas, &mut out, sx, "TABS", &self.status_tabs.1, RULE_2, MUTE)
+            let max_cwd = ((w * 0.42) / sw).floor() as usize;
+            if let Some(cwd) = self.status.cwd.clone() {
+                let shown = truncate_head(&cwd, max_cwd.max(8));
+                sx = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, sx, st_top, &shown, TEXT_2, 0.85, st_track) + gap;
+            }
+            sx - gap
         };
 
-        // right cluster (right→left): version · READY/PANE · clock. a live
-        // program notification takes the READY and clock slots for its text,
-        // truncated to the room left of the left cluster
-        let ver = concat!("termie ", env!("CARGO_PKG_VERSION"));
-        let ver_w = self.text_w(FontId::Chrome, ver, track);
-        let rx_ver = w - pad - ver_w;
-        let _ = Self::draw_text(
-            &mut self.atlas, &mut out, FontId::Chrome, rx_ver, st_top, ver, RULE_2, 1.0, track,
-        );
+        // right cluster, laid right→left: UPDATE chip, mode, command state.
+        // a live notice, link preview, or drag hint takes the mode and
+        // command slots for its text
         self.update_hit = None;
+        let mut rx = w - pad;
+        if let Some(v) = self.update_chip.clone() {
+            let label = format!("UPDATE {v}");
+            let lw = sicon + ig + self.text_w(FontId::Small, &label, key_track);
+            let chip_pad = t(tokens::SPACE_S);
+            let chip_h = small.cell_h.min(self.status_bar_h - t(tokens::SPACE_XS));
+            let chip = (rx - lw - chip_pad * 2.0, (sb_y + (self.status_bar_h - chip_h) / 2.0).round(), lw + chip_pad * 2.0, chip_h);
+            Self::push_shape(&mut out, chip, [t(tokens::RADIUS_CHIP), 0.0, 0.0], PAPER, 0.14);
+            let ix = chip.0 + chip_pad;
+            Self::draw_icon(&mut self.atlas, &mut out, Icon::Arrow, (ix, sbar.1, sicon, sbar.3), sicon, stroke, PAPER, 1.0);
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, ix + sicon + ig, st_top, &label, PAPER, 1.0, key_track);
+            self.update_hit = Some((chip.0, sb_y, chip.2, self.status_bar_h));
+            rx = chip.0 - gap;
+        }
+        let room = (rx - left_end - gap).max(0.0);
         if let Some(n) = self.notice.clone() {
-            let avail = (rx_ver - (16.0 * self.scale).round() - left_end - gap).max(0.0);
-            let maxc = (avail / cw_c).floor().max(0.0) as usize;
-            let mut shown = String::from("\u{f0f3}  ");
-            if n.chars().count() + 3 > maxc && maxc > 4 {
-                shown.extend(n.chars().take(maxc - 4));
-                shown.push('\u{2026}');
-            } else {
-                shown.push_str(&n);
-            }
-            let nw = self.text_w(FontId::Chrome, &shown, track);
-            let rx_n = (rx_ver - (16.0 * self.scale).round() - nw).max(left_end + gap);
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, rx_n, st_top, &shown, PAPER, 1.0, track,
-            );
+            let maxc = ((room - sicon - ig) / sw).floor().max(0.0) as usize;
+            let shown = truncate_tail(&n, maxc);
+            let nw = self.text_w(FontId::Small, &shown, st_track);
+            let nx = (rx - nw).max(left_end + gap + sicon + ig);
+            Self::draw_icon(&mut self.atlas, &mut out, Icon::Bell, (nx - sicon - ig, sbar.1, sicon, sbar.3), sicon, stroke, PAPER, 1.0);
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, nx, st_top, &shown, PAPER, 1.0, st_track);
         } else if self.broadcast {
-            let ready = "BROADCAST";
-            let ready_w = self.text_w(FontId::Chrome, ready, wide);
-            let rx_ready = rx_ver - (16.0 * self.scale).round() - ready_w;
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, PAPER, 1.0, wide,
-            );
+            let bw = self.text_w(FontId::Small, "BROADCAST", key_track);
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, rx - bw, st_top, "BROADCAST", PAPER, 1.0, key_track);
         } else if self.link_preview.is_some() {
-            let avail = (rx_ver - (16.0 * self.scale).round() - left_end - gap).max(0.0);
             let full_key = "CTRL+CLICK";
-            let full_key_w = self.text_w(FontId::Chrome, full_key, wide);
             let short_key = "LINK";
-            let short_key_w = self.text_w(FontId::Chrome, short_key, wide);
-            let value_gap = (7.0 * scale).round();
-            let chrome_char_w = self.atlas.metrics(FontId::Chrome).cell_w + track;
+            let value_gap = t(tokens::SPACE_S);
             let useful_chars =
-                self.link_preview.as_ref().map(|preview| preview.host_chars.min(24)).unwrap_or(0)
-                    as f32;
-            if chrome_char_w <= avail {
-                let (key, key_w, key_gap) =
-                    if full_key_w + value_gap + useful_chars * chrome_char_w <= avail {
-                        (full_key, full_key_w, value_gap)
-                    } else if short_key_w + value_gap + useful_chars * chrome_char_w <= avail {
-                        (short_key, short_key_w, value_gap)
-                    } else {
-                        ("", 0.0, 0.0)
-                    };
-                let value_avail = (avail - key_w - key_gap).max(0.0);
-                let maxc = (value_avail / chrome_char_w).floor() as usize;
+                self.link_preview.as_ref().map(|preview| preview.host_chars.min(24)).unwrap_or(0) as f32;
+            if sw <= room {
+                let (key, key_w, key_gap) = [full_key, short_key]
+                    .into_iter()
+                    .map(|k| (k, self.text_w(FontId::Small, k, key_track), value_gap))
+                    .find(|(_, kw, kg)| kw + kg + useful_chars * sw <= room)
+                    .unwrap_or(("", 0.0, 0.0));
+                let maxc = ((room - key_w - key_gap).max(0.0) / sw).floor() as usize;
                 if let Some(preview) = self.link_preview.as_mut() {
                     preview.fit(maxc);
                 }
                 let preview = self.link_preview.as_ref().expect("link preview exists");
-                let value = preview.fitted.as_str();
-                let value_w = preview.fitted_chars as f32 * chrome_char_w;
+                let value = preview.fitted.clone();
+                let value_w = preview.fitted_chars as f32 * sw;
+                let x = rx - key_w - key_gap - value_w;
                 if key.is_empty() {
-                    let rx_preview = rx_ver - (16.0 * self.scale).round() - value_w;
-                    let _ = Self::draw_text(
-                        &mut self.atlas,
-                        &mut out,
-                        FontId::Chrome,
-                        rx_preview,
-                        st_top,
-                        value,
-                        MUTE,
-                        1.0,
-                        track,
-                    );
+                    let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &value, MUTE, 1.0, st_track);
                 } else {
-                    let preview_w = key_w + key_gap + value_w;
-                    let rx_preview = rx_ver - (16.0 * self.scale).round() - preview_w;
-                    let _ = draw_seg(
-                        &mut self.atlas,
-                        &mut out,
-                        rx_preview,
-                        key,
-                        value,
-                        PAPER,
-                        MUTE,
-                    );
+                    let _ = self.status_keyed(&mut out, x, st_top, key, &value, PAPER, MUTE);
                 }
             }
-        } else if let Some(&(key, value)) = drag_hint_variants(self.hovered)
-            .iter()
-            .find(|&&(key, value)| {
-                let hint_w = self.text_w(FontId::Chrome, key, wide)
-                    + (7.0 * scale).round()
-                    + self.text_w(FontId::Chrome, value, track);
-                hint_w <= rx_ver - (16.0 * self.scale).round() - left_end - gap
-            })
+        } else if let Some(&(key, value)) =
+            drag_hint_variants(self.hovered).iter().find(|&&(key, value)| keyed_w(self, key, value) <= room)
         {
-            let hint_w = self.text_w(FontId::Chrome, key, wide)
-                + (7.0 * scale).round()
-                + self.text_w(FontId::Chrome, value, track);
-            let rx_hint = rx_ver - (16.0 * self.scale).round() - hint_w;
-            let _ = draw_seg(
-                &mut self.atlas,
-                &mut out,
-                rx_hint,
-                key,
-                value,
-                PAPER,
-                MUTE,
-            );
+            let x = rx - keyed_w(self, key, value);
+            let _ = self.status_keyed(&mut out, x, st_top, key, value, PAPER, MUTE);
         } else {
-            let (ready, ready_col) = if self.pane_mode {
-                ("PANE MODE", PAPER)
+            let (mode, mode_c, mode_a) = if self.pane_mode {
+                ("PANE MODE", PAPER, 1.0)
             } else if self.mark_mode {
-                ("MARK MODE", PAPER)
+                ("MARK MODE", PAPER, 1.0)
             } else {
-                ("READY", TEXT_2)
+                ("READY", TEXT_2, tokens::KEY_LABEL)
             };
-            let ready_w = self.text_w(FontId::Chrome, ready, wide);
-            let rx_ready = rx_ver - (16.0 * self.scale).round() - ready_w;
-            let _ = Self::draw_text(
-                &mut self.atlas, &mut out, FontId::Chrome, rx_ready, st_top, ready, ready_col, 1.0, wide,
-            );
-            let mut right_edge = rx_ready;
-            if !self.status_clock.is_empty() {
-                let clk_w = self.text_w(FontId::Chrome, &self.status_clock, track);
-                let rx_clk = rx_ready - (16.0 * self.scale).round() - clk_w;
-                let _ = Self::draw_text(
-                    &mut self.atlas, &mut out, FontId::Chrome, rx_clk, st_top, &self.status_clock, MUTE, 1.0, track,
-                );
-                right_edge = rx_clk;
-            }
-            // a pending release: a bright clickable chip, gone once installed
-            if let Some(v) = self.update_chip.clone() {
-                let label = format!("\u{f062} UPDATE {v}");
-                let lw = self.text_w(FontId::Chrome, &label, wide);
-                let ux = right_edge - (20.0 * self.scale).round() - lw;
-                let _ = Self::draw_text(
-                    &mut self.atlas, &mut out, FontId::Chrome, ux, st_top, &label, PAPER, 1.0, wide,
-                );
-                self.update_hit =
-                    Some((ux - 6.0 * self.scale, sb_y, lw + 12.0 * self.scale, self.status_bar_h));
+            let mw = self.text_w(FontId::Small, mode, key_track);
+            rx -= mw;
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, rx, st_top, mode, mode_c, mode_a, key_track);
+            rx -= gap;
+            // a resize shows the grid size for a beat; otherwise the focused
+            // pane's command: a breathing dot and timer while it runs, then
+            // its result and how long it took
+            let sizing = self.size_flash.is_some_and(|t| t.elapsed().as_secs_f32() < 1.0);
+            if sizing {
+                let text = self.status_size.2.clone();
+                let tw = self.text_w(FontId::Small, &text, st_track);
+                let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, rx - tw, st_top, &text, TEXT_2, 1.0, st_track);
+            } else if let Some((text, mark)) = self.command_readout() {
+                let tw = self.text_w(FontId::Small, &text, st_track);
+                let x = rx - tw;
+                if x - sicon - ig > left_end + gap {
+                    let (c, a) = match mark {
+                        1 => (MUTE, motion::breathe(self.start.elapsed().as_secs_f32())),
+                        4 => (self.palette.ansi_color(1), 1.0),
+                        _ => (self.palette.ansi_color(2), 1.0),
+                    };
+                    let mark_rect = (x - sicon - ig, sbar.1, sicon, sbar.3);
+                    if mark == 2 {
+                        Self::draw_icon(&mut self.atlas, &mut out, Icon::Check, mark_rect, sicon, stroke, c, a);
+                    } else {
+                        let d = t(tokens::DOT).max(4.0);
+                        let dy = (sb_y + (self.status_bar_h - d) / 2.0).round();
+                        Self::push_round(&mut out, (mark_rect.0 + (sicon - d) / 2.0).round(), dy, d, d, d / 2.0, c, a);
+                    }
+                    let tc = if mark == 4 { self.palette.ansi_color(1) } else { MUTE };
+                    let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &text, tc, 1.0, st_track);
+                }
             }
         }
 
@@ -4472,15 +4574,10 @@ impl Renderer {
         if overlay_now {
             let p = self
                 .overlay_since
-                .map(|t| {
-                    let e = (t.elapsed().as_secs_f32() / Self::OVERLAY_FADE).clamp(0.0, 1.0);
-                    1.0 - (1.0 - e).powi(3)
-                })
+                .map(|t| motion::ease_out(motion::progress(t, motion::OVERLAY)))
                 .unwrap_or(1.0);
             if p < 1.0 {
-                for inst in &mut out[overlay_start..] {
-                    inst.color[3] *= p;
-                }
+                bloom(&mut out[overlay_start..], p, w);
             }
         }
         // the settings panel draws last so its scrollable body is the final
@@ -4516,73 +4613,37 @@ impl Renderer {
             }
         }
 
+        // the dragged tab or pane rides under the pointer as a small card
         if let Some((pointer_x, pointer_y, label, tag)) = self.drag_preview.clone() {
-            let pad = (8.0 * self.scale).round();
-            let gap = (10.0 * self.scale).round();
-            let rail = (3.0 * self.scale).round().max(hair * 2.0);
-            let tag_w = self.text_w(FontId::Chrome, tag, wide);
-            let room = (w - pad * 4.0 - rail - tag_w - gap).max(cw_c * 4.0);
-            let max_chars = (room / cw_c).floor().max(4.0) as usize;
-            let mut shown: String = label.chars().take(max_chars).collect();
-            if label.chars().count() > max_chars {
-                shown.pop();
-                shown.push('\u{2026}');
-            }
-            if shown.is_empty() {
-                shown.push_str("untitled");
-            }
+            let t = |pt: f32| tokens::px(pt, self.scale);
+            let edge = t(tokens::SPACE_S);
+            let inset = t(tokens::SPACE_M);
+            let gap = t(tokens::SPACE_S);
+            let key_track = self.key_track();
+            let tag_w = self.text_w(FontId::Small, tag, key_track);
+            let cw_c = self.atlas.metrics(FontId::Chrome).cell_w + track;
+            let room = (w - edge * 2.0 - inset * 2.0 - tag_w - gap).max(cw_c * 4.0);
+            let shown = truncate_tail(if label.is_empty() { "untitled" } else { &label }, (room / cw_c).floor().max(4.0) as usize);
             let label_w = self.text_w(FontId::Chrome, &shown, track);
-            let box_w = rail + pad * 2.0 + tag_w + gap + label_w;
-            let box_h = (chrome_h + 12.0 * self.scale).round();
-            let offset = (14.0 * self.scale).round();
-            let box_x = if pointer_x + offset + box_w <= w - pad {
-                pointer_x + offset
-            } else {
-                pointer_x - offset - box_w
-            }
-            .clamp(pad, (w - box_w - pad).max(pad));
-            let box_y = if pointer_y + offset + box_h <= h - pad {
-                pointer_y + offset
-            } else {
-                pointer_y - offset - box_h
-            }
-            .clamp(pad, (h - box_h - pad).max(pad));
-            Self::push_rect(
-                &mut out,
-                box_x + hair * 3.0,
-                box_y + hair * 3.0,
-                box_w,
-                box_h,
-                INK_0,
-                0.5,
-            );
-            Self::push_rect(&mut out, box_x, box_y, box_w, box_h, INK_3, 0.98);
-            Self::stroke_rect_a(&mut out, (box_x, box_y, box_w, box_h), hair, RULE_2, 1.0);
-            Self::push_rect(&mut out, box_x, box_y, rail, box_h, PAPER, 1.0);
-            let text_y = (box_y + (box_h - chrome_h) / 2.0).round();
-            let tag_x = box_x + rail + pad;
-            let _ = Self::draw_text(
-                &mut self.atlas,
-                &mut out,
-                FontId::Chrome,
-                tag_x,
-                text_y,
-                tag,
-                PAPER,
-                1.0,
-                wide,
-            );
-            let _ = Self::draw_text(
-                &mut self.atlas,
-                &mut out,
-                FontId::Chrome,
-                tag_x + tag_w + gap,
-                text_y,
-                &shown,
-                TEXT_2,
-                1.0,
-                track,
-            );
+            let box_w = inset * 2.0 + tag_w + gap + label_w;
+            let box_h = t(tokens::SPACE_2XL);
+            let offset = t(tokens::SPACE_L);
+            let box_x = if pointer_x + offset + box_w <= w - edge { pointer_x + offset } else { pointer_x - offset - box_w }
+                .clamp(edge, (w - box_w - edge).max(edge))
+                .round();
+            let box_y = if pointer_y + offset + box_h <= h - edge { pointer_y + offset } else { pointer_y - offset - box_h }
+                .clamp(edge, (h - box_h - edge).max(edge))
+                .round();
+            let card = (box_x, box_y, box_w, box_h);
+            let r = t(tokens::RADIUS_ROW + 2.0);
+            Self::push_shadow(&mut out, card, r, t(14.0), t(6.0), INK_0, 0.45);
+            Self::push_shape(&mut out, card, [r, 0.0, 0.0], INK_3, 0.98);
+            Self::push_ring(&mut out, card, r, hair, RULE_2, 1.0);
+            let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+            let small_h = self.atlas.metrics(FontId::Small).cell_h;
+            let tag_x = box_x + inset;
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, tag_x, (box_y + (box_h - small_h) / 2.0).round(), tag, PAPER, 1.0, key_track);
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, tag_x + tag_w + gap, (box_y + (box_h - chrome_h) / 2.0).round(), &shown, TEXT_2, 1.0, track);
         }
 
         // latency hud (diagnostic) drawn last so it stays on top
@@ -4591,20 +4652,18 @@ impl Renderer {
         out
     }
 
-    const STARTUP_FADE: f32 = 0.22;
-
     /// restart the power-on reveal; called the instant the window becomes
     /// visible so the whole animation plays in view rather than during gpu init
     pub fn begin_reveal(&mut self) {
         self.reveal_start = Instant::now();
     }
 
-    /// normalized startup-reveal progress: 0 → 1 over STARTUP_FADE, then ≥ 1
+    /// normalized startup-reveal progress: 0 → 1 over motion::STARTUP, then ≥ 1
     fn startup_t(&self) -> f32 {
-        (self.reveal_start.elapsed().as_secs_f32() / Self::STARTUP_FADE).min(1.0)
+        (self.reveal_start.elapsed().as_secs_f32() / motion::STARTUP).min(1.0)
     }
 
-    /// dim-overlay alpha for the reveal: 1 → 0 over STARTUP_FADE (ease-out)
+    /// dim-overlay alpha for the reveal: 1 → 0 over motion::STARTUP (ease-out)
     fn startup_fade(&self) -> f32 {
         let t = self.startup_t();
         if t >= 1.0 {
@@ -4615,7 +4674,7 @@ impl Renderer {
     }
 
     pub fn startup_fading(&self) -> bool {
-        self.reveal_start.elapsed().as_secs_f32() < Self::STARTUP_FADE
+        self.reveal_start.elapsed().as_secs_f32() < motion::STARTUP
     }
 
     #[allow(non_snake_case)]
@@ -4623,13 +4682,11 @@ impl Renderer {
         let INK_0 = self.palette.ink0;
         let INK_1 = self.palette.ink1;
         let RULE = self.palette.rule;
-        let RULE_2 = self.palette.rule2;
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
         let s = self.scale;
         let hair = s.max(1.0);
-        let wide = (0.14 * self.atlas.metrics(FontId::Chrome).cell_w).max(1.0);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
 
         // snapshot Copy values so we can borrow self.atlas freely while drawing
@@ -4642,7 +4699,6 @@ impl Renderer {
         let pad_px = self.pane_pad_px as i32;
         let opacity_pct = self.opacity_pct();
         let p = self.settings_p;
-        let cw_c = self.atlas.metrics(FontId::Chrome).cell_w;
         let g = self.settings_geom();
         let bh = g.bh;
         let cx = g.content_x;
@@ -4650,27 +4706,21 @@ impl Renderer {
         let lbl = |y: f32| (y + (bh - chrome_h) / 2.0).round();
 
         // ── fixed chrome: scrim + panel body + header (drawn unclipped) ──
+        // the drawer casts a soft shadow left onto the terminal as it slides in
+        let t = |pt| tokens::px(pt, s);
         Self::push_rect(out, 0.0, g.panel_top, self.config.width as f32, g.panel_h, INK_0, 0.32 * p);
+        let panel = (g.panel_x, g.panel_top, g.panel_w + t(tokens::SPACE_XL), g.panel_h);
+        Self::push_shadow(out, panel, 0.0, t(tokens::SPACE_XL), 0.0, INK_0, 0.45 * p);
         Self::push_rect(out, g.panel_x, g.panel_top, g.panel_w, g.panel_h, INK_1, 1.0);
         Self::push_rect(out, g.panel_x, g.panel_top, hair, g.panel_h, RULE, 1.0); // left edge
-        // top accent runs the full window width so it reads as a continuous rail
-        // the drawer slides in along; alpha tracks the slide so it fades in too
-        Self::push_rect(out, 0.0, g.panel_top, self.config.width as f32, hair * 2.0, PAPER, p);
 
-        let _ = Self::draw_text(
-            &mut self.atlas, out, FontId::Chrome, cx, g.head_y, "\u{25B8} SETTINGS", PAPER, 1.0, wide,
-        );
-        // ✕ close button
-        let (qx, qy, qw, qh) = g.close_btn;
-        let q_hover = self.hovered == Some(Hot::PanelClose);
-        if q_hover {
-            Self::push_rect(out, qx, qy, qw, qh, PAPER, 1.0);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, g.head_y, "Settings", PAPER, 1.0, track);
+        let qa = self.hover_a(Hot::PanelClose);
+        if qa > 0.0 {
+            Self::push_shape(out, g.close_btn, [t(tokens::RADIUS_CHIP + 2.0), 0.0, 0.0], self.palette.ink3, qa);
         }
-        let qcol = if q_hover { INK_0 } else { MUTE };
-        let qgx = (qx + (qw - cw_c) / 2.0).round();
-        let qgy = (qy + (qh - chrome_h) / 2.0).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qgx, qgy, "\u{f00d}", qcol, 1.0, track);
-        Self::push_rect(out, cx, g.body_top - 12.0 * s, cw, hair, RULE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, g.close_btn, t(9.0), hair, MUTE.lerp(TEXT_2, qa), 1.0);
+        Self::push_rect(out, cx, g.body_top - t(tokens::SPACE_M), cw, hair, RULE, 1.0);
 
         // ── scrollable body: everything after this index is scissor-clipped ──
         let body_start = out.len() as u32;
@@ -4681,74 +4731,76 @@ impl Renderer {
 
         // PLUGINS (top of the panel: installed list with on/off + browse store).
         // stop the header rule short of the browse button so it doesn't run under it
-        let plug_rule_w = (g.plugins_btn.0 - cx - 12.0 * s).max(0.0);
-        self.section_label(out, cx, g.sec_plugins_y, plug_rule_w, "PLUGINS", wide, RULE_2, MUTE);
-        self.cycle_btn(out, g.plugins_btn, "browse \u{25B8}", Hot::OpenPlugins, track);
+        let plug_rule_w = (g.plugins_btn.0 - cx - t(tokens::SPACE_M)).max(0.0);
+        self.section_label(out, cx, g.sec_plugins_y, plug_rule_w, "PLUGINS");
+        self.cycle_btn(out, g.plugins_btn, "browse", Hot::OpenPlugins, track);
         if g.plugin_rows.is_empty() {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.sec_plugins_y + 32.0 * s), "no plugins installed", RULE_2, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.sec_plugins_y + t(tokens::SPACE_2XL)), "no plugins installed", MUTE, 1.0, track);
         } else {
             for (i, (name, on, rect, ry)) in g.plugin_rows.iter().enumerate() {
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(*ry), name, MUTE, 1.0, wide);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(*ry), name, TEXT_2, 1.0, track);
                 self.toggle_btn(out, *rect, *on, Hot::PluginToggle(i), track);
             }
         }
 
         // APPEARANCE
-        self.section_label(out, cx, g.sec_app_y, cw, "APPEARANCE", wide, RULE_2, MUTE);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.font_y), "FONT SIZE", MUTE, 1.0, wide);
+        self.section_label(out, cx, g.sec_app_y, cw, "APPEARANCE");
+        self.setting_label(out, cx, g.font_y, bh, "FONT SIZE");
         self.stepper(out, g.font_dec, g.font_inc, &format!("{font_size}"), Hot::FontDec, Hot::FontInc, g.val_w, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.fontfam_y), "FONT", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.fontfam_y, bh, "FONT");
         self.cycle_btn(out, g.fontfam_btn, font_name, Hot::FontCycle, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.pad_y), "PADDING", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.pad_y, bh, "PADDING");
         self.stepper(out, g.pad_dec, g.pad_inc, &format!("{pad_px}"), Hot::PadDec, Hot::PadInc, g.val_w, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.opacity_y), "OPACITY", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.opacity_y, bh, "OPACITY");
         self.stepper(out, g.op_dec, g.op_inc, &format!("{opacity_pct}%"), Hot::OpacityDec, Hot::OpacityInc, g.val_w, track);
         let lh_label = format!("{:.2}", self.content_line_height);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.line_height_y), "LINE HEIGHT", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.line_height_y, bh, "LINE HEIGHT");
         self.stepper(out, g.lh_dec, g.lh_inc, &lh_label, Hot::LineHeightDec, Hot::LineHeightInc, g.val_w, track);
         let bb = self.bold_as_bright;
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.boldbright_y), "BOLD AS BRIGHT", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.boldbright_y, bh, "BOLD AS BRIGHT");
         self.toggle_btn(out, g.boldbright_btn, bb, Hot::BoldBright, track);
         let backdrop_label = if cfg!(windows) {
             "MICA BACKDROP"
         } else {
             "SYSTEM BLUR"
         };
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.mica_y), backdrop_label, MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.mica_y, bh, backdrop_label);
         self.toggle_btn(out, g.mica_btn, sv.acrylic, Hot::Mica, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.cursor_y), "CURSOR", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.cursor_y, bh, "CURSOR");
         self.cycle_btn(out, g.cursor_btn, cur_name, Hot::CursorCycle, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.blink_y), "CURSOR BLINK", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.blink_y, bh, "CURSOR BLINK");
         self.toggle_btn(out, g.blink_btn, blink, Hot::CursorBlink, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.theme_label_y), "THEME", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.theme_label_y, bh, "THEME");
         for (i, id) in ThemeId::ALL.into_iter().enumerate() {
             self.theme_chip(out, g.theme_chips[i], id, theme == id && !sv.theme_auto, track);
         }
         self.auto_chip(out, g.theme_chips[ThemeId::ALL.len()], sv.theme_auto, track);
 
         // BEHAVIOR
-        self.section_label(out, cx, g.sec_beh_y, cw, "BEHAVIOR", wide, RULE_2, MUTE);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.scrollback_y), "SCROLLBACK", MUTE, 1.0, wide);
+        self.section_label(out, cx, g.sec_beh_y, cw, "BEHAVIOR");
+        self.setting_label(out, cx, g.scrollback_y, bh, "SCROLLBACK");
         self.stepper(out, g.sb_dec, g.sb_inc, &format!("{}", sv.scrollback), Hot::ScrollbackDec, Hot::ScrollbackInc, g.val_w, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.copysel_y), "COPY ON SELECT", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.copysel_y, bh, "COPY ON SELECT");
         self.toggle_btn(out, g.copysel_btn, sv.copy_on_select, Hot::CopyOnSelect, track);
 
         // SHELL
-        self.section_label(out, cx, g.sec_shell_y, cw, "SHELL", wide, RULE_2, MUTE);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.shell_y), "DEFAULT SHELL", MUTE, 1.0, wide);
+        self.section_label(out, cx, g.sec_shell_y, cw, "SHELL");
+        self.setting_label(out, cx, g.shell_y, bh, "DEFAULT SHELL");
         self.cycle_btn(out, g.shell_btn, sv.shell_name, Hot::ShellCycle, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.profile_y), "LOAD PROFILE", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.profile_y, bh, "LOAD PROFILE");
         self.toggle_btn(out, g.profile_btn, sv.load_profile, Hot::LoadProfile, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.close_y), "CLOSE BUTTON", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.close_y, bh, "CLOSE BUTTON");
         self.cycle_btn(out, g.close_action_btn, sv.close_action_name, Hot::CloseActionCycle, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.backend_y), "BACKEND", MUTE, 1.0, wide);
+        self.setting_label(out, cx, g.backend_y, bh, "BACKEND");
         self.cycle_btn(out, g.backend_btn, sv.backend_name, Hot::BackendCycle, track);
         // backend can't swap live; hint that it applies next launch
         let (bbx, _, bbw, _) = g.backend_btn;
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bbx + bbw + 10.0 * s, lbl(g.backend_y), "(restart)", RULE_2, 1.0, track);
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let small_track = self.track_for(FontId::Small);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - small_h) / 2.0).round(), "applies on restart", MUTE, 1.0, small_track);
 
         // KEYBINDINGS (two sub-columns)
-        self.section_label(out, cx, g.sec_keys_y, cw, "KEYBINDINGS", wide, RULE_2, MUTE);
+        self.section_label(out, cx, g.sec_keys_y, cw, "KEYBINDINGS");
         let keys: [(&str, &str); 12] = [
             ("Ctrl+T", "new tab"),
             ("Ctrl+P", "palette"),
@@ -4763,30 +4815,31 @@ impl Renderer {
             ("Ctrl+,", "settings"),
             ("Esc", "close"),
         ];
-        let key_row = 22.0 * s;
+        let key_row = t(22.0);
         let sub2 = cx + cw / 2.0;
-        let desc_dx = 108.0 * s;
+        let desc_dx = t(108.0);
         for (i, (k, d)) in keys.into_iter().enumerate() {
             let (kx, ky) = if i < 6 {
                 (cx, g.keys_start_y + i as f32 * key_row)
             } else {
                 (sub2, g.keys_start_y + (i - 6) as f32 * key_row)
             };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, kx, ky, k, TEXT_2, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, kx, ky + (chrome_h - small_h) / 2.0, k, TEXT_2, 1.0, small_track);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, kx + desc_dx, ky, d, MUTE, 1.0, track);
         }
 
         // ABOUT
-        self.section_label(out, cx, g.sec_about_y, cw, "ABOUT", wide, RULE_2, MUTE);
+        self.section_label(out, cx, g.sec_about_y, cw, "ABOUT");
         let about: [(&str, &str); 3] = [
             ("FONT", font_name),
             ("VERSION", concat!("termie ", env!("CARGO_PKG_VERSION"))),
             ("RENDERER", self.backend_label),
         ];
-        let about_dx = 120.0 * s;
+        let about_dx = t(120.0);
+        let key_track = self.key_track();
         for (i, (k, v)) in about.into_iter().enumerate() {
-            let ya = g.about_start_y + i as f32 * 28.0 * s;
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, ya, k, MUTE, 1.0, wide);
+            let ya = g.about_start_y + i as f32 * t(28.0);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx, ya + (chrome_h - small_h) / 2.0, k, MUTE, 1.0, key_track);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx + about_dx, ya, v, TEXT_2, 1.0, track);
         }
     }
@@ -4826,14 +4879,14 @@ impl Renderer {
         let INK_1 = self.palette.ink1;
         let RULE = self.palette.rule;
         let TEXT_2 = self.palette.text2;
-        let PAPER = self.palette.paper;
+        let MUTE = self.palette.mute;
 
         // panel ground + a left hairline that reads as the seam to the terminal
         Self::push_rect(out, dx, cy, dw, ch, INK_1, 1.0);
         Self::push_rect(out, dx, cy, hair, ch, RULE, 1.0);
 
-        let pad = (12.0 * s).round();
-        let row = (chrome_h + 6.0 * s).round();
+        let pad = tokens::px(tokens::SPACE_M, s);
+        let row = (chrome_h + tokens::px(tokens::SPACE_XS + tokens::SPACE_2XS, s)).round();
         let mut y = cy + pad;
         self.dock_hitboxes.clear();
         // snapshot widget data so the atlas can be borrowed mutably while drawing
@@ -4845,7 +4898,10 @@ impl Renderer {
                 let ry = (y - pad * 0.5).round();
                 Self::push_rect(out, dx + pad, ry, dw - pad * 2.0, hair, RULE, 1.0);
             }
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, dx + pad, y.round(), &title, PAPER, 1.0, track);
+            // widget titles read like the settings section heads: small caps
+            let small_h = self.atlas.metrics(FontId::Small).cell_h;
+            let key_track = self.key_track();
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, dx + pad, (y + (chrome_h - small_h) / 2.0).round(), &title.to_uppercase(), MUTE, 1.0, key_track);
             y += row;
             // Tier-2 canvas: paint the plugin's immediate-mode primitives in a
             // bounded box, each clipped so a plugin can't paint outside its widget
@@ -4928,6 +4984,35 @@ impl Renderer {
 
     /// right-click pane context menu: a small panel of pane actions at the click
     #[allow(non_snake_case)]
+    /// the shared overlay surface: a layered soft shadow, rounded fill,
+    /// hairline edge, and a faint highlight along the top lip
+    fn overlay_frame(&self, out: &mut Vec<Instance>, rect: Rect, r: f32) {
+        let t = |pt| tokens::px(pt, self.scale);
+        let hair = self.scale.max(1.0);
+        let p = &self.palette;
+        Self::push_shadow(out, rect, r, t(tokens::SPACE_XL), t(tokens::SPACE_S), p.ink0, 0.35);
+        Self::push_shadow(out, rect, r, t(tokens::SPACE_2XS), t(1.0), p.ink0, 0.25);
+        Self::push_shape(out, rect, [r, 0.0, 0.0], p.ink1, 1.0);
+        Self::push_ring(out, rect, r, hair, p.rule2, 1.0);
+        let (x, y, w, _) = rect;
+        Self::push_rect(out, x + r, y + hair, (w - r * 2.0).max(0.0), hair, Rgb::new(255, 255, 255), 0.06);
+    }
+
+    /// a row highlight inset from the overlay edge
+    fn row_fill(&self, out: &mut Vec<Instance>, rect: Rect, alpha: f32) {
+        let t = |pt| tokens::px(pt, self.scale);
+        let (x, y, w, h) = rect;
+        let inset = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
+        Self::push_shape(
+            out,
+            (x + inset, y + t(1.0), w - inset * 2.0, h - t(2.0)),
+            [t(tokens::RADIUS_ROW), 0.0, 0.0],
+            self.palette.ink3,
+            alpha,
+        );
+    }
+
+    #[allow(non_snake_case)]
     fn build_pane_menu(&mut self, out: &mut Vec<Instance>, track: f32) {
         let Some(v) = self.pane_menu_view.as_ref() else {
             return;
@@ -4936,44 +5021,42 @@ impl Renderer {
         // owned so the pane_menu_view borrow ends before the atlas is drawn into
         let items = v.items.clone();
         let accents = v.accents.clone();
-        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mx, my, items.len());
-        let INK_0 = self.palette.ink0;
-        let INK_1 = self.palette.ink1;
-        let INK_3 = self.palette.ink3;
-        let RULE_2 = self.palette.rule2;
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mx, my, &items, !accents.is_empty());
+        if self.menu_hover.map(|(i, _)| i) != hovered {
+            self.menu_hover = hovered.map(|i| (i, Instant::now()));
+        }
+        let lit = self.menu_hover.map(|(i, t)| (i, motion::ease_out(motion::progress(t, motion::HOVER_IN))));
+        let t = |pt| tokens::px(pt, self.scale);
         let TEXT_2 = self.palette.text2;
-        let PAPER = self.palette.paper;
-        let s = self.scale;
-        let hair = s.max(1.0);
+        let RULE_2 = self.palette.rule2;
+        let hair = self.scale.max(1.0);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let mh = row_h * items.len() as f32 + pad * 2.0;
-        Self::push_rect(out, bx - 2.0 * s, by + 4.0 * s, mw + 4.0 * s, mh, INK_0, 0.5);
-        Self::push_rect(out, bx, by, mw, mh, INK_1, 1.0);
-        Self::stroke_rect(out, (bx, by, mw, mh), hair, RULE_2);
+        self.overlay_frame(out, (bx, by, mw, mh), t(tokens::RADIUS_ROW + 4.0));
         for (i, lbl) in items.iter().enumerate() {
             let ry = by + pad + row_h * i as f32;
-            if hovered == Some(i) {
-                Self::push_rect(out, bx, ry, mw, row_h, INK_3, 1.0);
-                Self::push_rect(out, bx, ry, 2.0 * s, row_h, PAPER, 1.0);
+            let a = lit.filter(|(li, _)| *li == i).map_or(0.0, |(_, a)| a);
+            if a > 0.0 {
+                self.row_fill(out, (bx, ry, mw, row_h), a);
             }
             let ty = (ry + (row_h - chrome_h) / 2.0).round();
-            let col = if hovered == Some(i) { PAPER } else { TEXT_2 };
-            let mut lx = bx + pad + 4.0 * s;
-            // color-menu rows lead with their swatch; "none" gets a hollow box
+            let mut lx = bx + pad + t(tokens::SPACE_M) - t(tokens::SPACE_XS);
+            // color-menu rows lead with their swatch; "none" gets a hollow ring
             if !accents.is_empty() {
-                let d = (chrome_h * 0.55).round().max(4.0);
+                let d = t(tokens::SPACE_M);
                 let sy = (ry + (row_h - d) / 2.0).round();
                 match accents.get(i).copied().flatten() {
-                    Some(ci) => Self::push_rect(out, lx, sy, d, d, self.palette.ansi_color(ci), 1.0),
-                    None => Self::stroke_rect(out, (lx, sy, d, d), hair, RULE_2),
+                    Some(ci) => Self::push_round(out, lx, sy, d, d, d / 2.0, self.palette.ansi_color(ci), 1.0),
+                    None => Self::push_ring(out, (lx, sy, d, d), d / 2.0, hair, RULE_2, 1.0),
                 }
-                lx += d + 6.0 * s;
+                lx += d + t(tokens::SPACE_S);
             }
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, lx, ty, lbl, col, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, lx, ty, lbl, TEXT_2, 0.85 + 0.15 * a, track);
         }
     }
 
-    /// centered command-palette overlay: search input + filtered action list
+    /// command-palette overlay: search input + filtered action list with each
+    /// row's shortcut on the right
     #[allow(non_snake_case)]
     fn build_palette(&mut self, out: &mut Vec<Instance>, track: f32) {
         self.palette_geom = None;
@@ -4986,88 +5069,110 @@ impl Renderer {
         // exceed nine); clicks map back through `first` to absolute indices
         let total = pv.items.len();
         let first = pv.selected.saturating_sub(8).min(total.saturating_sub(9));
-        let items: Vec<String> = pv.items.iter().skip(first).take(9).cloned().collect();
+        let items: Vec<(String, String)> = pv
+            .items
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(9)
+            .map(|(i, label)| (label.clone(), pv.hints.get(i).cloned().unwrap_or_default()))
+            .collect();
         let selected = pv.selected;
+        let scope = pv.scope;
         let INK_0 = self.palette.ink0;
-        let INK_1 = self.palette.ink1;
-        let INK_3 = self.palette.ink3;
         let RULE_2 = self.palette.rule2;
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
         let s = self.scale;
+        let t = |pt| tokens::px(pt, s);
         let hair = s.max(1.0);
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let key_track = self.key_track();
+        let small_track = self.track_for(FontId::Small);
 
-        Self::push_rect(out, 0.0, 0.0, w, h, INK_0, 0.55);
-        let bw = (560.0 * s).min(w - 80.0 * s);
+        Self::push_rect(out, 0.0, 0.0, w, h, INK_0, 0.45);
+        let bw = t(tokens::PALETTE_W).min(w - t(tokens::SPACE_2XL) * 2.0);
         let bx = ((w - bw) / 2.0).round();
-        let by = (self.title_bar_h + 70.0 * s).round();
-        let row_h = chrome_h + 14.0 * s;
-        let font_preview = pv.scope == "fonts";
+        let by = (h * 0.15).max(self.title_bar_h + t(tokens::SPACE_L)).round();
+        let row_h = chrome_h + t(tokens::SPACE_M) + t(tokens::SPACE_XS);
+        let font_preview = scope == "fonts";
         let rows = items.len().max(1) as f32 + 1.0 + f32::from(font_preview);
-        let bh = row_h * rows + 8.0 * s;
+        let bh = row_h * rows + t(tokens::SPACE_S);
         // remember the box + row pitch + window offset so clicks can land on
         // entries and resolve to absolute list indices
         self.palette_geom = Some(((bx, by, bw, bh), row_h, items.len(), first));
-        // drop shadow + box + border
-        Self::push_rect(out, bx - 2.0 * s, by + 5.0 * s, bw + 4.0 * s, bh, INK_0, 0.5);
-        Self::push_rect(out, bx, by, bw, bh, INK_1, 1.0);
-        Self::stroke_rect(out, (bx, by, bw, bh), hair, RULE_2);
+        self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_OVERLAY));
 
-        let pad = 16.0 * s;
-        // search input row, centered in [by, by+row_h] — an extra top offset
-        // here used to push the caret and descenders 1px past the separator
+        let pad = t(tokens::SPACE_L);
+        // search input row: magnifier, the scope as a small-caps tag, the query
         let iy = (by + (row_h - chrome_h) / 2.0).round();
-        let prompt = format!("\u{f002}  {}  {}", pv.scope, query);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, iy, &prompt, TEXT_2, 1.0, track);
-        let cwid = self.text_w(FontId::Chrome, &prompt, track);
-        Self::push_rect(out, bx + pad + cwid + 2.0 * s, iy, 2.0 * s, chrome_h, PAPER, 1.0);
-        Self::push_rect(out, bx, by + row_h, bw, hair, RULE_2, 1.0);
+        let icon = t(tokens::ICON + 2.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, icon, row_h), icon, hair, MUTE, 1.0);
+        let tag = scope.to_ascii_uppercase();
+        let tag_x = bx + pad + icon + t(tokens::SPACE_M);
+        let qx = Self::draw_text(&mut self.atlas, out, FontId::Small, tag_x, (by + (row_h - small_h) / 2.0).round(), &tag, MUTE, 1.0, key_track)
+            + t(tokens::SPACE_M);
+        let qend = if query.is_empty() {
+            let hint = match scope {
+                "tabs" => "switch to a tab",
+                "fonts" => "pick a font",
+                _ => "type a command",
+            };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx + t(tokens::SPACE_XS), iy, hint, MUTE, 0.7, track);
+            qx
+        } else {
+            Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &query, TEXT_2, 1.0, track)
+        };
+        Self::push_round(out, qend + t(1.0), iy + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), PAPER, 1.0);
+        Self::push_rect(out, bx + hair, by + row_h, bw - hair * 2.0, hair, RULE_2, 0.7);
 
         if items.is_empty() {
             let ty = (by + row_h + (row_h - chrome_h) / 2.0).round();
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, "no matches", MUTE, 1.0, track);
+            let noun = match scope {
+                "tabs" => "tabs",
+                "fonts" => "fonts",
+                _ => "commands",
+            };
+            let msg = format!("No {noun} match \"{}\"", truncate_tail(&query, 32));
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &msg, MUTE, 1.0, track);
         }
-        for (idx, lbl) in items.iter().enumerate() {
-            let ry = by + row_h * (idx as f32 + 1.0);
+        for (idx, (lbl, hint)) in items.iter().enumerate() {
+            let ry = by + row_h * (idx as f32 + 1.0) + t(tokens::SPACE_XS);
             let is_sel = first + idx == selected;
             if is_sel {
-                Self::push_rect(out, bx, ry, bw, row_h, INK_3, 1.0);
-                Self::push_rect(out, bx, ry, 2.0 * s, row_h, PAPER, 1.0);
+                self.row_fill(out, (bx, ry, bw, row_h), 1.0);
             }
             let ty = (ry + (row_h - chrome_h) / 2.0).round();
-            let col = if is_sel { PAPER } else { TEXT_2 };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, lbl, col, 1.0, track);
+            let hint_w = if hint.is_empty() { 0.0 } else { self.text_w(FontId::Small, hint, small_track) };
+            let room = bw - pad * 2.0 - hint_w - if hint_w > 0.0 { t(tokens::SPACE_L) } else { 0.0 };
+            let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
+            let shown = truncate_tail(lbl, (room / cw).floor().max(4.0) as usize);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &shown, TEXT_2, if is_sel { 1.0 } else { 0.8 }, track);
+            if hint_w > 0.0 {
+                let hy = (ry + (row_h - small_h) / 2.0).round();
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hint_w, hy, hint, MUTE, if is_sel { 1.0 } else { 0.8 }, small_track);
+            }
         }
         if font_preview {
-            let py = by + row_h * (items.len().max(1) as f32 + 1.0);
-            Self::push_rect(out, bx, py, bw, hair, RULE_2, 1.0);
+            let py = by + row_h * (items.len().max(1) as f32 + 1.0) + t(tokens::SPACE_XS);
+            Self::push_rect(out, bx + hair, py, bw - hair * 2.0, hair, RULE_2, 0.7);
             let sample = "Aa  0O  1l  {} []  -> !=";
             let sample_w = self.text_w(FontId::Content, sample, 0.0);
             let content_h = self.atlas.metrics(FontId::Content).cell_h;
             let sx = (bx + (bw - sample_w) / 2.0).round();
             let sy = (py + (row_h - content_h) / 2.0).round();
-            let _ = Self::draw_text(
-                &mut self.atlas,
-                out,
-                FontId::Content,
-                sx,
-                sy,
-                sample,
-                PAPER,
-                1.0,
-                0.0,
-            );
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Content, sx, sy, sample, PAPER, 1.0, 0.0);
         }
-        // more rows exist above/below the window: a dim count in the box corner
+        // more rows exist above/below the window: a dim position in the corner
         if total > items.len() {
             let hint = format!("{}/{}", selected + 1, total);
-            let hw = self.text_w(FontId::Chrome, &hint, track);
-            let ty = (by + (row_h - chrome_h) / 2.0).round();
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + bw - pad - hw, ty, &hint, MUTE, 1.0, track);
+            let hw = self.text_w(FontId::Small, &hint, small_track);
+            let ty = (by + (row_h - small_h) / 2.0).round();
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hw, ty, &hint, MUTE, 1.0, small_track);
         }
     }
 
@@ -5086,51 +5191,45 @@ impl Renderer {
         let capped = fv.capped;
         let regex_on = fv.regex_on;
         let bad = fv.bad;
-        let INK_0 = self.palette.ink0;
         let INK_1 = self.palette.ink1;
-        let RULE_2 = self.palette.rule2;
         let TEXT_2 = self.palette.text2;
         let MUTE = self.palette.mute;
         let PAPER = self.palette.paper;
         let s = self.scale;
+        let t = |pt| tokens::px(pt, s);
         let hair = s.max(1.0);
         let w = self.config.width as f32;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let bw = (560.0 * s).min(w - 80.0 * s);
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let small_track = self.track_for(FontId::Small);
+        let bw = t(560.0).min(w - t(tokens::SPACE_2XL) * 2.0);
         let bx = ((w - bw) / 2.0).round();
-        let by = (self.title_bar_h + 12.0 * s).round();
-        let row_h = chrome_h + 14.0 * s;
-        let bh = row_h + 8.0 * s;
-        Self::push_rect(out, bx - 2.0 * s, by + 5.0 * s, bw + 4.0 * s, bh, INK_0, 0.5);
-        Self::push_rect(out, bx, by, bw, bh, INK_1, 1.0);
-        Self::stroke_rect(out, (bx, by, bw, bh), hair, RULE_2);
-        let pad = 16.0 * s;
-        let iy = (by + 4.0 * s + (row_h - chrome_h) / 2.0).round();
+        let by = (self.title_bar_h + t(tokens::SPACE_M)).round();
+        let bh = chrome_h + t(tokens::SPACE_L) + t(tokens::SPACE_XS);
+        self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_ROW + 4.0));
+        let pad = t(tokens::SPACE_M);
+        let iy = (by + (bh - chrome_h) / 2.0).round();
         // right cluster: regex toggle / prev / next / close buttons, with the
         // counter to their left. rects are remembered so clicks land on them
-        let btn = (chrome_h + 6.0 * s).round();
-        let bgap = 4.0 * s;
+        let btn = (bh - t(tokens::SPACE_S)).round();
+        let bgap = t(tokens::SPACE_2XS);
         let byy = (by + (bh - btn) / 2.0).round();
-        let close_r = (bx + bw - pad + 4.0 * s - btn, byy, btn, btn);
+        let close_r = (bx + bw - t(tokens::SPACE_XS) - btn, byy, btn, btn);
         let next_r = (close_r.0 - btn - bgap, byy, btn, btn);
         let prev_r = (next_r.0 - btn - bgap, byy, btn, btn);
-        let rx_r = (prev_r.0 - btn - bgap, byy, btn, btn);
+        let rx_r = (prev_r.0 - btn - bgap - t(tokens::SPACE_XS), byy, btn, btn);
         self.find_btns = Some((rx_r, prev_r, next_r, close_r));
+        let chip_r = t(tokens::RADIUS_CHIP + 2.0);
         if regex_on {
-            Self::push_rect(out, rx_r.0, rx_r.1, rx_r.2, rx_r.3, PAPER, 0.85);
+            Self::push_shape(out, rx_r, [chip_r, 0.0, 0.0], PAPER, 0.9);
         }
-        let rx_col = if regex_on { INK_1 } else { MUTE };
-        for (r, glyph, col) in [
-            (rx_r, ".*", rx_col),
-            (prev_r, "\u{f077}", MUTE),
-            (next_r, "\u{f078}", MUTE),
-            (close_r, "\u{f00d}", MUTE),
-        ] {
-            let gw = self.text_w(FontId::Chrome, glyph, track);
-            let gx = r.0 + (r.2 - gw) / 2.0;
-            let gy = (r.1 + (r.3 - chrome_h) / 2.0).round();
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, gx, gy, glyph, col, 1.0, track);
-        }
+        let rx_text = ".*";
+        let rw = self.text_w(FontId::Small, rx_text, small_track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, if regex_on { INK_1 } else { MUTE }, 1.0, small_track);
+        let icon = t(tokens::ICON - 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::ChevronUp, prev_r, icon, hair, MUTE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, next_r, icon, hair, MUTE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(8.0), hair, MUTE, 1.0);
         let info = if bad {
             "bad pattern".to_string()
         } else if count == 0 {
@@ -5144,30 +5243,21 @@ impl Renderer {
         } else {
             format!("{}/{}{}", current + 1, count, if capped { "+" } else { "" })
         };
-        let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Chrome, &info, track) };
-        let right_edge = rx_r.0 - 10.0 * s;
+        let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Small, &info, small_track) };
+        let right_edge = rx_r.0 - t(tokens::SPACE_S);
+        let search = t(tokens::ICON + 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, search, bh), search, hair, MUTE, 1.0);
+        let qx = bx + pad + search + t(tokens::SPACE_S);
         // elide the head of an overlong query so the tail being typed stays
         // visible and never collides with the counter or the buttons
-        let avail = (right_edge - iw - 16.0 * s) - (bx + pad);
-        let mut prompt = format!("\u{f002}  {}", query);
-        if self.text_w(FontId::Chrome, &prompt, track) > avail {
-            let mut tail = query.as_str();
-            loop {
-                let mut it = tail.chars();
-                it.next();
-                tail = it.as_str();
-                prompt = format!("\u{f002}  \u{2026}{}", tail);
-                if tail.is_empty() || self.text_w(FontId::Chrome, &prompt, track) <= avail {
-                    break;
-                }
-            }
-        }
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, iy, &prompt, TEXT_2, 1.0, track);
-        // caret block after the query, same as the palette input
-        let cwid = self.text_w(FontId::Chrome, &prompt, track);
-        Self::push_rect(out, bx + pad + cwid + 2.0 * s, iy, 2.0 * s, chrome_h, PAPER, 1.0);
+        let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
+        let avail = (right_edge - iw - t(tokens::SPACE_M)) - qx;
+        let shown = truncate_head(&query, (avail / cw).floor().max(2.0) as usize);
+        let qend = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &shown, if bad { self.palette.ansi_color(1) } else { TEXT_2 }, 1.0, track);
+        Self::push_round(out, qend + t(1.0), iy + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), PAPER, 1.0);
         if !info.is_empty() {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, right_edge - iw, iy, &info, MUTE, 1.0, track);
+            let c = if bad { self.palette.ansi_color(1) } else { MUTE };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, right_edge - iw, (by + (bh - small_h) / 2.0).round(), &info, c, 1.0, small_track);
         }
     }
 
@@ -5178,7 +5268,8 @@ impl Renderer {
         if x < bx || x >= bx + bw {
             return None;
         }
-        let rel = y - (by + row_h);
+        // rows start a small gap below the input row's separator
+        let rel = y - (by + row_h + tokens::px(tokens::SPACE_XS, self.scale));
         if rel < 0.0 {
             return None;
         }
@@ -5214,70 +5305,57 @@ impl Renderer {
         let Some(cv) = self.confirm_view.as_ref() else {
             return;
         };
-        let prompt = cv.prompt.clone();
-        let hint = cv.hint.clone();
-        let ink0 = self.palette.ink0;
-        let ink1 = self.palette.ink1;
-        let rule2 = self.palette.rule2;
-        let paper = self.palette.paper;
-        let mute = self.palette.mute;
-        let s = self.scale;
-        let hair = s.max(1.0);
-        let w = self.config.width as f32;
-        let h = self.config.height as f32;
-        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let row_h = chrome_h + 10.0 * s;
-        let pad = 18.0 * s;
-        // size the box to its content (snug, centered) instead of a fixed wide
-        // panel that strands a short prompt in the corner
-        let cw = self.text_w(FontId::Chrome, &prompt, track).max(self.text_w(FontId::Chrome, &hint, track));
-        let bw = (cw + pad * 2.0).clamp(260.0 * s, (520.0 * s).min(w - 80.0 * s));
-        let bh = (row_h * 2.0 + pad * 2.0).round();
-        let bx = ((w - bw) / 2.0).round();
-        let by = ((h - bh) / 2.0).round().max(self.title_bar_h + 12.0 * s);
-        Self::push_rect(out, bx - 2.0 * s, by + 6.0 * s, bw + 4.0 * s, bh, ink0, 0.5);
-        Self::push_rect(out, bx, by, bw, bh, ink1, 1.0);
-        Self::stroke_rect(out, (bx, by, bw, bh), hair, rule2);
-        let tx = bx + pad;
-        let ty = (by + pad).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty, &prompt, paper, 1.0, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty + row_h, &hint, mute, 1.0, track);
+        let (prompt, hint) = (cv.prompt.clone(), cv.hint.clone());
+        self.dialog(out, track, &prompt, None, &hint);
     }
 
-    /// the tab-rename field: a centered box with the editable name + a caret,
-    /// modeled on build_confirm
+    /// the tab-rename field: a centered box with the editable name + a caret
     fn build_rename(&mut self, out: &mut Vec<Instance>, track: f32) {
         let Some(rv) = self.rename_view.as_ref() else {
             return;
         };
-        let label = format!("rename tab: {}\u{2588}", rv.buf);
-        let hint = "enter: rename \u{b7} esc: cancel".to_string();
-        let ink0 = self.palette.ink0;
-        let ink1 = self.palette.ink1;
-        let rule2 = self.palette.rule2;
-        let paper = self.palette.paper;
-        let mute = self.palette.mute;
+        let buf = rv.buf.clone();
+        self.dialog(out, track, "Rename tab", Some(&buf), "enter rename  \u{b7}  esc cancel");
+    }
+
+    /// a small centered dialog: a title line, an optional text field with a
+    /// caret, and a key hint, sized to its content
+    fn dialog(&mut self, out: &mut Vec<Instance>, track: f32, title: &str, field: Option<&str>, hint: &str) {
         let s = self.scale;
-        let hair = s.max(1.0);
+        let t = |pt| tokens::px(pt, s);
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let row_h = chrome_h + 10.0 * s;
-        let pad = 18.0 * s;
-        // content-sized box, matching build_confirm, so a short name isn't lost in
-        // a wide panel (grows with the typed name up to the cap)
-        let cw = self.text_w(FontId::Chrome, &label, track).max(self.text_w(FontId::Chrome, &hint, track));
-        let bw = (cw + pad * 2.0).clamp(260.0 * s, (520.0 * s).min(w - 80.0 * s));
-        let bh = (row_h * 2.0 + pad * 2.0).round();
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let small_track = self.track_for(FontId::Small);
+        let pad = t(tokens::SPACE_XL);
+        let field_h = chrome_h + t(tokens::SPACE_M);
+        let gap = t(tokens::SPACE_M);
+        let content_w = self
+            .text_w(FontId::Chrome, title, track)
+            .max(self.text_w(FontId::Small, hint, small_track))
+            .max(field.map_or(0.0, |f| self.text_w(FontId::Chrome, f, track) + t(tokens::SPACE_L) * 2.0));
+        let bw = (content_w + pad * 2.0).clamp(t(300.0), t(520.0).min(w - t(tokens::SPACE_2XL) * 2.0)).round();
+        let bh = (pad * 2.0 + chrome_h + gap + small_h + field.map_or(0.0, |_| field_h + gap)).round();
         let bx = ((w - bw) / 2.0).round();
-        let by = ((h - bh) / 2.0).round().max(self.title_bar_h + 12.0 * s);
-        Self::push_rect(out, bx - 2.0 * s, by + 6.0 * s, bw + 4.0 * s, bh, ink0, 0.5);
-        Self::push_rect(out, bx, by, bw, bh, ink1, 1.0);
-        Self::stroke_rect(out, (bx, by, bw, bh), hair, rule2);
-        let tx = bx + pad;
-        let ty = (by + pad).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty, &label, paper, 1.0, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, ty + row_h, &hint, mute, 1.0, track);
+        let by = ((h - bh) / 2.0).round().max(self.title_bar_h + t(tokens::SPACE_M));
+        Self::push_rect(out, 0.0, 0.0, w, h, self.palette.ink0, 0.35);
+        self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_OVERLAY));
+        let mut y = by + pad;
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, y, title, self.palette.paper, 1.0, track);
+        y += chrome_h + gap;
+        if let Some(text) = field {
+            let fr = (bx + pad, y, bw - pad * 2.0, field_h);
+            Self::push_shape(out, fr, [t(tokens::RADIUS_ROW), 0.0, 0.0], self.palette.ink0, 0.8);
+            Self::push_ring(out, fr, t(tokens::RADIUS_ROW), s.max(1.0), self.palette.rule2, 1.0);
+            let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
+            let shown = truncate_head(text, ((fr.2 - t(tokens::SPACE_L) * 2.0) / cw).floor().max(2.0) as usize);
+            let ty = (y + (field_h - chrome_h) / 2.0).round();
+            let end = Self::draw_text(&mut self.atlas, out, FontId::Chrome, fr.0 + t(tokens::SPACE_M), ty, &shown, self.palette.text2, 1.0, track);
+            Self::push_round(out, end + t(1.0), ty + t(1.0), t(tokens::SPACE_2XS), chrome_h - t(2.0), t(1.0), self.palette.paper, 1.0);
+            y += field_h + gap;
+        }
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + pad, y, hint, self.palette.mute, 1.0, small_track);
     }
 
     /// plugins marketplace overlay: a centered panel listing installed + catalog
@@ -5328,7 +5406,12 @@ impl Renderer {
         let top = self.title_bar_h;
         let bottom = (h - self.status_bar_h).max(top + 1.0);
         Self::push_rect(out, 0.0, top, w, bottom - top, INK_1, 1.0);
-        Self::push_rect(out, 0.0, top, w, hair * 2.0, PAPER, 1.0);
+        let t = |pt| tokens::px(pt, s);
+        let card_r = t(tokens::RADIUS_ROW + 4.0);
+        let chip_r = t(tokens::RADIUS_CHIP);
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let small_track = self.track_for(FontId::Small);
+        let key_track = self.key_track();
 
         // centered content column
         let col_w = (940.0 * s).min(w - 96.0 * s);
@@ -5337,19 +5420,18 @@ impl Renderer {
         let line = chrome_h + 6.0 * s; // text line advance within a card
 
         // ---- header band: title + counts + close, subtitle, rule ----
-        let title_y = (top + 30.0 * s).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, title_y, "\u{f487}  PLUGINS", PAPER, 1.0, track);
-        let close_x = col_x + col_w - char_w;
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, close_x, title_y, "\u{00d7}", MUTE, 1.0, track);
-        self.market_hits.push((
-            (close_x - 4.0 * s, title_y - 2.0 * s, char_w + 8.0 * s, chrome_h + 4.0 * s),
-            MarketHit::Close,
-        ));
+        let title_y = (top + t(tokens::SPACE_2XL)).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, title_y, "Plugins", PAPER, 1.0, track);
+        let close_sz = (chrome_h + t(tokens::SPACE_S)).round();
+        let close_r = (col_x + col_w - close_sz, (title_y + (chrome_h - close_sz) / 2.0).round(), close_sz, close_sz);
+        Self::push_shape(out, close_r, [chip_r, 0.0, 0.0], INK_3, 0.6);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(8.0), hair, MUTE, 1.0);
+        self.market_hits.push((close_r, MarketHit::Close));
         let count = format!("{n_installed} installed \u{b7} {n_avail} available");
-        let count_w = self.text_w(FontId::Chrome, &count, track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, close_x - 20.0 * s - count_w, title_y, &count, MUTE, 1.0, track);
-        let sub_y = (title_y + chrome_h + 7.0 * s).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, sub_y, "browse and manage plugins \u{2014} each runs as its own process", MUTE, 1.0, track);
+        let count_w = self.text_w(FontId::Small, &count, small_track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, close_r.0 - t(tokens::SPACE_L) - count_w, (title_y + (chrome_h - small_h) / 2.0).round(), &count, MUTE, 1.0, small_track);
+        let sub_y = (title_y + chrome_h + t(tokens::SPACE_S)).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, sub_y, "Browse and manage plugins. Each runs as its own sandboxed process.", MUTE, 1.0, track);
         let rule_y = (sub_y + chrome_h + 14.0 * s).round();
         Self::push_rect(out, col_x, rule_y, col_w, hair, RULE_2, 1.0);
 
@@ -5390,12 +5472,14 @@ impl Renderer {
             };
             let ry = body_top + stride * vi as f32;
             let sel = idx == selected;
-            // each card is an outlined surface; the selected one brightens with a left accent
-            Self::push_rect(out, col_x, ry, col_w, card_h, if sel { INK_3 } else { INK_0 }, if sel { 1.0 } else { 0.3 });
-            Self::stroke_rect(out, (col_x, ry, col_w, card_h), hair, if sel { PAPER } else { RULE_2 });
+            // each card is a rounded surface; the selected one lifts and its
+            // edge brightens
+            let card = (col_x, ry, col_w, card_h);
             if sel {
-                Self::push_rect(out, col_x, ry, 3.0 * s, card_h, PAPER, 1.0);
+                Self::push_shadow(out, card, card_r, t(tokens::SPACE_M), t(tokens::SPACE_XS), INK_0, 0.3);
             }
+            Self::push_shape(out, card, [card_r, 0.0, 0.0], if sel { INK_3 } else { INK_0 }, if sel { 1.0 } else { 0.35 });
+            Self::push_ring(out, card, card_r, hair, if sel { MUTE } else { RULE_2 }, 1.0);
             let inner = col_x + pad;
             // line 1: name + version (left), action chip (right)
             let l1 = (ry + 13.0 * s).round();
@@ -5411,23 +5495,29 @@ impl Renderer {
             } else {
                 ("DISABLED", false, MUTE, RULE_2)
             };
-            let cw_chip = self.text_w(FontId::Chrome, chip, track);
-            let chip_w = cw_chip + 18.0 * s;
+            let mark = if r.installed && r.enabled { t(tokens::ICON - 1.0) + t(tokens::SPACE_XS) } else { 0.0 };
+            let cw_chip = self.text_w(FontId::Small, chip, key_track) + mark;
+            let chip_w = cw_chip + t(tokens::SPACE_L) + t(tokens::SPACE_XS);
             let chip_x = col_x + col_w - pad - chip_w;
-            let chip_h = chrome_h + 8.0 * s;
-            let chip_y = (l1 - 4.0 * s).round();
-            self.market_hits.push(((chip_x, chip_y, chip_w, chip_h), MarketHit::Chip(idx)));
+            let chip_h = small_h + t(tokens::SPACE_S);
+            let chip_y = (l1 + (chrome_h - chip_h) / 2.0).round();
+            let chip_rect = (chip_x, chip_y, chip_w, chip_h);
+            self.market_hits.push((chip_rect, MarketHit::Chip(idx)));
             if chip_fill {
-                Self::push_rect(out, chip_x, chip_y, chip_w, chip_h, PAPER, 1.0);
+                Self::push_shape(out, chip_rect, [chip_r, 0.0, 0.0], PAPER, 1.0);
             } else {
-                Self::stroke_rect(out, (chip_x, chip_y, chip_w, chip_h), hair, chip_border);
+                Self::push_ring(out, chip_rect, chip_r, hair, chip_border, 1.0);
             }
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, chip_x + (chip_w - cw_chip) / 2.0, l1, chip, chip_fg, 1.0, track);
+            let cx = chip_x + (chip_w - cw_chip) / 2.0;
+            if mark > 0.0 {
+                Self::draw_icon(&mut self.atlas, out, Icon::Check, (cx, chip_y, t(tokens::ICON - 1.0), chip_h), t(tokens::ICON - 1.0), hair, chip_fg, 1.0);
+            }
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx + mark, (chip_y + (chip_h - small_h) / 2.0).round(), chip, chip_fg, 1.0, key_track);
             // line 2: description (truncated to the card width)
             let l2 = (l1 + line).round();
             let dmax = ((col_w - 2.0 * pad) / char_w).floor() as usize;
             let desc = if r.desc.is_empty() {
-                "\u{2014}".to_string()
+                "no description".to_string()
             } else if r.desc.chars().count() > dmax {
                 let mut t: String = r.desc.chars().take(dmax.saturating_sub(1)).collect();
                 t.push('\u{2026}');
@@ -5439,17 +5529,20 @@ impl Renderer {
             // line 3: permission badges, or a note when there are none
             let l3 = (l2 + line).round();
             if r.perms.is_empty() {
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner, l3, "no special permissions", RULE_2, 1.0, track);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, inner, (l3 + (chrome_h - small_h) / 2.0).round(), "no special permissions", MUTE, 0.7, small_track);
             } else {
                 let mut px = inner;
+                let ph = small_h + t(tokens::SPACE_XS);
                 for p in &r.perms {
-                    let pw = self.text_w(FontId::Chrome, p, track) + 12.0 * s;
+                    let pw = self.text_w(FontId::Small, p, small_track) + t(tokens::SPACE_M);
                     if px + pw > col_x + col_w - pad {
                         break;
                     }
-                    Self::stroke_rect(out, (px, (l3 - 2.0 * s).round(), pw, chrome_h + 4.0 * s), hair, RULE_2);
-                    let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, px + 6.0 * s, l3, p, TEXT_2, 1.0, track);
-                    px += pw + 6.0 * s;
+                    let pr = (px, (l3 + (chrome_h - ph) / 2.0).round(), pw, ph);
+                    Self::push_shape(out, pr, [chip_r, 0.0, 0.0], INK_1, 0.8);
+                    Self::push_ring(out, pr, chip_r, hair, RULE_2, 1.0);
+                    let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, px + t(6.0), (pr.1 + (ph - small_h) / 2.0).round(), p, TEXT_2, 1.0, small_track);
+                    px += pw + t(6.0);
                 }
             }
             self.market_hits.push(((col_x, ry, col_w, card_h), MarketHit::Card(idx)));
@@ -5459,61 +5552,78 @@ impl Renderer {
         Self::push_rect(out, col_x, body_bottom + 6.0 * s, col_w, hair, RULE_2, 1.0);
         let fy = (body_bottom + 6.0 * s + (foot_h - chrome_h) / 2.0).round();
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, fy, &status, MUTE, 1.0, track);
-        let hints = "\u{2191}\u{2193} select \u{b7} enter install/toggle \u{b7} r remove \u{b7} esc close";
-        let hints_w = self.text_w(FontId::Chrome, hints, track);
+        let hints = "\u{2191}\u{2193} select  \u{b7}  enter install/toggle  \u{b7}  r remove  \u{b7}  esc close";
+        let hints_w = self.text_w(FontId::Small, hints, small_track);
         let status_w = self.text_w(FontId::Chrome, &status, track);
-        if hints_w + status_w + 24.0 * s < col_w {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + col_w - hints_w, fy, hints, RULE_2, 1.0, track);
+        if hints_w + status_w + t(tokens::SPACE_XL) < col_w {
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, col_x + col_w - hints_w, (fy + (chrome_h - small_h) / 2.0).round(), hints, MUTE, 0.8, small_track);
         }
     }
 
-    /// `LABEL ─────────` section header with a rule filling the remaining width
-    #[allow(clippy::too_many_arguments)]
-    fn section_label(&mut self, out: &mut Vec<Instance>, x: f32, y: f32, w: f32, text: &str, wide: f32, rule: Rgb, mute: Rgb) {
-        let tw = self.text_w(FontId::Chrome, text, wide);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, x, y, text, mute, 1.0, wide);
+    /// `LABEL ─────────` section header: small caps, then a rule filling the
+    /// remaining width
+    fn section_label(&mut self, out: &mut Vec<Instance>, x: f32, y: f32, w: f32, text: &str) {
+        let key_track = self.key_track();
+        let tw = self.text_w(FontId::Small, text, key_track);
+        let (chrome_h, small_h) = (self.atlas.metrics(FontId::Chrome).cell_h, self.atlas.metrics(FontId::Small).cell_h);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (y + (chrome_h - small_h) / 2.0).round(), text, self.palette.mute, 1.0, key_track);
         let hair = self.scale.max(1.0);
-        let ry = (y + self.atlas.metrics(FontId::Chrome).cell_h / 2.0).round();
-        let rx = x + tw + 12.0 * self.scale;
-        Self::push_rect(out, rx, ry, (x + w - rx).max(0.0), hair, rule, 1.0);
+        let ry = (y + chrome_h / 2.0).round();
+        let rx = x + tw + tokens::px(tokens::SPACE_M, self.scale);
+        Self::push_rect(out, rx, ry, (x + w - rx).max(0.0), hair, self.palette.rule, 1.0);
     }
 
-    /// an outlined button with centered label that cycles a value on click
+    /// a setting's name: small caps in the Small face, centered on its row
+    fn setting_label(&mut self, out: &mut Vec<Instance>, x: f32, row_y: f32, bh: f32, text: &str) {
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let key_track = self.key_track();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (row_y + (bh - small_h) / 2.0).round(), text, self.palette.mute, 1.0, key_track);
+    }
+
+    /// a rounded field that cycles its value on click, with a chevron
     fn cycle_btn(&mut self, out: &mut Vec<Instance>, rect: (f32, f32, f32, f32), text: &str, hot: Hot, track: f32) {
+        let t = |pt| tokens::px(pt, self.scale);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let (bx, by, bw, bh) = rect;
-        // ease the bright fill in on hover (and cross-fade the label dark) to
-        // match the title bar instead of snapping
-        let he = if self.hovered == Some(hot) { self.hover_ease() } else { 0.0 };
-        Self::stroke_rect(out, (bx, by, bw, bh), 1.0, self.palette.rule2);
+        let he = self.hover_a(hot);
+        let r = t(tokens::RADIUS_ROW);
+        Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink0, 0.6);
         if he > 0.0 {
-            Self::push_rect(out, bx, by, bw, bh, self.palette.paper, he);
+            Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink3, he);
         }
-        let tw = self.text_w(FontId::Chrome, text, track);
-        let col = self.palette.text2.lerp(self.palette.ink0, he);
-        let _ = Self::draw_text(
-            &mut self.atlas, out, FontId::Chrome,
-            bx + (bw - tw) / 2.0, (by + (bh - chrome_h) / 2.0).round(), text, col, 1.0, track,
-        );
+        Self::push_ring(out, rect, r, self.scale.max(1.0), self.palette.rule2.lerp(self.palette.mute, he * 0.5), 1.0);
+        // cycling fields carry a chevron; a plain action button (browse) doesn't
+        let icon = if hot == Hot::OpenPlugins { 0.0 } else { t(tokens::ICON - 2.0) };
+        let room = bw - t(tokens::SPACE_M) * 2.0 - icon - t(tokens::SPACE_XS);
+        let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
+        let shown = truncate_tail(text, (room / cw).floor().max(2.0) as usize);
+        let tx = if icon > 0.0 { bx + t(tokens::SPACE_M) } else { (bx + (bw - self.text_w(FontId::Chrome, &shown, track)) / 2.0).round() };
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, (by + (bh - chrome_h) / 2.0).round(), &shown, self.palette.text2, 1.0, track);
+        if icon == 0.0 {
+            return;
+        }
+        let ix = bx + bw - t(tokens::SPACE_M) - icon;
+        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, (ix, by, icon, bh), icon, self.scale.max(1.0), self.palette.mute.lerp(self.palette.text2, he), 1.0);
     }
 
-    /// an on/off pill: bright label = on, dim = off; fills on hover
-    fn toggle_btn(&mut self, out: &mut Vec<Instance>, rect: (f32, f32, f32, f32), on: bool, hot: Hot, track: f32) {
-        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let (bx, by, bw, bh) = rect;
-        let he = if self.hovered == Some(hot) { self.hover_ease() } else { 0.0 };
-        Self::stroke_rect(out, (bx, by, bw, bh), 1.0, self.palette.rule2);
-        if he > 0.0 {
-            Self::push_rect(out, bx, by, bw, bh, self.palette.paper, he);
+    /// an on/off switch at the leading edge of its row rect
+    fn toggle_btn(&mut self, out: &mut Vec<Instance>, rect: (f32, f32, f32, f32), on: bool, hot: Hot, _track: f32) {
+        let t = |pt| tokens::px(pt, self.scale);
+        let (bx, by, _bw, bh) = rect;
+        let he = self.hover_a(hot);
+        let (sw, sh) = (t(32.0), t(18.0));
+        let track_r = (bx, (by + (bh - sh) / 2.0).round(), sw, sh);
+        let knob = sh - t(tokens::SPACE_XS);
+        let kx = if on { track_r.0 + sw - knob - t(tokens::SPACE_2XS) } else { track_r.0 + t(tokens::SPACE_2XS) };
+        let ky = track_r.1 + t(tokens::SPACE_2XS);
+        if on {
+            Self::push_shape(out, track_r, [sh / 2.0, 0.0, 0.0], self.palette.paper, 0.9 + 0.1 * he);
+            Self::push_round(out, kx, ky, knob, knob, knob / 2.0, self.palette.ink0, 1.0);
+        } else {
+            Self::push_shape(out, track_r, [sh / 2.0, 0.0, 0.0], self.palette.ink3, 1.0);
+            Self::push_ring(out, track_r, sh / 2.0, self.scale.max(1.0), self.palette.rule2.lerp(self.palette.mute, he), 1.0);
+            Self::push_round(out, kx, ky, knob, knob, knob / 2.0, self.palette.mute.lerp(self.palette.text2, he), 1.0);
         }
-        let txt = if on { "on" } else { "off" };
-        let tw = self.text_w(FontId::Chrome, txt, track);
-        let base = if on { self.palette.paper } else { self.palette.mute };
-        let col = base.lerp(self.palette.ink0, he);
-        let _ = Self::draw_text(
-            &mut self.atlas, out, FontId::Chrome,
-            bx + (bw - tw) / 2.0, (by + (bh - chrome_h) / 2.0).round(), txt, col, 1.0, track,
-        );
     }
 
     /// a theme chip: name on top + a live swatch strip of that theme's palette,
@@ -5525,25 +5635,13 @@ impl Renderer {
         let s = self.scale;
         let cw = self.atlas.metrics(FontId::Chrome).cell_w;
         let (bx, by, bw, bh) = rect;
-        let hov = self.hovered == Some(Hot::ThemeAuto);
-        let he = if hov { self.hover_ease() } else { 0.0 };
-        if active {
-            Self::push_rect(out, bx, by, bw, bh, self.palette.paper, 1.0);
-        } else {
-            Self::stroke_rect(out, (bx, by, bw, bh), 1.0, self.palette.rule2);
-            if he > 0.0 {
-                Self::push_rect(out, bx, by, bw, bh, self.palette.ink4, he);
-            }
-        }
+        let he = self.hover_a(Hot::ThemeAuto);
+        self.chip_frame(out, rect, active, he);
         let name = "auto";
         let maxc = (((bw - 8.0 * s) / (cw + track)).floor().max(1.0)) as usize;
         let t: String = name.chars().take(maxc).collect();
         let tw = self.text_w(FontId::Chrome, &t, track);
-        let col = if active {
-            self.palette.ink0
-        } else {
-            self.palette.text2.lerp(self.palette.paper, he)
-        };
+        let col = if active { self.palette.paper } else { self.palette.text2.lerp(self.palette.paper, he) };
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + 6.0 * s).round(), &t, col, 1.0, track);
         // half-and-half swatch: the dark default's bg beside the light one's
         let dark = Palette::from_theme(ThemeId::Instrument);
@@ -5554,9 +5652,10 @@ impl Renderer {
         let half_w = ((strip_w - gap) / 2.0).max(1.0);
         let sh = 11.0 * s;
         let sy = by + bh - sh - 6.0 * s;
-        Self::push_rect(out, bx + inset, sy, half_w, sh, dark.bg, 1.0);
-        Self::push_rect(out, bx + inset + half_w + gap, sy, half_w, sh, light.bg, 1.0);
-        Self::stroke_rect(out, (bx + inset, sy, strip_w, sh), 1.0, self.palette.rule2);
+        let r = tokens::px(2.0, s);
+        Self::push_round(out, bx + inset, sy, half_w, sh, r, dark.bg, 1.0);
+        Self::push_round(out, bx + inset + half_w + gap, sy, half_w, sh, r, light.bg, 1.0);
+        Self::push_ring(out, (bx + inset, sy, strip_w, sh), r, 1.0, self.palette.rule2, 1.0);
     }
 
     fn theme_chip(&mut self, out: &mut Vec<Instance>, rect: (f32, f32, f32, f32), id: ThemeId, active: bool, track: f32) {
@@ -5564,16 +5663,8 @@ impl Renderer {
         let cw = self.atlas.metrics(FontId::Chrome).cell_w;
         let (bx, by, bw, bh) = rect;
         let hot = Hot::ThemeSet(id);
-        let hov = self.hovered == Some(hot);
-        let he = if hov { self.hover_ease() } else { 0.0 };
-        if active {
-            Self::push_rect(out, bx, by, bw, bh, self.palette.paper, 1.0);
-        } else {
-            Self::stroke_rect(out, (bx, by, bw, bh), 1.0, self.palette.rule2);
-            if he > 0.0 {
-                Self::push_rect(out, bx, by, bw, bh, self.palette.ink4, he);
-            }
-        }
+        let he = self.hover_a(hot);
+        self.chip_frame(out, rect, active, he);
         // theme name (truncated to fit), centered at the top
         let name = id.name();
         let maxc = (((bw - 8.0 * s) / (cw + track)).floor().max(1.0)) as usize;
@@ -5583,11 +5674,7 @@ impl Renderer {
             name.to_string()
         };
         let tw = self.text_w(FontId::Chrome, &t, track);
-        let col = if active {
-            self.palette.ink0
-        } else {
-            self.palette.text2.lerp(self.palette.paper, he)
-        };
+        let col = if active { self.palette.paper } else { self.palette.text2.lerp(self.palette.paper, he) };
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + (bw - tw) / 2.0, (by + 6.0 * s).round(), &t, col, 1.0, track);
 
         // swatch strip: bg · fg · accent · ansi red · ansi blue
@@ -5606,20 +5693,25 @@ impl Renderer {
         let cell_w = ((strip_w - gap * (n - 1.0)) / n).max(1.0);
         let sh = 11.0 * s;
         let sy = by + bh - sh - 6.0 * s;
-        let dim = |c: Rgb| Rgb::new(
-            (c.r as f32 * 0.72) as u8,
-            (c.g as f32 * 0.72) as u8,
-            (c.b as f32 * 0.72) as u8,
-        );
+        let r = tokens::px(2.0, s);
         for (i, c) in sw.into_iter().enumerate() {
             let sx = bx + inset + i as f32 * (cell_w + gap);
-            // each swatch is a small vertical gradient for depth; on hover the
-            // (inactive) chip flips it bottom→top so the strip reads as lifted
-            if hov && !active {
-                Self::push_vgradient(out, sx, sy, cell_w, sh, dim(c), c, 6);
-            } else {
-                Self::push_vgradient(out, sx, sy, cell_w, sh, c, dim(c), 6);
-            }
+            Self::push_round(out, sx, sy, cell_w, sh, r, c, 1.0);
+        }
+    }
+
+    /// a theme card's surface: rounded, lit on hover, ringed bright when active
+    fn chip_frame(&self, out: &mut Vec<Instance>, rect: Rect, active: bool, he: f32) {
+        let r = tokens::px(tokens::RADIUS_ROW, self.scale);
+        let hair = self.scale.max(1.0);
+        Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink0, 0.6);
+        if he > 0.0 || active {
+            Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink3, if active { 1.0 } else { he });
+        }
+        if active {
+            Self::push_ring(out, rect, r, hair * 1.5, self.palette.paper, 1.0);
+        } else {
+            Self::push_ring(out, rect, r, hair, self.palette.rule2, 1.0);
         }
     }
 
@@ -5639,53 +5731,75 @@ impl Renderer {
         let INK_0 = self.palette.ink0;
         let RULE_2 = self.palette.rule2;
         let TEXT_2 = self.palette.text2;
-        let PAPER = self.palette.paper;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
 
-        for (rect, glyph, hot) in [(dec, "\u{2013}", hot_dec), (inc, "+", hot_inc)] {
-            let (bx, by, bw, bh) = rect;
-            let he = if self.hovered == Some(hot) { self.hover_ease() } else { 0.0 };
-            // 1px outline button, with the fill easing in over it on hover
-            Self::push_rect(out, bx, by, bw, 1.0, RULE_2, 1.0);
-            Self::push_rect(out, bx, by + bh - 1.0, bw, 1.0, RULE_2, 1.0);
-            Self::push_rect(out, bx, by, 1.0, bh, RULE_2, 1.0);
-            Self::push_rect(out, bx + bw - 1.0, by, 1.0, bh, RULE_2, 1.0);
+        let r = tokens::px(tokens::RADIUS_ROW, self.scale);
+        let hair = self.scale.max(1.0);
+        // one rounded well holding [−] value [+]; each button lights on hover
+        let (dx, dy, dw, dh) = dec;
+        let well = (dx, dy, inc.0 + inc.2 - dx, dh);
+        Self::push_shape(out, well, [r, 0.0, 0.0], INK_0, 0.6);
+        Self::push_ring(out, well, r, hair, RULE_2, 1.0);
+        for (rect, icon, hot) in [(dec, Icon::Minimize, hot_dec), (inc, Icon::Plus, hot_inc)] {
+            let he = self.hover_a(hot);
             if he > 0.0 {
-                Self::push_rect(out, bx, by, bw, bh, PAPER, he);
+                let inset = tokens::px(tokens::SPACE_2XS, self.scale);
+                let lit = (rect.0 + inset, rect.1 + inset, rect.2 - inset * 2.0, rect.3 - inset * 2.0);
+                Self::push_shape(out, lit, [r - inset, 0.0, 0.0], self.palette.ink3, he);
             }
-            let gx = (bx + (bw - self.atlas.metrics(FontId::Chrome).cell_w) / 2.0).round();
-            let gy = (by + (bh - chrome_h) / 2.0).round();
-            let col = TEXT_2.lerp(INK_0, he);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, gx, gy, glyph, col, 1.0, track);
+            let size = tokens::px(tokens::ICON - 2.0, self.scale);
+            Self::draw_icon(&mut self.atlas, out, icon, rect, size, hair, self.palette.mute.lerp(TEXT_2, 0.4 + 0.6 * he), 1.0);
         }
         // value centered between the buttons
-        let (dx, dy, dw, _dh) = dec;
-        let vx = dx + dw + (val_w - self.text_w(FontId::Chrome, val, track)) / 2.0;
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, vx, dy + (4.0 * self.scale), val, TEXT_2, 1.0, track);
+        let vx = (dx + dw + (val_w - self.text_w(FontId::Chrome, val, track)) / 2.0).round();
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, vx, (dy + (dh - chrome_h) / 2.0).round(), val, TEXT_2, 1.0, track);
     }
 
-    /// draw a `KEY value` status segment; returns the pen end-x
+    /// a status-bar "KEY value" pair: tracked small-caps key, then its value
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    fn seg(
-        atlas: &mut GlyphAtlas,
-        out: &mut Vec<Instance>,
-        x: f32,
-        y_top: f32,
-        key: &str,
-        val: &str,
-        track: f32,
-        wide: f32,
-        scale: f32,
-        key_c: Rgb,
-        val_c: Rgb,
-    ) -> f32 {
-        let mut px = Self::draw_text(atlas, out, FontId::Chrome, x, y_top, key, key_c, 1.0, wide);
-        px += (7.0 * scale).round();
-        Self::draw_text(atlas, out, FontId::Chrome, px, y_top, val, val_c, 1.0, track)
+    fn status_keyed(&mut self, out: &mut Vec<Instance>, x: f32, y_top: f32, key: &str, val: &str, key_c: Rgb, val_c: Rgb) -> f32 {
+        let (key_track, track) = (self.key_track(), self.track_for(FontId::Small));
+        let px = Self::draw_text(&mut self.atlas, out, FontId::Small, x, y_top, key, key_c, 1.0, key_track)
+            + tokens::px(tokens::SPACE_S, self.scale);
+        Self::draw_text(&mut self.atlas, out, FontId::Small, px, y_top, val, val_c, 1.0, track)
     }
 
-    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, focus_ease: f32, bare: bool) -> Result<()> {
+    /// color and alpha of a command/attention dot: 1 running (breathing),
+    /// 2 done, 3 bell, 4 failed; None for 0
+    fn status_dot(&self, status: u8) -> Option<(Rgb, f32)> {
+        match status {
+            0 => None,
+            1 => Some((self.palette.mute, motion::breathe(self.start.elapsed().as_secs_f32()))),
+            2 => Some((self.palette.ansi_color(2), 1.0)),
+            4 => Some((self.palette.ansi_color(1), 1.0)),
+            _ => Some((self.palette.paper, 1.0)),
+        }
+    }
+
+    /// the focused pane's command readout and its mark (1 running, 2 ok,
+    /// 4 failed), reformatted only when the shown text would change
+    fn command_readout(&mut self) -> Option<(String, u8)> {
+        let (key, mark) = match self.status.command {
+            CommandState::Idle => return None,
+            CommandState::Running(since) => (since.elapsed().as_secs(), 1),
+            CommandState::Finished { code, took } => {
+                let failed = code.is_some_and(|c| c != 0);
+                (took.as_millis() as u64 / 100 + (1 << 40) + if failed { 1 << 41 } else { 0 }, if failed { 4 } else { 2 })
+            }
+        };
+        if self.status_cmd.0 != key {
+            let text = match self.status.command {
+                CommandState::Running(since) => format!("running {}", fmt_duration(since.elapsed())),
+                CommandState::Finished { code: Some(c), took } if c != 0 => format!("exit {c} \u{00b7} {}", fmt_duration(took)),
+                CommandState::Finished { took, .. } => fmt_duration(took),
+                CommandState::Idle => String::new(),
+            };
+            self.status_cmd = (key, text);
+        }
+        Some((self.status_cmd.1.clone(), mark))
+    }
+
+    pub fn render(&mut self, panes: &[PaneView], focused: bool, maximized: bool, bare: bool) -> Result<()> {
         // a device-lost callback fired since the last frame: rebuild the gpu now,
         // before building/uploading anything against the dead device
         if self.device_lost.swap(false, Ordering::SeqCst)
@@ -5693,7 +5807,7 @@ impl Renderer {
         {
             self.recreate(w)?;
         }
-        let instances = self.build(panes, focused, maximized, focus_ease, bare);
+        let instances = self.build(panes, focused, maximized, bare);
         self.upload_atlas();
 
         let needed = instances.len() as u64;
@@ -5936,7 +6050,7 @@ impl Renderer {
         path: &str,
     ) -> std::io::Result<()> {
         use std::io::Error;
-        let instances = self.build(panes, focused, maximized, 1.0, bare);
+        let instances = self.build(panes, focused, maximized, bare);
         self.upload_atlas();
 
         let needed = instances.len() as u64;
@@ -6056,13 +6170,15 @@ impl Renderer {
 /// falling back to the dock body color for anything unrecognized; a pure mirror
 /// of dock_color so the role table stays unit-testable
 fn resolve_dock_color(p: &Palette, spec: &str) -> Rgb {
+    // a raw hex snaps to the nearest color the theme already has, so a plugin
+    // stays on-palette in every theme instead of carrying its own colors
     if let Some(hex) = spec.strip_prefix('#')
         && let Some(c) = Renderer::parse_hex_rgb(hex)
     {
-        return c;
+        return nearest_theme_color(p, c);
     }
     match spec {
-        "paper" => p.paper,
+        "paper" | "accent" => p.paper,
         "text" | "text2" => p.text2,
         "mute" => p.mute,
         "rule" => p.rule,
@@ -6071,9 +6187,31 @@ fn resolve_dock_color(p: &Palette, spec: &str) -> Rgb {
         "ink0" => p.ink0,
         "ink3" => p.ink3,
         "ink4" => p.ink4,
-        "accent" => p.paper,
-        _ => p.text2,
+        "err" => p.ansi_color(1),
+        "ok" => p.ansi_color(2),
+        "warn" => p.ansi_color(3),
+        "info" => p.ansi_color(4),
+        s => s
+            .strip_prefix("ansi")
+            .and_then(|n| n.parse::<u8>().ok())
+            .filter(|&n| n < 16)
+            .map_or(p.text2, |n| p.ansi_color(n)),
     }
+}
+
+/// the theme color perceptually closest to `c` (redmean-weighted rgb distance)
+/// among its chrome tokens and 16 ansi colors
+fn nearest_theme_color(p: &Palette, c: Rgb) -> Rgb {
+    let dist = |a: Rgb, b: Rgb| {
+        let rm = (a.r as f32 + b.r as f32) / 2.0;
+        let (dr, dg, db) = (a.r as f32 - b.r as f32, a.g as f32 - b.g as f32, a.b as f32 - b.b as f32);
+        (2.0 + rm / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rm) / 256.0) * db * db
+    };
+    [p.paper, p.text2, p.mute, p.rule, p.rule2, p.ink0, p.ink1, p.ink3, p.ink4]
+        .into_iter()
+        .chain((0..16).map(|n| p.ansi_color(n)))
+        .min_by(|a, b| dist(*a, c).total_cmp(&dist(*b, c)))
+        .unwrap_or(p.text2)
 }
 
 /// map a Tier-2 primitive's normalized rect (x,y,w,h in 0..1) into the pixel box
@@ -6124,7 +6262,7 @@ impl Renderer {
         let run = |atlas: &mut GlyphAtlas, out: &mut Vec<Instance>| {
             out.clear();
             Self::draw_grid(
-                atlas, &palette, out, term, 0.0, 0.0, true, true, true, 2.0, CursorShape::Block, None, None, &[], true, 1.0, true,
+                atlas, &palette, out, term, 0.0, 0.0, true, 1.0, 1.0, 2.0, CursorShape::Block, None, None, &[], true, 1.0, true,
             );
         };
         for _ in 0..(iters / 8).max(1) {
@@ -6161,8 +6299,8 @@ mod tests {
             0.0,
             0.0,
             true,
-            true,
-            true,
+            1.0,
+            1.0,
             2.0,
             CursorShape::Block,
             None,
@@ -6272,8 +6410,8 @@ mod tests {
                 0.0,
                 0.0,
                 true,
-                true,
-                true,
+                1.0,
+                1.0,
                 2.0,
                 CursorShape::Block,
                 None,
@@ -6309,8 +6447,8 @@ mod tests {
                 0.0,
                 0.0,
                 true,
-                true,
-                true,
+                1.0,
+                1.0,
                 2.0,
                 CursorShape::Block,
                 None,
@@ -6346,8 +6484,8 @@ mod tests {
             0.0,
             0.0,
             true,
-            true,
-            true,
+            1.0,
+            1.0,
             2.0,
             CursorShape::Block,
             None,
@@ -6397,8 +6535,8 @@ mod tests {
             0.0,
             0.0,
             true,
-            true,
-            true,
+            1.0,
+            1.0,
             2.0,
             CursorShape::Block,
             None,
@@ -6443,8 +6581,8 @@ mod tests {
             0.0,
             0.0,
             true,
-            true,
-            true,
+            1.0,
+            1.0,
             2.0,
             CursorShape::Block,
             None,
@@ -6586,8 +6724,8 @@ mod tests {
                 0.0,
                 0.0,
                 true,
-                true,
-                true,
+                1.0,
+                1.0,
                 2.0,
                 CursorShape::Block,
                 None,
@@ -6623,8 +6761,8 @@ mod tests {
             0.0,
             0.0,
             true,
-            true,
-            true,
+            1.0,
+            1.0,
             2.0,
             CursorShape::Block,
             None,
@@ -6659,7 +6797,7 @@ mod tests {
 
     #[test]
     fn dock_color_resolves_roles_hex_and_fallback() {
-        use super::{resolve_dock_color, Palette, Rgb, ThemeId};
+        use super::{resolve_dock_color, Palette, ThemeId};
         let p = Palette::from_theme(ThemeId::Instrument);
         assert_eq!(resolve_dock_color(&p, "paper"), p.paper);
         assert_eq!(resolve_dock_color(&p, "ink"), p.ink1);
@@ -6667,8 +6805,13 @@ mod tests {
         assert_eq!(resolve_dock_color(&p, "rule2"), p.rule2);
         // accent maps to the high-contrast paper color, like the widget title
         assert_eq!(resolve_dock_color(&p, "accent"), p.paper);
-        // a #hex spec wins over the role table
-        assert_eq!(resolve_dock_color(&p, "#6486a6"), Rgb::new(0x64, 0x86, 0xa6));
+        // a #hex spec snaps to the theme's nearest color: its own exact color
+        // comes back unchanged, and pure red lands on the theme's red
+        assert_eq!(resolve_dock_color(&p, &format!("#{:02x}{:02x}{:02x}", p.paper.r, p.paper.g, p.paper.b)), p.paper);
+        assert_eq!(resolve_dock_color(&p, "#ff0000"), p.ansi_color(1));
+        assert_eq!(resolve_dock_color(&p, "ok"), p.ansi_color(2));
+        assert_eq!(resolve_dock_color(&p, "ansi12"), p.ansi_color(12));
+        assert_eq!(resolve_dock_color(&p, "ansi16"), p.text2);
         // anything unrecognized falls back to the dock body color
         assert_eq!(resolve_dock_color(&p, "chartreuse"), p.text2);
         assert_eq!(resolve_dock_color(&p, "#zzz"), p.text2);
@@ -6861,6 +7004,7 @@ mod hit_tests {
         r.set_palette(Some(PaletteView {
             query: "ne".into(),
             items: vec!["new tab".into(), "new tab here".into(), "new window".into()],
+            hints: Vec::new(),
             selected: 0,
             scope: "commands",
         }));
@@ -6883,6 +7027,7 @@ mod hit_tests {
         r.set_palette(Some(PaletteView {
             query: String::new(),
             items: (0..20).map(|i| format!("font {i}")).collect(),
+            hints: Vec::new(),
             selected: 15,
             scope: "fonts",
         }));
@@ -6928,7 +7073,8 @@ mod hit_tests {
         // shared geometry must resolve each of its rows and reject the outside
         let items: Vec<String> = TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
         r.set_pane_menu(Some(PaneMenuView { x: 60.0, y: 60.0, hovered: None, items, accents: Vec::new() }));
-        let (bx, by, mw, row_h, pad) = r.pane_menu_geom(60.0, 60.0, TAB_MENU_ITEMS.len());
+        let labels: Vec<String> = TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
+        let (bx, by, mw, row_h, pad) = r.pane_menu_geom(60.0, 60.0, &labels, false);
         for i in 0..TAB_MENU_ITEMS.len() {
             let cy = by + pad + row_h * (i as f32 + 0.5);
             assert_eq!(r.pane_menu_item_at(bx + mw / 2.0, cy), Some(i));

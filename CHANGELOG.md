@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Interface
+- The chrome is rebuilt on one spacing, type, and motion scale. Overlays, menus, the find bar, dialogs, the marketplace, and settings share rounded surfaces with soft shadows, inset row highlights, and an open animation that grows from 98% while fading in. Window controls, tab buttons, and settings controls use one set of anti-aliased vector icons, and window close turns red on hover.
+- Tabs size to their titles and give way widest-first when the strip fills. The active tab keeps its fill and a short rounded rail that springs between tabs; hairline dividers separate idle tabs. When a background tab's command finishes, its rail draws in green or red, holds, and settles into a dot. A running command's dot breathes.
+- Split panes meet on a single hairline. Focus dims the other panes instead of boxing the focused one, crossfading on every switch. A bell now pools a warm glow along the pane's inner edge.
+- The status bar shows the focused pane's directory, a live timer while a command runs, then its result and duration. The grid size appears for a moment after a resize. The command palette lists each command's shortcut.
+- Hover fills fade in and fade out more slowly, the cursor blink eases in and out, and every positional animation becomes a plain fade when the system asks for reduced motion.
+- Plugin widget colors accept `ok`, `err`, `warn`, `info`, and `ansi0` to `ansi15`. A raw hex color snaps to the active theme's nearest color, so widgets stay on-palette in every theme.
 - Hovered web links now show their destination in the status bar. Ctrl-click requires a reviewed target with a plain ASCII authority, rejects directional formatting, and pauses if the destination changes under the pointer.
 - Precision wheels and touchpads accumulate small zoom deltas and reset at gesture boundaries, giving each font-size step deliberate weight.
 - Find keeps its newest matches within fixed scan, run, and result budgets, refreshes live output without losing the selected result, and paints wrapped or wide-cell matches across every covered row. Reflowed and evicted results cannot leave stale highlights or dead navigation entries.
