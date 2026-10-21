@@ -26,15 +26,15 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "embed-manifest"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94cdc65b1cf9e871453ce2f86f5aaec24ff2eaa36a1fa3e02e441dddc3613b99"
+checksum = "ba92c8f4591bf29f89716b45e5f5f56577adbb81426e5620c6e994da7c88bb7a"
 
 [[package]]
 name = "embed-resource"
-version = "3.0.11"
+version = "3.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbfdaacccebec3b28e4866b8973543c7647797db5ada1bdab552e48fe665fbbd"
+checksum = "6168487b5e7eb2673e6efe1200b1848016e436a6ca0b8031bf04bd9d493a249f"
 dependencies = [
  "cc",
  "memchr",
@@ -438,9 +438,9 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "winreg"
-version = "0.55.0"
+version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
  "windows-sys",
