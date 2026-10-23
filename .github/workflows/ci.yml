@@ -39,7 +39,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: build
         run: cargo build --all-targets --locked
       - name: test
@@ -102,7 +102,7 @@ jobs:
           echo "HOME=$HOME CARGO_HOME=${CARGO_HOME:-<unset>} rustup=$(command -v rustup)"
           echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           dirname "$(rustup which cargo)" | tee -a "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: system deps
         run: |
           if command -v pkg-config >/dev/null && pkg-config --exists wayland-client xkbcommon x11 && command -v bwrap >/dev/null && command -v unzip >/dev/null && command -v zip >/dev/null; then
@@ -151,7 +151,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: install cargo-audit
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
