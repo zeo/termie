@@ -3708,7 +3708,18 @@ struct PaneWindow {
     /// set when this window's paint is deferred because a pane is mid
     /// synchronized-output (DEC 2026) frame; the deadline forces a paint if the frame stalls
     sync_redraw_pending: Option<Instant>,
+    /// what the screen reader last got of the focused pane's text; while it
+    /// still matches, the text runs are left out of the update
+    a11y_screen: Option<A11yScreenKey>,
+    /// new output headed for the screen reader's live region
+    announce: a11y::Announcer,
+    /// the user typed into the focused pane since the announcer last looked
+    typed: bool,
 }
+
+/// pane id, terminal revision, scroll offset, grid origin and cell size bits,
+/// and the visible selection span
+type A11yScreenKey = (usize, u64, usize, [u64; 4], Option<render::SelSpan>);
 
 const SYNC_PAINT_DEADLINE: Duration = Duration::from_millis(100);
 
@@ -3768,6 +3779,9 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         confirm: None,
         rename: None,
         sync_redraw_pending: None,
+        a11y_screen: None,
+        announce: a11y::Announcer::default(),
+        typed: false,
     }
 }
 
@@ -6432,11 +6446,16 @@ impl App {
         }
     }
 
-    fn update_window_a11y(&mut self, id: WindowId) {
+    /// a screen reader attached to window `id` and needs the whole tree
+    fn send_initial_a11y_tree(&mut self, id: WindowId) {
+        let fresh = |app: &mut App| {
+            app.pw.a11y_screen = None;
+            app.update_a11y();
+        };
         if self.pw.window.as_ref().map(|window| window.id()) == Some(id) {
-            self.update_a11y();
+            fresh(self);
         } else if let Some(index) = self.satellite_for(id) {
-            self.with_window(index, |app| app.update_a11y());
+            self.with_window(index, fresh);
         }
     }
 
@@ -6447,23 +6466,37 @@ impl App {
         }
     }
 
-    fn build_a11y_update(&self) -> accesskit::TreeUpdate {
+    fn build_a11y_update(&mut self) -> accesskit::TreeUpdate {
         let window_bounds = self.pw.window.as_ref().map(|w| {
             let s = w.inner_size();
             accesskit::Rect::new(0.0, 0.0, s.width as f64, s.height as f64)
         });
-        let text = self
-            .active_focused_id()
-            .and_then(|id| {
-                self.pw.tabs
-                    .get(self.pw.active_tab)
-                    .and_then(|t| t.root.as_ref())
-                    .and_then(|r| find_pane(r, id))
-            })
-            .map(|p| a11y::flatten(&p.term))
-            .unwrap_or_default();
+        let pane = self.active_focused_id().and_then(|id| {
+            self.pw.tabs
+                .get(self.pw.active_tab)
+                .and_then(|t| t.root.as_ref())
+                .and_then(|r| find_pane(r, id))
+        });
+        let grid_rect = pane.and_then(|p| {
+            let rect = self.pw.layout_cache.iter().find(|(id, _)| *id == p.id)?.1;
+            self.pw.renderer.as_ref().map(|r| r.cell_screen_rect(rect, 0, 0))
+        });
+        let mut screen = None;
+        if let Some(p) = pane {
+            let g = &p.term.grid;
+            let selection = self.selection.as_ref().filter(|s| s.pane == p.id).and_then(|s| sel_view_span(g, s));
+            let (x, y, w, h) = grid_rect.unwrap_or((0.0, 0.0, 1.0, 1.0));
+            let key = (p.id, p.term.revision, g.view_offset, [x, y, w, h].map(f64::to_bits), selection);
+            if self.pw.a11y_screen != Some(key) {
+                let selection = selection.map(|(a, (row, col), _)| (a, (row, col + 1)));
+                screen = Some(a11y::Screen::new(&p.term, (x, y), (w, h), selection));
+                self.pw.a11y_screen = Some(key);
+            }
+            self.pw.announce.observe(p.id, &p.term, std::mem::take(&mut self.pw.typed));
+        }
+        let output = self.pw.announce.spoken(Instant::now()).to_string();
         let Some(renderer) = self.pw.renderer.as_ref() else {
-            return a11y::build_tree(&text, "termie", window_bounds, None, None, Vec::new(), Vec::new(), Vec::new());
+            return a11y::build_tree(screen.as_ref(), &output, "termie", window_bounds, None, None, Vec::new(), Vec::new(), Vec::new());
         };
         let rect = a11y::rect;
         let mut panels = renderer.a11y_panels();
@@ -6526,7 +6559,8 @@ impl App {
             Some(control(target, label.to_string(), bounds, toggled, false))
         }));
         a11y::build_tree(
-            &text,
+            screen.as_ref(),
+            &output,
             "termie",
             window_bounds,
             Some(rect(renderer.content_rect())),
@@ -6590,6 +6624,7 @@ impl App {
         let Some(id) = self.active_focused_id() else {
             return;
         };
+        self.pw.typed = true;
         if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
         {
@@ -12087,7 +12122,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Err(e) => self.show_notice(&format!("update download failed: {e}")),
             },
             UserEvent::Accessibility(e) => match e.window_event {
-                accesskit_winit::WindowEvent::InitialTreeRequested => self.update_window_a11y(e.window_id),
+                accesskit_winit::WindowEvent::InitialTreeRequested => self.send_initial_a11y_tree(e.window_id),
                 accesskit_winit::WindowEvent::ActionRequested(request) => {
                     self.run_window_a11y_action(e.window_id, request, event_loop);
                 }
@@ -12564,6 +12599,12 @@ impl ApplicationHandler<UserEvent> for App {
         });
         #[cfg(not(target_os = "linux"))]
         let kwin_ms: Option<u64> = None;
+        let now = Instant::now();
+        let announce_ms = std::iter::once(&self.pw)
+            .chain(&self.satellites)
+            .filter_map(|pw| pw.announce.wait(now))
+            .map(|wait| wait.as_millis() as u64 + 1)
+            .min();
         match main_ms
             .into_iter()
             .chain(sat_ms)
@@ -12573,6 +12614,7 @@ impl ApplicationHandler<UserEvent> for App {
             .chain(find_ms)
             .chain(drive_ms)
             .chain(kwin_ms)
+            .chain(announce_ms)
             .min()
         {
             Some(ms) => event_loop
