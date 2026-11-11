@@ -1695,7 +1695,7 @@ fn apply_keybindings_conf(
             continue;
         }
         // `send <text>` types the text into the focused pane (WT's sendInput)
-        if action.len() > 5 && action[..5].eq_ignore_ascii_case("send ") {
+        if action.len() > 5 && action.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("send ")) {
             let payload = unescape_send_input(action[5..].trim_start());
             if payload.is_empty() {
                 log::warn!("keybindings.conf: empty send payload (combo {})", combo.trim());
@@ -14101,6 +14101,15 @@ mod tests {
             actions,
             vec![PaletteAction::SendInput(0), PaletteAction::SendInput(1)]
         );
+    }
+
+    #[test]
+    fn keybindings_conf_multibyte_action_is_ignored_not_a_panic() {
+        let mut out = Vec::new();
+        let mut sends = Vec::new();
+        let ignored = apply_keybindings_conf("ctrl+alt+u = sendé\nctrl+alt+v = 日本語\n", &mut out, &mut sends);
+        assert_eq!(ignored, 2);
+        assert!(out.is_empty() && sends.is_empty());
     }
 
     #[test]
