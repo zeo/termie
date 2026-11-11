@@ -1,6 +1,6 @@
 //! accessibility tree for the title bar and focused terminal pane
 
-use accesskit::{Action, HasPopup, Node, NodeId, Orientation, Rect, Role, Tree, TreeId, TreeUpdate};
+use accesskit::{Action, HasPopup, Node, NodeId, Orientation, Rect, Role, TreeId, TreeInfo, TreeUpdate};
 
 use crate::term::Terminal;
 
@@ -155,7 +155,7 @@ pub fn build_tree(
 
     TreeUpdate {
         nodes,
-        tree: Some(Tree::new(ROOT)),
+        tree: Some(TreeInfo::new(ROOT)),
         tree_id: TreeId::ROOT,
         focus: TERMINAL,
     }
