@@ -978,6 +978,37 @@ pub fn text_scale() -> f32 {
     percent.clamp(100, 225) as f32 / 100.0
 }
 
+/// the active contrast theme's system colors, None while contrast themes are off
+#[cfg(windows)]
+pub fn high_contrast() -> Option<crate::color::SystemColors> {
+    use crate::color::{Rgb, SystemColors};
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+        SYS_COLOR_INDEX,
+    };
+    use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows::Win32::UI::WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW};
+    let size = std::mem::size_of::<HIGHCONTRASTW>() as u32;
+    let mut hc = HIGHCONTRASTW { cbSize: size, ..Default::default() };
+    unsafe { SystemParametersInfoW(SPI_GETHIGHCONTRAST, size, Some(&mut hc as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) }.ok()?;
+    if !hc.dwFlags.contains(HCF_HIGHCONTRASTON) {
+        return None;
+    }
+    // colorref is 0x00bbggrr
+    let sys = |i: SYS_COLOR_INDEX| {
+        let c = unsafe { GetSysColor(i) };
+        Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
+    };
+    Some(SystemColors {
+        window: sys(COLOR_WINDOW),
+        text: sys(COLOR_WINDOWTEXT),
+        highlight: sys(COLOR_HIGHLIGHT),
+        highlight_text: sys(COLOR_HIGHLIGHTTEXT),
+        button: sys(COLOR_BTNFACE),
+        button_text: sys(COLOR_BTNTEXT),
+    })
+}
+
 /// kde's animation speed slider at "instant", or gnome's animations switch
 /// off (read through the settings portal); blocking, so call it off the ui thread
 #[cfg(target_os = "linux")]
@@ -1024,6 +1055,18 @@ pub fn caret_blink_ms() -> Option<u32> {
     })
 }
 
+/// the portal's higher-contrast preference; it names no colors, so this
+/// answers with a black scheme. blocking, so call it off the ui thread
+#[cfg(target_os = "linux")]
+pub fn high_contrast() -> Option<crate::color::SystemColors> {
+    let proxy = settings_portal()?;
+    let on = portal_setting(&proxy, "org.freedesktop.appearance", "contrast", |v| match v {
+        zbus::zvariant::Value::U32(c) => Some(*c == 1),
+        _ => None,
+    });
+    on.unwrap_or(false).then_some(crate::color::SystemColors::BLACK)
+}
+
 /// gnome's large text / text scaling factor; blocking, so call it off the ui thread
 #[cfg(target_os = "linux")]
 pub fn text_scale() -> f32 {
@@ -1049,16 +1092,26 @@ fn settings_portal() -> Option<zbus::blocking::Proxy<'static>> {
     .ok()
 }
 
-/// one `org.gnome.desktop.interface` key, unwrapped from the portal's
-/// variant nesting and handed to `pick`
+/// one `org.gnome.desktop.interface` key, handed to `pick`
 #[cfg(target_os = "linux")]
 fn gnome_interface<T>(
     proxy: &zbus::blocking::Proxy<'_>,
     key: &str,
     pick: impl Fn(&zbus::zvariant::Value) -> Option<T>,
 ) -> Option<T> {
+    portal_setting(proxy, "org.gnome.desktop.interface", key, pick)
+}
+
+/// one settings key, unwrapped from the portal's variant nesting and handed to `pick`
+#[cfg(target_os = "linux")]
+fn portal_setting<T>(
+    proxy: &zbus::blocking::Proxy<'_>,
+    namespace: &str,
+    key: &str,
+    pick: impl Fn(&zbus::zvariant::Value) -> Option<T>,
+) -> Option<T> {
     use zbus::zvariant::{OwnedValue, Value};
-    let key = ("org.gnome.desktop.interface", key);
+    let key = (namespace, key);
     let value: OwnedValue = proxy
         .call("ReadOne", &key)
         .or_else(|_| proxy.call("Read", &key))
@@ -1083,6 +1136,11 @@ pub fn caret_blink_ms() -> Option<u32> {
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn text_scale() -> f32 {
     1.0
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn high_contrast() -> Option<crate::color::SystemColors> {
+    None
 }
 
 #[cfg(windows)]

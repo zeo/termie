@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use bytemuck::{Pod, Zeroable};
 use winit::window::{ResizeDirection, Window};
 
-use crate::color::{Color, Palette, Rgb, ThemeId};
+use crate::color::{Color, Palette, Rgb, Skin, SystemColors, ThemeId};
 use crate::grid::CursorShape;
 use crate::term::Terminal;
 pub(crate) use atlas::{FontId, GlyphAtlas, GlyphKey};
@@ -860,6 +860,10 @@ pub struct Renderer {
     /// palettes for panes whose profile overrides the window theme, built on
     /// demand in build() and dropped when the color overrides change
     pane_palettes: Vec<(ThemeId, Palette)>,
+    /// chrome surface colors: aqua, or the os scheme under high contrast
+    skin: Skin,
+    /// the os high-contrast scheme while it is on
+    system: Option<SystemColors>,
 
     /// chrome scale: device scale times ui_factor
     scale: f32,
@@ -1627,6 +1631,8 @@ impl Renderer {
             atlas,
             palette: Palette::from_theme(ThemeId::Instrument),
             pane_palettes: Vec::new(),
+            skin: Skin::aqua(),
+            system: None,
             theme: ThemeId::Instrument,
             color_overrides: Vec::new(),
             broadcast: false,
@@ -2011,7 +2017,22 @@ impl Renderer {
     fn themed_palette(&self) -> Palette {
         let mut p = Palette::from_theme(self.theme);
         p.apply_overrides(&self.color_overrides);
-        p
+        match &self.system {
+            Some(s) => p.forced(s),
+            None => p,
+        }
+    }
+
+    /// follow the os high-contrast scheme, or drop back to the theme on None
+    pub fn set_system_colors(&mut self, system: Option<SystemColors>) {
+        if self.system == system {
+            return;
+        }
+        self.system = system;
+        self.skin = system.as_ref().map_or_else(Skin::aqua, Skin::system);
+        self.palette = self.themed_palette();
+        self.pane_palettes.clear();
+        self.atlas.dirty = true;
     }
 
     /// install user color overrides (from disk) and rebuild the active palette
@@ -2627,20 +2648,23 @@ impl Renderer {
 
     /// a title-bar stop nudged toward the theme's own surface hue, so the
     /// graphite sits in the theme instead of over it. light themes stay neutral
-    fn nav_tint(&self, c: [u8; 3]) -> Rgb {
+    fn nav_tint(&self, c: Rgb) -> Rgb {
         let p = &self.palette;
-        if self.light() {
-            return Rgb::from_triple(c);
+        if self.light() || !self.skin.gloss {
+            return c;
         }
         let s = p.ink4;
         let avg = (s.r as i16 + s.g as i16 + s.b as i16) / 3;
         let nudge = |v: u8, ch: u8| (v as i16 + (ch as i16 - avg) * 3 / 4).clamp(0, 255) as u8;
-        Rgb::new(nudge(c[0], s.r), nudge(c[1], s.g), nudge(c[2], s.b))
+        Rgb::new(nudge(c.r, s.r), nudge(c.g, s.g), nudge(c.b, s.b))
     }
 
     /// the engraved shadow under text on a gloss surface: one pixel above, dark
     #[allow(clippy::too_many_arguments)]
-    fn engrave(atlas: &mut GlyphAtlas, out: &mut Vec<Instance>, font: FontId, x: f32, y_top: f32, text: &str, hair: f32, track: f32) {
+    fn engrave(skin: &Skin, atlas: &mut GlyphAtlas, out: &mut Vec<Instance>, font: FontId, x: f32, y_top: f32, text: &str, hair: f32, track: f32) {
+        if !skin.gloss {
+            return;
+        }
         let _ = Self::draw_text(atlas, out, font, x, y_top - hair, text, Rgb::new(0, 0, 0), 0.6, track);
     }
 
@@ -3266,20 +3290,20 @@ impl Renderer {
 
     /// a gel button face: the split body, a lit top edge, the soft gloss over
     /// the upper half and a dark outline. `pressed` sinks it into the surface
-    fn push_button(out: &mut Vec<Instance>, rect: Rect, r: f32, hair: f32, default: bool, pressed: bool, alpha: f32) {
-        use crate::instrument as i;
+    #[allow(clippy::too_many_arguments)]
+    fn push_button(skin: &Skin, out: &mut Vec<Instance>, rect: Rect, r: f32, hair: f32, default: bool, pressed: bool, alpha: f32) {
         let stops = match (default, pressed) {
-            (true, false) => i::AQUA_GEL,
-            (true, true) => i::AQUA_PRESSED,
-            (false, false) => i::GRAPHITE_GEL,
-            (false, true) => i::GRAPHITE_PRESSED,
+            (true, false) => skin.accent_gel,
+            (true, true) => skin.accent_pressed,
+            (false, false) => skin.gel,
+            (false, true) => skin.gel_pressed,
         };
-        let edge = Rgb::from_triple(if default { i::AQUA_EDGE } else { i::GEL_EDGE });
+        let edge = if default { skin.accent_edge } else { skin.gel_edge };
         let white = Rgb::new(255, 255, 255);
-        Self::push_gel(out, rect, r, stops.map(Rgb::from_triple), alpha);
-        if pressed {
+        Self::push_gel(out, rect, r, stops, alpha);
+        if skin.gloss && pressed {
             Self::push_grad(out, rect, r, (0.0, (hair * 3.0).round()), Rgb::new(0, 0, 0), 0.55 * alpha, Rgb::new(0, 0, 0), 0.0);
-        } else {
+        } else if skin.gloss {
             let lift = if default { 0.32 } else { 0.2 };
             Self::push_grad(out, rect, r, (0.0, (rect.3 * 0.52).round()), white, lift * alpha, white, 0.04 * alpha);
             let lip = if default { 0.55 } else { 0.22 };
@@ -3292,8 +3316,14 @@ impl Renderer {
     /// lip; focus swaps the outline for aqua and adds a soft glow
     /// returns the ink for text typed into it. light themes get a white well
     fn push_well(&self, out: &mut Vec<Instance>, rect: Rect, r: f32, focused: bool) -> Rgb {
-        use crate::instrument as i;
         let hair = self.scale.max(1.0);
+        let s = &self.skin;
+        if !s.gloss {
+            Self::push_shape(out, rect, [r, 0.0, 0.0], s.well, 1.0);
+            let (ring, w) = if focused { (s.focus, (hair * 2.0).round()) } else { (s.gel_edge, hair) };
+            Self::push_ring(out, rect, r, w, ring, 1.0);
+            return s.well_text;
+        }
         let black = Rgb::new(0, 0, 0);
         let light = self.light();
         if focused {
@@ -3304,7 +3334,7 @@ impl Renderer {
         let (lip, edge, fill, shade) = if light {
             (Rgb::new(255, 255, 255), Rgb::new(0x8c, 0x8c, 0x8c), Rgb::new(255, 255, 255), 0.18)
         } else {
-            (Rgb::new(0x3a, 0x3a, 0x3a), black, Rgb::from_triple(i::WELL), 0.8)
+            (Rgb::new(0x3a, 0x3a, 0x3a), black, s.well, 0.8)
         };
         Self::push_shape(out, rect, [r, 0.0, 0.0], lip, 1.0);
         let face = (rect.0, rect.1, rect.2, rect.3 - hair);
@@ -3313,9 +3343,9 @@ impl Renderer {
         Self::push_shape(out, inner, [(r - hair).max(0.0), 0.0, 0.0], fill, 1.0);
         Self::push_grad(out, inner, (r - hair).max(0.0), (0.0, (hair * 2.0).round()), black, shade, black, 0.0);
         if focused {
-            Self::push_ring(out, rect, r, hair, Rgb::from_triple(i::AQUA), 1.0);
+            Self::push_ring(out, rect, r, hair, s.accent, 1.0);
         }
-        if light { Rgb::new(0x1c, 0x1c, 0x1c) } else { Rgb::from_triple(i::TEXT2) }
+        if light { Rgb::new(0x1c, 0x1c, 0x1c) } else { s.well_text }
     }
 
     /// 1px outline around a rect
@@ -3721,16 +3751,6 @@ impl Renderer {
                         (fg.b as u16 * 2 / 3) as u8,
                     );
                 }
-                // accessibility floor last, so it also rescues dimmed text
-                if min_contrast > 1.0 {
-                    fg = crate::color::apply_min_contrast(fg, bg, min_contrast);
-                }
-                // blinking cells hide their glyph + decorations on the off phase
-                let blink_hidden = cell.attrs.blink() && blink_on < 0.5;
-
-                let x = ox + c as f32 * cell_w;
-                let y = oy + r as f32 * cell_h;
-                let is_cursor = show_cursor && r == crow && c == ccol;
                 let selected = sel_norm
                     .map(|(s, e, block)| {
                         if block {
@@ -3744,6 +3764,17 @@ impl Renderer {
                         }
                     })
                     .unwrap_or(false);
+                // accessibility floor last, so it also rescues dimmed text; a
+                // selected cell is read against the selection over it
+                if min_contrast > 1.0 {
+                    fg = crate::color::apply_min_contrast(fg, if selected { sel_col } else { bg }, min_contrast);
+                }
+                // blinking cells hide their glyph + decorations on the off phase
+                let blink_hidden = cell.attrs.blink() && blink_on < 0.5;
+
+                let x = ox + c as f32 * cell_w;
+                let y = oy + r as f32 * cell_h;
+                let is_cursor = show_cursor && r == crow && c == ccol;
 
                 if selected {
                     Self::push_rect(out, x, y, cell_w, cell_h, sel_col, 0.9);
@@ -4230,6 +4261,7 @@ impl Renderer {
         for pv in panes {
             if let Some(id) = pv.theme
                 && id != self.theme
+                && self.system.is_none()
                 && !self.pane_palettes.iter().any(|(t, _)| *t == id)
             {
                 let mut p = Palette::from_theme(id);
@@ -4239,16 +4271,18 @@ impl Renderer {
         }
         let cursor_style = self.cursor_style;
         let bold_as_bright = self.bold_as_bright;
-        let min_contrast = self.min_contrast;
+        // high contrast holds program colors to the wcag aaa text ratio
+        let min_contrast = if self.system.is_some() { self.min_contrast.max(7.0) } else { self.min_contrast };
         let ligatures = self.ligatures;
         {
             let palette = &self.palette;
             let pane_palettes = &self.pane_palettes;
             let theme = self.theme;
+            let forced = self.system.is_some();
             let atlas = &mut self.atlas;
             let find_view = self.find_view.as_ref();
             for (pv, info) in panes.iter().zip(pane_info.iter_mut()) {
-                let themed = pv.theme.filter(|&id| id != theme);
+                let themed = pv.theme.filter(|&id| id != theme && !forced);
                 let mut pal = themed
                     .and_then(|id| pane_palettes.iter().find(|(t, _)| *t == id))
                     .map(|(_, p)| p)
@@ -4410,7 +4444,7 @@ impl Renderer {
         let stroke = hair;
 
         // ---- title bar: graphite gloss in every theme ----
-        let nav = crate::instrument::NAV.map(|c| self.nav_tint(c));
+        let nav = self.skin.nav.map(|c| self.nav_tint(c));
         let bar = (0.0, 0.0, w, tbh);
         let lip = (hair * 2.0).round();
         let seam = (tbh * 0.5).round();
@@ -4419,10 +4453,10 @@ impl Renderer {
         Self::push_grad(&mut out, bar, 0.0, (lip, seam), nav[1], 1.0, nav[2], 1.0);
         Self::push_grad(&mut out, bar, 0.0, (seam, foot), nav[3], 1.0, nav[4], 1.0);
         Self::push_grad(&mut out, bar, 0.0, (foot, tbh), nav[4], 1.0, nav[5], 1.0);
-        Self::push_rect(&mut out, 0.0, tbh - hair, w, hair, Rgb::new(5, 5, 5), 1.0);
-        let WHITE = Rgb::new(255, 255, 255);
-        let BAR_TEXT = Rgb::from_triple(crate::instrument::NAV_TEXT);
-        let BAR_MUTE = Rgb::from_triple(crate::instrument::NAV_MUTE);
+        Self::push_rect(&mut out, 0.0, tbh - hair, w, hair, self.skin.nav_foot, 1.0);
+        let WHITE = self.skin.nav_hot;
+        let BAR_TEXT = self.skin.nav_text;
+        let BAR_MUTE = self.skin.nav_mute;
         // the brightest stop behind the text, so contrast holds over the whole bar
         let BAR_BG = nav[2];
         // the spring rail keeps the theme accent unless it vanishes on graphite
@@ -4442,7 +4476,7 @@ impl Renderer {
         let tl = self.tab_layout();
         if tl.wordmark {
             let wx = pad + badge + t(tokens::SPACE_S);
-            Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", hair, track);
+            Self::engrave(&self.skin, &mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", hair, track);
             let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", BAR_TEXT, 1.0, track);
         }
         let active_tab = self.active_tab;
@@ -4474,18 +4508,20 @@ impl Renderer {
             if *active {
                 // the active tab sits pressed into the bar
                 let slot = (tx, bar_y, tw, bar_h);
-                Self::push_gel(&mut out, slot, 0.0, crate::instrument::NAV_ACTIVE.map(|c| self.nav_tint(c)), 1.0);
-                let black = Rgb::new(0, 0, 0);
-                Self::push_grad(&mut out, slot, 0.0, (0.0, (hair * 3.0).round()), black, 0.65, black, 0.0);
-                Self::push_rect(&mut out, tx, bar_y, hair, bar_h, black, 0.5);
-                Self::push_rect(&mut out, tx + tw - hair, bar_y, hair, bar_h, black, 0.5);
+                Self::push_gel(&mut out, slot, 0.0, self.skin.nav_active.map(|c| self.nav_tint(c)), 1.0);
+                if self.skin.gloss {
+                    let black = Rgb::new(0, 0, 0);
+                    Self::push_grad(&mut out, slot, 0.0, (0.0, (hair * 3.0).round()), black, 0.65, black, 0.0);
+                    Self::push_rect(&mut out, tx, bar_y, hair, bar_h, black, 0.5);
+                    Self::push_rect(&mut out, tx + tw - hair, bar_y, hair, bar_h, black, 0.5);
+                }
             } else if *ha > 0.0 {
                 Self::push_rect(&mut out, tx, bar_y, tw, bar_h, WHITE, 0.06 * ha);
             }
             // a user-picked tab color washes over the base fill, stronger on
             // the active tab so the tint reads without drowning the label
-            if let Some(ci) = tint {
-                let c = self.palette.ansi_color(*ci);
+            if let Some(ci) = tint.filter(|_| self.skin.gloss) {
+                let c = self.palette.ansi_color(ci);
                 Self::push_rect(&mut out, tx, bar_y, tw, bar_h, c, if *active { 0.28 } else { 0.14 });
             }
 
@@ -4494,11 +4530,13 @@ impl Renderer {
             // and a status dot holds it otherwise
             let show_close = (*active || *ha > 0.0) && close.2 > 0.0;
             let label_x = tx + t(tokens::TAB_INSET);
-            let label_end = if close.2 > 0.0 { close.0 - t(tokens::SPACE_XS) } else { tx + tw - t(tokens::SPACE_S) };
+            // without a close slot a status mark takes the tab's trailing edge
+            let mark_w = if *attn != 0 { t(tokens::ICON_SMALL) + t(tokens::SPACE_XS) } else { 0.0 };
+            let label_end = if close.2 > 0.0 { close.0 - t(tokens::SPACE_XS) } else { tx + tw - t(tokens::SPACE_S) - mark_w };
             // a pixel of slack: the tab and close rects round to whole pixels,
             // and a tab sized to its label exactly must not lose a glyph to that
             let maxc = ((label_end - label_x + 1.0).max(0.0) / cw_c).floor() as usize;
-            let label_bg = if *active { nav[3] } else { BAR_BG };
+            let label_bg = if *active { self.nav_tint(self.skin.nav_active[3]) } else { BAR_BG };
             // borrow the already-owned snapshot label; only allocate when the
             // label actually needs truncating (the common case fits as-is)
             let truncated;
@@ -4513,12 +4551,14 @@ impl Renderer {
                 label
             };
             let lc = if *active {
-                WHITE
+                self.skin.nav_active_text
+            } else if !self.skin.gloss {
+                BAR_TEXT
             } else {
                 let mix = label_bg.lerp(BAR_TEXT, tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha);
                 crate::color::apply_min_contrast(mix, label_bg, tokens::TEXT_CONTRAST)
             };
-            Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, hair, track);
+            Self::engrave(&self.skin, &mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, hair, track);
             let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, lc, 1.0, track);
 
             let signal = if *active { None } else { self.tab_signal_phase(*i) };
@@ -4534,7 +4574,8 @@ impl Renderer {
                 if *close_ha > 0.0 {
                     Self::push_round(&mut out, cx, cy, ccw, cch, t(tokens::RADIUS_CHIP), WHITE, 0.12 * close_ha);
                 }
-                let c = BAR_MUTE.lerp(WHITE, *close_ha);
+                let (rest, hot) = if *active && !self.skin.gloss { (self.skin.nav_active_text, self.skin.nav_active_text) } else { (BAR_MUTE, WHITE) };
+                let c = rest.lerp(hot, *close_ha);
                 Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(tokens::ICON_SMALL), stroke, c, 1.0);
             } else if let Some((dot, da)) = self.status_dot(*attn, label_bg) {
                 let dot_a = signal.map_or(1.0, |(_, _, d)| d);
@@ -4610,9 +4651,9 @@ impl Renderer {
             let fa = if pinned { 1.0 } else { a };
             let cell = (x0, 0.0, x1 - x0, tbh - hair);
             if c == Hot::Close && a > 0.0 {
-                Self::push_gel(&mut out, cell, 0.0, crate::instrument::CLOSE_GEL.map(Rgb::from_triple), a);
+                Self::push_gel(&mut out, cell, 0.0, self.skin.close_gel, a);
             } else if pinned {
-                Self::push_gel(&mut out, cell, 0.0, crate::instrument::NAV_ACTIVE.map(|c| self.nav_tint(c)), 1.0);
+                Self::push_gel(&mut out, cell, 0.0, self.skin.nav_active.map(|c| self.nav_tint(c)), 1.0);
                 Self::push_grad(&mut out, cell, 0.0, (0.0, (hair * 3.0).round()), Rgb::new(0, 0, 0), 0.65, Rgb::new(0, 0, 0), 0.0);
             } else if a > 0.0 {
                 Self::push_rect(&mut out, x0, 0.0, x1 - x0, tbh - hair, WHITE, 0.1 * a);
@@ -4628,9 +4669,11 @@ impl Renderer {
                 _ => Icon::Close,
             };
             let color = if c == Hot::Close {
-                BAR_MUTE.lerp(WHITE, a)
-            } else if c == Hot::PaneMode && self.pane_mode {
+                BAR_MUTE.lerp(self.skin.nav_active_text, a)
+            } else if c == Hot::PaneMode && self.pane_mode && self.skin.gloss {
                 RAIL
+            } else if pinned {
+                self.skin.nav_active_text
             } else {
                 BAR_MUTE.lerp(WHITE, fa)
             };
@@ -4641,7 +4684,7 @@ impl Renderer {
         if let Some((_, r)) = self.chrome_focus.and_then(|f| self.chrome_targets().into_iter().find(|(h, _)| *h == f)) {
             let ring = tokens::px(2.0, self.scale).round().max(2.0);
             let inset = (r.0 + ring, r.1 + ring, r.2 - ring * 2.0, r.3 - ring * 2.0);
-            Self::push_ring(&mut out, inset, t(tokens::RADIUS_FIELD), ring, Rgb::from_triple(crate::instrument::FOCUS), 1.0);
+            Self::push_ring(&mut out, inset, t(tokens::RADIUS_FIELD), ring, self.skin.focus, 1.0);
         }
 
         // ---- status bar: a shallow brushed band under the content ----
@@ -4735,7 +4778,7 @@ impl Renderer {
             // an error carries a cross as well as the danger colour, so it
             // reads without colour vision
             let (icon, tint) = if self.notice_error {
-                let danger = Rgb::from_triple(crate::instrument::DANGER);
+                let danger = self.skin.danger;
                 (Icon::Close, crate::color::apply_min_contrast(danger, self.palette.ink1, tokens::ICON_CONTRAST))
             } else {
                 (Icon::Bell, PAPER)
@@ -4807,7 +4850,7 @@ impl Renderer {
                 {
                     let mark_rect = (x - sicon - ig, sbar.1, sicon, sbar.3);
                     Self::push_status_mark(&mut self.atlas, &mut out, mark, mark_rect, sicon, t(tokens::DOT).max(4.0), stroke, c, a);
-                    let tc = if mark == 4 {
+                    let tc = if mark == 4 && self.skin.gloss {
                         crate::color::apply_min_contrast(self.palette.ansi_color(1), self.palette.ink1, tokens::TEXT_CONTRAST)
                     } else {
                         QUIET
@@ -5351,7 +5394,7 @@ impl Renderer {
         let (x, y, w, h) = rect;
         let inset = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
         let row = (x + inset, y + t(tokens::SPACE_3XS), w - inset * 2.0, h - t(tokens::SPACE_2XS));
-        let [top, bottom] = crate::instrument::PICKED.map(Rgb::from_triple);
+        let [top, bottom] = self.skin.picked;
         Self::push_grad(out, row, t(tokens::RADIUS_ROW), (0.0, 0.0), top, alpha, bottom, alpha);
         Self::push_grad(out, row, t(tokens::RADIUS_ROW), (0.0, self.scale.max(1.0)), Rgb::new(255, 255, 255), 0.18 * alpha, Rgb::new(255, 255, 255), 0.18 * alpha);
     }
@@ -5401,7 +5444,7 @@ impl Renderer {
                 }
                 lx += d + t(tokens::SPACE_S);
             }
-            let picked = Rgb::from_triple(crate::instrument::PICKED_TEXT);
+            let picked = self.skin.picked_text;
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ty, lbl, TEXT_2.lerp(picked, a), 0.85 + 0.15 * a, 0.0);
         }
     }
@@ -5504,8 +5547,8 @@ impl Renderer {
             let hint_w = if hint.is_empty() { 0.0 } else { self.text_w(FontId::Small, hint, small_track) };
             let room = bw - pad * 2.0 - hint_w - if hint_w > 0.0 { t(tokens::SPACE_L) } else { 0.0 };
             let shown = self.fit_tail(font, lbl, room, ftrack);
-            let picked = Rgb::from_triple(crate::instrument::PICKED_TEXT);
-            let (lc, hc) = if is_sel { (picked, Rgb::from_triple(crate::instrument::PICKED_META)) } else { (TEXT_2, QUIET) };
+            let picked = self.skin.picked_text;
+            let (lc, hc) = if is_sel { (picked, self.skin.picked_meta) } else { (TEXT_2, QUIET) };
             let _ = Self::draw_text(&mut self.atlas, out, font, bx + pad, ty, &shown, lc, if is_sel { 1.0 } else { 0.8 }, ftrack);
             if hint_w > 0.0 {
                 let hy = (ry + (row_h - small_h) / 2.0).round();
@@ -5575,12 +5618,12 @@ impl Renderer {
         self.find_btns = Some((rx_r, prev_r, next_r, close_r));
         let chip_r = t(tokens::RADIUS_ROW);
         if regex_on {
-            Self::push_gel(out, rx_r, chip_r, crate::instrument::AQUA_PRESSED.map(Rgb::from_triple), 1.0);
-            Self::push_ring(out, rx_r, chip_r, hair, Rgb::from_triple(crate::instrument::AQUA_EDGE), 1.0);
+            Self::push_gel(out, rx_r, chip_r, self.skin.accent_pressed, 1.0);
+            Self::push_ring(out, rx_r, chip_r, hair, self.skin.accent_edge, 1.0);
         }
         let rx_text = ".*";
         let rw = self.text_w(FontId::Small, rx_text, small_track);
-        let rx_ink = if regex_on { Rgb::from_triple(crate::instrument::PICKED_TEXT) } else { QUIET };
+        let rx_ink = if regex_on { self.skin.picked_text } else { QUIET };
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, rx_ink, 1.0, small_track);
         let icon = t(tokens::ICON - 1.0);
         let glyph = crate::color::apply_min_contrast(MUTE, INK_1, tokens::ICON_CONTRAST);
@@ -5606,7 +5649,7 @@ impl Renderer {
         let inset = t(tokens::SPACE_XS);
         let well = (bx + inset, by + inset, right_edge + t(tokens::SPACE_XS) - bx - inset, bh - inset * 2.0);
         let ink = self.push_well(out, well, (well.3 / 2.0).round(), false);
-        let well_bg = if self.light() { Rgb::new(255, 255, 255) } else { Rgb::from_triple(crate::instrument::WELL) };
+        let well_bg = if self.light() && self.skin.gloss { Rgb::new(255, 255, 255) } else { self.skin.well };
         let well_quiet = self.quiet(well_bg);
         let search = t(tokens::ICON + 1.0);
         Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, search, bh), search, hair, well_quiet, 1.0);
@@ -5616,7 +5659,7 @@ impl Renderer {
         let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
         let avail = (right_edge - iw - t(tokens::SPACE_M)) - qx;
         let shown = truncate_head(&query, (avail / cw).floor().max(2.0) as usize);
-        let danger = crate::color::apply_min_contrast(Rgb::from_triple(crate::instrument::DANGER), well_bg, tokens::TEXT_CONTRAST);
+        let danger = crate::color::apply_min_contrast(self.skin.danger, well_bg, tokens::TEXT_CONTRAST);
         let qend = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &shown, if bad { danger } else { ink }, 1.0, track);
         Self::push_round(out, qend + t(tokens::SPACE_3XS), iy + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), ink, 1.0);
         if !info.is_empty() {
@@ -5727,11 +5770,11 @@ impl Renderer {
         let yes_r = (bx + bw - pad - yes_w, y, yes_w, btn_h);
         let no_r = (yes_r.0 - t(tokens::SPACE_S) - no_w, y, no_w, btn_h);
         for (r, label, default) in [(no_r, no, false), (yes_r, yes, true)] {
-            Self::push_button(out, r, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
+            Self::push_button(&self.skin, out, r, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
             let lx = (r.0 + (r.2 - self.text_w(FontId::Label, label, 0.0)) / 2.0).round();
             let ly = (r.1 + (r.3 - label_h) / 2.0).round();
-            Self::engrave(&mut self.atlas, out, FontId::Label, lx, ly, label, hair, 0.0);
-            let ink = Rgb::from_triple(if default { crate::instrument::PICKED_TEXT } else { crate::instrument::GEL_TEXT });
+            Self::engrave(&self.skin, &mut self.atlas, out, FontId::Label, lx, ly, label, hair, 0.0);
+            let ink = if default { self.skin.picked_text } else { self.skin.gel_text };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ly, label, ink, 1.0, 0.0);
         }
         self.dialog_btns = Some((no_r, yes_r));
@@ -6108,7 +6151,7 @@ impl Renderer {
             }
             Self::push_shape(out, card, [card_r, 0.0, 0.0], if sel { INK_3 } else { INK_0 }, if sel { 1.0 } else { 0.35 });
             if sel {
-                Self::push_ring(out, card, card_r, hair * 2.0, Rgb::from_triple(crate::instrument::AQUA), 1.0);
+                Self::push_ring(out, card, card_r, hair * 2.0, self.skin.accent, 1.0);
             } else {
                 Self::push_ring(out, card, card_r, hair, RULE_2, 1.0);
             }
@@ -6122,13 +6165,12 @@ impl Renderer {
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner + nw + t(tokens::SPACE_S), l1, &ver, QUIET, 1.0, track);
             // install is the card's default action, so it takes the aqua gel;
             // enabled carries a check so the state never rests on color alone
-            use crate::instrument as i;
             let (chip, default, chip_fg) = if !r.installed {
-                ("Install", true, Rgb::from_triple(i::PICKED_TEXT))
+                ("Install", true, self.skin.picked_text)
             } else if r.enabled {
-                ("Enabled", false, Rgb::from_triple(i::GEL_TEXT))
+                ("Enabled", false, self.skin.gel_text)
             } else {
-                ("Disabled", false, Rgb::from_triple(i::GEL_TEXT))
+                ("Disabled", false, self.skin.gel_text)
             };
             let label_h = self.atlas.metrics(FontId::Label).cell_h;
             let mark = if r.installed && r.enabled { t(tokens::ICON - 1.0) + t(tokens::SPACE_XS) } else { 0.0 };
@@ -6139,13 +6181,13 @@ impl Renderer {
             let chip_y = (l1 + (chrome_h - chip_h) / 2.0).round();
             let chip_rect = (chip_x, chip_y, chip_w, chip_h);
             self.market_hits.push((chip_rect, MarketHit::Chip(idx)));
-            Self::push_button(out, chip_rect, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
+            Self::push_button(&self.skin, out, chip_rect, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
             let cx = (chip_x + (chip_w - cw_chip) / 2.0).round();
             if mark > 0.0 {
                 Self::draw_icon(&mut self.atlas, out, Icon::Check, (cx, chip_y, t(tokens::ICON - 1.0), chip_h), t(tokens::ICON - 1.0), hair, chip_fg, 1.0);
             }
             let ly = (chip_y + (chip_h - label_h) / 2.0).round();
-            Self::engrave(&mut self.atlas, out, FontId::Label, cx + mark, ly, chip, hair, 0.0);
+            Self::engrave(&self.skin, &mut self.atlas, out, FontId::Label, cx + mark, ly, chip, hair, 0.0);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, cx + mark, ly, chip, chip_fg, 1.0, 0.0);
             // line 2: description (truncated to the card width)
             let l2 = (l1 + line).round();
@@ -6226,7 +6268,7 @@ impl Renderer {
         // action button (browse) is a pill with a label
         let action = hot == Hot::OpenPlugins;
         let r = t(if action { tokens::RADIUS_BUTTON } else { tokens::RADIUS_FIELD });
-        Self::push_button(out, rect, r, hair, false, false, 1.0);
+        Self::push_button(&self.skin, out, rect, r, hair, false, false, 1.0);
         Self::gel_hover(out, rect, r, he);
         let (font, ftrack) = if action { (FontId::Label, 0.0) } else { (FontId::Chrome, track) };
         let icon = if action { 0.0 } else { t(tokens::ICON - 2.0) };
@@ -6234,8 +6276,8 @@ impl Renderer {
         let shown = self.fit_tail(font, text, room, ftrack);
         let tx = if action { (bx + (bw - self.text_w(font, &shown, ftrack)) / 2.0).round() } else { bx + t(tokens::SPACE_M) };
         let ty = (by + (bh - self.atlas.metrics(font).cell_h) / 2.0).round();
-        let ink = Rgb::from_triple(crate::instrument::GEL_TEXT);
-        Self::engrave(&mut self.atlas, out, font, tx, ty, &shown, hair, ftrack);
+        let ink = self.skin.gel_text;
+        Self::engrave(&self.skin, &mut self.atlas, out, font, tx, ty, &shown, hair, ftrack);
         let _ = Self::draw_text(&mut self.atlas, out, font, tx, ty, &shown, ink, 1.0, ftrack);
         if action {
             return;
@@ -6258,12 +6300,17 @@ impl Renderer {
         // on is a lit aqua gel; off sinks into a well. the knob is a pearl
         // either way, so state reads from position and color together
         if on {
-            Self::push_button(out, track_r, sh / 2.0, hair, true, false, 1.0);
+            Self::push_button(&self.skin, out, track_r, sh / 2.0, hair, true, false, 1.0);
         } else {
             let _ = self.push_well(out, track_r, sh / 2.0, false);
         }
         Self::gel_hover(out, track_r, sh / 2.0, he);
         let pearl = (kx, ky, knob, knob);
+        if !self.skin.gloss {
+            let ink = if on { self.skin.picked_text } else { self.skin.well_text };
+            Self::push_shape(out, pearl, [knob / 2.0, 0.0, 0.0], ink, 1.0);
+            return;
+        }
         Self::push_shadow(out, pearl, knob / 2.0, hair, hair, Rgb::new(0, 0, 0), 0.5);
         Self::push_grad(out, pearl, knob / 2.0, (0.0, 0.0), Rgb::new(255, 255, 255), 1.0, Rgb::new(0xc8, 0xc8, 0xc8), 1.0);
         Self::push_ring(out, pearl, knob / 2.0, hair, Rgb::new(0, 0, 0), 0.35);
@@ -6352,7 +6399,7 @@ impl Renderer {
             Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink3, if active { 1.0 } else { he });
         }
         if active {
-            Self::push_ring(out, rect, r, hair * 2.0, Rgb::from_triple(crate::instrument::AQUA), 1.0);
+            Self::push_ring(out, rect, r, hair * 2.0, self.skin.accent, 1.0);
         } else {
             Self::push_ring(out, rect, r, hair, self.palette.rule2, 1.0);
         }
@@ -6379,9 +6426,9 @@ impl Renderer {
         let gap = tokens::px(tokens::SPACE_2XS, self.scale);
         let well = (dx + dw + gap, dy, (val_w - gap * 2.0).max(0.0), dh);
         let ink = self.push_well(out, well, r, false);
-        let glyph = Rgb::from_triple(crate::instrument::GEL_TEXT);
+        let glyph = self.skin.gel_text;
         for (rect, icon, hot) in [(dec, Icon::Minimize, hot_dec), (inc, Icon::Plus, hot_inc)] {
-            Self::push_button(out, rect, r, hair, false, false, 1.0);
+            Self::push_button(&self.skin, out, rect, r, hair, false, false, 1.0);
             Self::gel_hover(out, rect, r, self.hover_a(hot));
             let size = tokens::px(tokens::ICON - 2.0, self.scale);
             Self::draw_icon(&mut self.atlas, out, icon, rect, size, hair, glyph, 1.0);
@@ -6414,6 +6461,12 @@ impl Renderer {
             4 => (self.palette.ansi_color(1), 1.0),
             _ => (self.palette.paper, 1.0),
         };
+        if !self.skin.gloss {
+            // shapes carry the state; the ink is whichever system color the surface pairs with
+            let (fg, bg) = (self.palette.fg, self.palette.bg);
+            let ink = if crate::color::contrast(fg, surface) >= crate::color::contrast(bg, surface) { fg } else { bg };
+            return Some((ink, a));
+        }
         Some((crate::color::apply_min_contrast(c, surface, tokens::ICON_CONTRAST), a))
     }
 

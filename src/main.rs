@@ -210,8 +210,8 @@ enum UserEvent {
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
-    /// a worker re-read the os reduced-motion, caret blink and text size
-    OsPrefsRead { text_scale: f32 },
+    /// a worker re-read the os reduced-motion, caret blink, text size and contrast
+    OsPrefsRead { text_scale: f32, system_colors: Option<color::SystemColors> },
     /// another ordinary launch joined this process and needs its own window
     Launch { request: instance::LaunchRequest, _permit: EventPermit },
     #[cfg(target_os = "linux")]
@@ -3925,6 +3925,8 @@ struct App {
     satellites: Vec<PaneWindow>,
     /// the os text size factor, last read by read_os_prefs
     os_text_scale: f32,
+    /// the os high-contrast scheme while it is on, last read by read_os_prefs
+    os_system_colors: Option<color::SystemColors>,
     /// windows removed during input dispatch, kept alive until the callback ends
     retired_windows: Vec<PaneWindow>,
     /// while a satellite is swapped into self.pw for handling, the index it came
@@ -4135,6 +4137,7 @@ impl App {
             // a registry read on windows, so the first frame is already sized;
             // the linux portal read blocks and arrives with read_os_prefs
             os_text_scale: if cfg!(windows) { win::text_scale() } else { 1.0 },
+            os_system_colors: if cfg!(windows) { win::high_contrast() } else { None },
             retired_windows: Vec::new(),
             cur_sat: None,
             next_id: 0,
@@ -4250,6 +4253,7 @@ impl App {
         renderer.set_bold_as_bright(settings.bold_as_bright);
         renderer.set_line_height(settings.line_height);
         renderer.set_ui_factor(settings.ui_scale * self.os_text_scale);
+        renderer.set_system_colors(self.os_system_colors);
         renderer.set_pane_pad_px(settings.padding);
         renderer.set_opacity_pct(settings.opacity);
         if let Some(font) = settings.font.as_deref() {
@@ -8927,7 +8931,7 @@ impl App {
         });
     }
 
-    /// re-read the os reduced-motion, caret blink and text size settings on a
+    /// re-read the os reduced-motion, caret blink, text size and contrast settings on a
     /// worker (the linux reads block on d-bus); the user can change any of them
     /// while termie runs
     fn read_os_prefs(&self) {
@@ -8937,7 +8941,7 @@ impl App {
             if let Some(ms) = win::caret_blink_ms() {
                 render::motion::set_blink_cycle(ms);
             }
-            let _ = proxy.send_event(UserEvent::OsPrefsRead { text_scale: win::text_scale() });
+            let _ = proxy.send_event(UserEvent::OsPrefsRead { text_scale: win::text_scale(), system_colors: win::high_contrast() });
         });
     }
 
@@ -12214,10 +12218,16 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(any(windows, target_os = "linux"))]
             UserEvent::ToggleQuake => self.toggle_quake(),
             // repaint so a cursor caught in its off phase shows once blinking stops
-            UserEvent::OsPrefsRead { text_scale } => {
+            UserEvent::OsPrefsRead { text_scale, system_colors } => {
                 if (text_scale - self.os_text_scale).abs() > f32::EPSILON {
                     self.os_text_scale = text_scale;
                     self.apply_ui_factor();
+                }
+                if system_colors != self.os_system_colors {
+                    self.os_system_colors = system_colors;
+                    for r in std::iter::once(&mut self.pw).chain(&mut self.satellites).filter_map(|w| w.renderer.as_mut()) {
+                        r.set_system_colors(system_colors);
+                    }
                 }
                 for w in self.satellites.iter().filter_map(|sat| sat.window.as_ref()) {
                     w.request_redraw();

@@ -85,6 +85,14 @@ pub fn capture(
             r.set_ui_factor(1.75);
             r.set_tab_status(vec![0, 4, 2]);
         }
+        "high-contrast" => {
+            // a contrast theme on: flat system colors over every theme
+            r.set_system_colors(Some(crate::color::SystemColors::BLACK));
+            r.set_chrome_focus(Some(Hot::Tab(1)));
+            r.set_tab_status(vec![0, 4, 2]);
+            r.set_settings_panel(true, 1.0);
+            r.set_plugins(vec![("tamagotchi".into(), true), ("relay".into(), false)]);
+        }
         "error" => {
             // a failure that stays on the status bar until dismissed
             r.set_error("couldn't start the requested shell".into());
@@ -321,10 +329,10 @@ mod tests {
     use crate::color::ThemeId;
 
     /// every chrome surface worth guarding, each rendered in every theme
-    const SCENES: [&str; 18] = [
+    const SCENES: [&str; 19] = [
         "split", "attention", "hover", "palette", "menu", "find", "confirm", "rename", "market",
-        "settings", "settings2", "panemode", "notice", "error", "focus", "large-text", "welcome-hints",
-        "readme",
+        "settings", "settings2", "panemode", "notice", "error", "focus", "large-text", "high-contrast",
+        "welcome-hints", "readme",
     ];
     const W: u32 = 1100;
     const H: u32 = 680;

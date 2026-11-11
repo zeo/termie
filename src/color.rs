@@ -237,6 +237,28 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// the chrome ladder and the default ink in system colors; the 256
+    /// program colors stay and the contrast floor keeps them legible
+    pub fn forced(&self, s: &SystemColors) -> Palette {
+        Palette {
+            ink0: s.window,
+            ink1: s.window,
+            ink3: s.window,
+            ink4: s.window,
+            rule: s.text,
+            rule2: s.text,
+            mute: s.text,
+            text2: s.text,
+            paper: s.text,
+            fg: s.text,
+            bg: s.window,
+            bg2: s.window,
+            cursor: s.text,
+            sel: s.highlight,
+            ansi: self.ansi,
+        }
+    }
+
     /// clone with a program's dynamic OSC overrides applied. the gradient
     /// companion follows an overridden bg so the pane wash reads flat
     pub fn with_dyn(&self, d: &DynColors) -> Palette {
@@ -649,6 +671,129 @@ fn fill_ansi(base16: [Rgb; 16]) -> [Rgb; 256] {
     ansi
 }
 
+/// the os high-contrast scheme: the color pairs windows asks apps to draw
+/// with while contrast themes are on
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SystemColors {
+    pub window: Rgb,
+    pub text: Rgb,
+    pub highlight: Rgb,
+    pub highlight_text: Rgb,
+    pub button: Rgb,
+    pub button_text: Rgb,
+}
+
+impl SystemColors {
+    /// the linux portal only says higher contrast is wanted, not which colors
+    pub const BLACK: SystemColors = SystemColors {
+        window: Rgb::new(0, 0, 0),
+        text: Rgb::new(255, 255, 255),
+        highlight: Rgb::new(255, 255, 0),
+        highlight_text: Rgb::new(0, 0, 0),
+        button: Rgb::new(0, 0, 0),
+        button_text: Rgb::new(255, 255, 255),
+    };
+}
+
+/// the chrome's fixed surface colors: aqua gels by default, flat system
+/// colors under high contrast
+#[derive(Clone, Copy, Debug)]
+pub struct Skin {
+    pub nav: [Rgb; 6],
+    pub nav_active: [Rgb; 4],
+    pub nav_text: Rgb,
+    pub nav_mute: Rgb,
+    /// what hovered title-bar glyphs brighten toward
+    pub nav_hot: Rgb,
+    pub nav_active_text: Rgb,
+    pub nav_foot: Rgb,
+    pub accent: Rgb,
+    pub accent_gel: [Rgb; 4],
+    pub accent_pressed: [Rgb; 4],
+    pub accent_edge: Rgb,
+    pub focus: Rgb,
+    pub picked: [Rgb; 2],
+    pub picked_text: Rgb,
+    pub picked_meta: Rgb,
+    pub danger: Rgb,
+    pub gel: [Rgb; 4],
+    pub gel_pressed: [Rgb; 4],
+    pub gel_edge: Rgb,
+    pub gel_text: Rgb,
+    pub close_gel: [Rgb; 4],
+    pub well: Rgb,
+    pub well_text: Rgb,
+    /// gloss, bevels, engraved shadows and theme tints; off under high contrast
+    pub gloss: bool,
+}
+
+impl Skin {
+    pub fn aqua() -> Skin {
+        use crate::instrument as i;
+        let c = Rgb::from_triple;
+        let quad = |q: [[u8; 3]; 4]| q.map(Rgb::from_triple);
+        Skin {
+            nav: i::NAV.map(Rgb::from_triple),
+            nav_active: quad(i::NAV_ACTIVE),
+            nav_text: c(i::NAV_TEXT),
+            nav_mute: c(i::NAV_MUTE),
+            nav_hot: Rgb::new(255, 255, 255),
+            nav_active_text: Rgb::new(255, 255, 255),
+            nav_foot: Rgb::new(5, 5, 5),
+            accent: c(i::AQUA),
+            accent_gel: quad(i::AQUA_GEL),
+            accent_pressed: quad(i::AQUA_PRESSED),
+            accent_edge: c(i::AQUA_EDGE),
+            focus: c(i::FOCUS),
+            picked: i::PICKED.map(Rgb::from_triple),
+            picked_text: c(i::PICKED_TEXT),
+            picked_meta: c(i::PICKED_META),
+            danger: c(i::DANGER),
+            gel: quad(i::GRAPHITE_GEL),
+            gel_pressed: quad(i::GRAPHITE_PRESSED),
+            gel_edge: c(i::GEL_EDGE),
+            gel_text: c(i::GEL_TEXT),
+            close_gel: quad(i::CLOSE_GEL),
+            well: c(i::WELL),
+            well_text: c(i::TEXT2),
+            gloss: true,
+        }
+    }
+
+    /// every surface flat in a system color, every mark in its paired text color
+    pub fn system(s: &SystemColors) -> Skin {
+        // the ring sits on buttons and on the window; fall back to text when
+        // the highlight fades into either
+        let ring = if contrast(s.highlight, s.button) >= 3.0 && contrast(s.highlight, s.window) >= 3.0 { s.highlight } else { s.button_text };
+        Skin {
+            nav: [s.button; 6],
+            nav_active: [s.highlight; 4],
+            nav_text: s.button_text,
+            nav_mute: s.button_text,
+            nav_hot: s.button_text,
+            nav_active_text: s.highlight_text,
+            nav_foot: s.button_text,
+            accent: ring,
+            accent_gel: [s.highlight; 4],
+            accent_pressed: [s.highlight; 4],
+            accent_edge: s.button_text,
+            focus: ring,
+            picked: [s.highlight; 2],
+            picked_text: s.highlight_text,
+            picked_meta: s.highlight_text,
+            danger: s.text,
+            gel: [s.button; 4],
+            gel_pressed: [s.highlight; 4],
+            gel_edge: s.button_text,
+            gel_text: s.button_text,
+            close_gel: [s.highlight; 4],
+            well: s.window,
+            well_text: s.text,
+            gloss: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +874,36 @@ mod tests {
                 let lifted = apply_min_contrast(p.mute, surface, crate::render::tokens::TEXT_CONTRAST);
                 assert!(ratio(lifted, surface) >= 4.5, "{name}: muted text");
             }
+        }
+    }
+
+    #[test]
+    fn system_skin_pairs_each_surface_with_its_own_text_color() {
+        let white = SystemColors {
+            window: Rgb::new(255, 255, 255),
+            text: Rgb::new(0, 0, 0),
+            highlight: Rgb::new(0x37, 0x00, 0x6e),
+            highlight_text: Rgb::new(255, 255, 255),
+            button: Rgb::new(255, 255, 255),
+            button_text: Rgb::new(0, 0, 0),
+        };
+        for s in [SystemColors::BLACK, white] {
+            let k = Skin::system(&s);
+            assert!(!k.gloss);
+            for (ink, surface) in [
+                (k.nav_text, k.nav[2]),
+                (k.nav_active_text, k.nav_active[0]),
+                (k.gel_text, k.gel[0]),
+                (k.picked_text, k.accent_gel[0]),
+                (k.picked_text, k.picked[0]),
+                (k.well_text, k.well),
+                (k.danger, k.well),
+            ] {
+                assert!(ratio(ink, surface) >= 4.5, "{ink:?} on {surface:?}");
+            }
+            assert!(ratio(k.focus, k.nav[2]) >= 3.0 && ratio(k.focus, k.well) >= 3.0, "focus ring on {s:?}");
+            let p = Palette::from_theme(ThemeId::Instrument).forced(&s);
+            assert!(ratio(p.fg, p.bg) >= 4.5 && ratio(p.text2, p.ink1) >= 4.5);
         }
     }
 
