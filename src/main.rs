@@ -63,6 +63,7 @@ const MAX_PENDING_PLUGIN_EVENTS: usize = 16;
 const MAX_PENDING_LAUNCH_EVENTS: usize = 16;
 const MAX_PLUGIN_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
 const MAX_PLUGIN_TOPIC_BYTES: usize = 256;
+const MAX_PLUGIN_WIDGETS_PER_PLUGIN: usize = 8;
 
 fn plugin_topic_is_valid(topic: &str) -> bool {
     !topic.is_empty() && topic.len() <= MAX_PLUGIN_TOPIC_BYTES
@@ -5212,8 +5213,11 @@ impl App {
             C::Ready { name, api_version } => {
                 log::info!("plugin ready: {name} (api {api_version})");
             }
+            // the plugin id leads so a plugin can't pass its notice off as termie's own
             C::Notify { text } => {
-                log::info!("plugin notify: {text}");
+                let from = self.plugin_ids.get(pidx).map_or("plugin", String::as_str);
+                let notice = format!("{from}: {text}");
+                self.show_notice(&notice);
             }
             // plugin widgets: upsert by (plugin, id) and rebuild the dock. a
             // Tier-2 widget also carries an immediate-mode draw list (mapped into
@@ -5232,13 +5236,18 @@ impl App {
                     })
                     .collect();
                 let dw = render::DockWidget { title: w.title, lines: w.lines, draw, canvas_h: w.canvas_h };
+                let owned = self.plugin_widgets.iter().filter(|(p, _, _)| *p == pidx).count();
                 match self
                     .plugin_widgets
                     .iter_mut()
                     .find(|(p, id, _)| *p == pidx && *id == w.id)
                 {
                     Some(slot) => slot.2 = dw,
-                    None => self.plugin_widgets.push((pidx, w.id, dw)),
+                    None if owned < MAX_PLUGIN_WIDGETS_PER_PLUGIN => self.plugin_widgets.push((pidx, w.id, dw)),
+                    None => {
+                        log::warn!("plugin {pidx} exceeded its widget limit");
+                        return;
+                    }
                 }
                 self.rebuild_dock();
             }

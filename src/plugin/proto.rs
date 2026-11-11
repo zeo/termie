@@ -12,6 +12,12 @@ use super::json::Json;
 
 pub const API_VERSION: u32 = 2;
 
+/// plugin text shown in chrome: at most `max` chars, control chars blanked so a
+/// line can't break the dock or status bar layout
+fn display_text(text: &str, max: usize) -> String {
+    text.chars().take(max).map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 /// an immediate-mode draw primitive (Tier-2, `api_version` >= 2). coordinates are
 /// normalized 0..1 within the widget's canvas box, so a plugin is scale- and
 /// resolution-independent and can never address outside its own widget. `color`
@@ -35,7 +41,7 @@ impl DrawCmd {
             "text" => DrawCmd::Text {
                 x: unit("x"),
                 y: unit("y"),
-                text: v.get_str("text").unwrap_or("").chars().take(240).collect(),
+                text: display_text(v.get_str("text").unwrap_or(""), 240),
                 color,
             },
             _ => return None,
@@ -69,7 +75,8 @@ impl DrawCmd {
 /// without breaking older plugins because unknown fields are ignored. a Tier-2
 /// plugin (`api_version` >= 2) may also set `draw` — an immediate-mode primitive
 /// list painted in a `canvas_h`-tall box under the title; Tier-1 plugins leave it
-/// empty and are unaffected
+/// empty and are unaffected. limits: ids up to 64 bytes, titles 120 chars,
+/// 64 lines of 240 chars, 256 draw primitives, 8 widgets per plugin
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Widget {
     pub id: String,
@@ -81,12 +88,12 @@ pub struct Widget {
 
 impl Widget {
     fn from_json(v: &Json) -> Option<Widget> {
-        let id = v.get_str("id")?.to_string();
-        let title = v.get_str("title").unwrap_or("").to_string();
+        let id = v.get_str("id").filter(|id| id.len() <= 64)?.to_string();
+        let title = display_text(v.get_str("title").unwrap_or(""), 120);
         let lines = v
             .get("lines")
             .and_then(Json::as_array)
-            .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+            .map(|a| a.iter().filter_map(|l| l.as_str().map(|l| display_text(l, 240))).take(64).collect())
             .unwrap_or_default();
         // cap the primitive count so one widget can't flood the instance buffer
         let draw = v
@@ -229,7 +236,7 @@ impl PluginCmd {
                 None => PluginCmd::Unknown(t.to_string()),
             },
             "notify" => PluginCmd::Notify {
-                text: v.get_str("text").unwrap_or("").to_string(),
+                text: display_text(v.get_str("text").unwrap_or(""), 200),
             },
             "write_pty" => PluginCmd::WritePty {
                 data: v.get_str("data").unwrap_or("").to_string(),
@@ -438,6 +445,30 @@ mod tests {
         match PluginCmd::from_line(&line).unwrap() {
             PluginCmd::DeclareWidget(w) => assert_eq!(w.draw.len(), 256),
             other => panic!("expected widget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn widget_and_notify_text_is_bounded_and_flattened() {
+        let lines = std::iter::repeat_n(format!("\"{}\"", "x".repeat(300)), 100).collect::<Vec<_>>().join(",");
+        let line = format!(r#"{{"t":"declare_widget","widget":{{"id":"w","title":"a\nb","lines":[{lines}]}}}}"#);
+        match PluginCmd::from_line(&line).unwrap() {
+            PluginCmd::DeclareWidget(w) => {
+                assert_eq!(w.title, "a b");
+                assert_eq!(w.lines.len(), 64);
+                assert!(w.lines.iter().all(|l| l.chars().count() == 240));
+            }
+            other => panic!("expected widget, got {other:?}"),
+        }
+        let long_id = format!(r#"{{"t":"declare_widget","widget":{{"id":"{}"}}}}"#, "i".repeat(65));
+        assert!(matches!(PluginCmd::from_line(&long_id).unwrap(), PluginCmd::Unknown(_)));
+        let notify = format!(r#"{{"t":"notify","text":"done\u001b[2J{}"}}"#, "y".repeat(400));
+        match PluginCmd::from_line(&notify).unwrap() {
+            PluginCmd::Notify { text } => {
+                assert!(text.starts_with("done [2J"));
+                assert_eq!(text.chars().count(), 200);
+            }
+            other => panic!("expected notify, got {other:?}"),
         }
     }
 
