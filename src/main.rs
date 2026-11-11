@@ -4,6 +4,7 @@
 mod a11y;
 mod apc;
 mod color;
+mod config;
 #[cfg(windows)]
 mod defterm;
 mod fxhash;
@@ -114,10 +115,16 @@ impl Drop for EventPermit {
 
 type Rect = (f32, f32, f32, f32);
 
+/// read at most `limit` bytes as text, dropping a utf-8 bom; a stray invalid
+/// byte (an ansi-encoded path) becomes U+FFFD instead of discarding the file
 fn read_text(reader: impl Read, limit: usize) -> Option<String> {
-    let mut text = String::new();
-    reader.take(limit as u64 + 1).read_to_string(&mut text).ok()?;
-    (text.len() <= limit).then_some(text)
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
 }
 
 fn read_text_file(path: &Path, limit: usize) -> Option<String> {
@@ -3087,131 +3094,6 @@ impl Default for Config {
     }
 }
 
-/// all persisted settings (App-owned + renderer-owned), read at startup
-struct Persisted {
-    scrollback: usize,
-    copy_on_select: bool,
-    shell: ShellKind,
-    load_profile: bool,
-    close_action: CloseAction,
-    right_click: RightClick,
-    backend: render::BackendChoice,
-    restore_on_launch: bool,
-    font_size: f32,
-    padding: f32,
-    cursor: grid::CursorShape,
-    cursor_blink: bool,
-    bold_as_bright: bool,
-    line_height: f32,
-    theme: color::ThemeId,
-    /// `theme=auto`: follow the OS light/dark setting, resolving to
-    /// theme_dark / theme_light (which only matter while auto is on)
-    theme_auto: bool,
-    theme_dark: color::ThemeId,
-    theme_light: color::ThemeId,
-    font: Option<String>,
-    /// base weight regular text renders at (`font_weight=`, named or 100-900)
-    font_weight: u16,
-    /// minimum WCAG contrast ratio text is lifted to against its cell bg
-    /// (`min_contrast=`, 1-21; 1 = off). wt's minimumContrastRatio
-    min_contrast: f32,
-    /// window background image png (`background_image=` path) drawn behind
-    /// panes at `background_image_opacity=` (0..1)
-    background_image: Option<String>,
-    background_image_opacity: f32,
-    /// shape punctuation runs through the font's ligature rules (`ligatures=`,
-    /// default on; fonts without liga/calt render identically)
-    ligatures: bool,
-    opacity: i32,
-    #[cfg(windows)]
-    quake_key: Option<(u32, u32)>,
-    #[cfg(target_os = "linux")]
-    quake_key: Option<String>,
-    /// the quake_key line as written, kept so save_config preserves its spelling
-    quake_key_raw: Option<String>,
-    /// the WSL distribution `new tab: wsl` launches (None = wsl.exe default)
-    wsl_distro: Option<String>,
-    /// run plugins inside the OS sandbox for privilege isolation: a windows
-    /// appcontainer (`plugin_sandbox=appcontainer`) or a linux bwrap jail
-    /// (`plugin_sandbox=bwrap`); on by default
-    plugin_sandbox: bool,
-    /// let terminal programs replace the OS clipboard through OSC 52
-    osc52: bool,
-    /// system backdrop behind the window (`acrylic=true`, alias `mica`): mica
-    /// on windows 11 and compositor blur on linux
-    acrylic: bool,
-    /// custom shell profiles, kept both raw as (`profile.` sub-key, value) so
-    /// save_config re-emits every line the user wrote, and parsed into Profiles
-    /// (argv plus optional .cwd / .env.<VAR> sub-keys)
-    profiles_raw: Vec<(String, String)>,
-    profiles: Vec<pty::Profile>,
-    /// per-profile themes (`theme.<shell-or-profile>=<theme name>`): panes
-    /// spawned as that shell/profile paint with that theme's palette while
-    /// the window chrome keeps the global theme
-    shell_themes: Vec<(String, color::ThemeId)>,
-    /// paint pty output inline instead of via the request_redraw hop, shaving up
-    /// to a frame of input-to-photon latency and staying tear-free under Fifo
-    /// vsync; on by default — set `inline_paint=false` to use the redraw hop
-    inline_paint: bool,
-    /// draw the input-to-photon latency hud (`latency_hud=true`); off by default
-    latency_hud: bool,
-    /// daily update check against GitHub releases; `update_check=false` opts out
-    update_check: bool,
-    /// value of $TERM_PROGRAM for child processes. default "termie". set to a
-    /// known host name (e.g. ghostty) only for apps that refuse the kitty
-    /// keyboard protocol unless the name is on their allowlist
-    term_program: String,
-    /// working directories saved from the command palette or tab menu
-    bookmarks: Vec<String>,
-}
-
-impl Default for Persisted {
-    fn default() -> Self {
-        Persisted {
-            scrollback: 10_000,
-            copy_on_select: false,
-            shell: ShellKind::Auto,
-            load_profile: false,
-            close_action: CloseAction::Quit,
-            right_click: RightClick::Menu,
-            backend: render::BackendChoice::Auto,
-            restore_on_launch: true,
-            font_size: CONTENT_PT,
-            padding: 6.0,
-            cursor: grid::CursorShape::Block,
-            cursor_blink: true,
-            bold_as_bright: true,
-            line_height: 1.32,
-            theme: color::ThemeId::Instrument,
-            theme_auto: false,
-            theme_dark: color::ThemeId::Instrument,
-            theme_light: color::ThemeId::Paper,
-            font: None,
-            font_weight: 400,
-            min_contrast: 1.0,
-            background_image: None,
-            background_image_opacity: 0.3,
-            ligatures: true,
-            opacity: 85,
-            #[cfg(any(windows, target_os = "linux"))]
-            quake_key: None,
-            quake_key_raw: None,
-            wsl_distro: None,
-            plugin_sandbox: true,
-            osc52: false,
-            acrylic: false,
-            profiles_raw: Vec::new(),
-            profiles: Vec::new(),
-            shell_themes: Vec::new(),
-            inline_paint: true,
-            latency_hud: false,
-            update_check: true,
-            term_program: String::from("termie"),
-            bookmarks: Vec::new(),
-        }
-    }
-}
-
 /// a small rolling meter of input-to-photon latency and frame intervals (ms),
 /// feeding the optional latency hud. fixed-capacity so it never grows
 #[derive(Default)]
@@ -3261,31 +3143,6 @@ fn percentiles(q: &std::collections::VecDeque<f32>) -> Option<(f32, f32)> {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let pick = |p: f32| v[((v.len() as f32 * p) as usize).min(v.len() - 1)];
     Some((pick(0.50), pick(0.95)))
-}
-
-/// css/opentype weight, named or numeric; None leaves the setting untouched
-fn font_weight_from_label(v: &str) -> Option<u16> {
-    let named = match v.to_ascii_lowercase().as_str() {
-        "thin" => 100,
-        "extralight" => 200,
-        "light" => 300,
-        "normal" | "regular" => 400,
-        "medium" => 500,
-        "semibold" => 600,
-        "bold" => 700,
-        "extrabold" => 800,
-        "black" => 900,
-        _ => return v.parse::<u16>().ok().map(|n| n.clamp(100, 900)),
-    };
-    Some(named)
-}
-
-fn cursor_from_name(s: &str) -> grid::CursorShape {
-    match s {
-        "block" => grid::CursorShape::Block,
-        "underline" => grid::CursorShape::Underline,
-        _ => grid::CursorShape::Bar,
-    }
 }
 
 /// whether a chrome button mutates a persisted setting (triggers a save)
@@ -3784,222 +3641,6 @@ fn portal_key_name(name: &str) -> Option<String> {
     .to_string())
 }
 
-fn load_persisted() -> Persisted {
-    let Some(path) = config_path() else {
-        return Persisted::default();
-    };
-    let Some(text) = read_text_file(&path, MAX_STARTUP_TEXT_BYTES) else {
-        return Persisted::default();
-    };
-    parse_persisted(&text)
-}
-
-fn record_profile_line(persisted: &mut Persisted, key: &str, value: &str) {
-    if persisted.profiles_raw.len() < MAX_PROFILE_RAW_LINES {
-        persisted.profiles_raw.push((key.to_string(), value.to_string()));
-    }
-}
-
-/// parse the key=value config text into Persisted, leaving defaults for any key
-/// absent or malformed; split out from load_persisted so the settings parser is
-/// unit-testable without touching %APPDATA%
-fn parse_persisted(text: &str) -> Persisted {
-    let mut p = Persisted::default();
-    for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let (k, v) = (k.trim(), v.trim());
-        match k {
-            "scrollback" => {
-                if let Ok(n) = v.parse::<usize>() {
-                    // same ceiling as the settings control: history is stored
-                    // as full-width lines, so an uncapped value is an OOM knob
-                    if n > 100_000 {
-                        log::warn!("scrollback={n} clamped to 100000");
-                    }
-                    p.scrollback = n.min(100_000);
-                }
-            }
-            "copy_on_select" => p.copy_on_select = v == "true",
-            "shell" => p.shell = ShellKind::from_label(v),
-            "load_profile" => p.load_profile = v == "true",
-            "close_action" => p.close_action = CloseAction::from_label(v),
-            "right_click" => p.right_click = RightClick::from_label(v),
-            "backend" => p.backend = render::BackendChoice::from_label(v),
-            "restore_on_launch" => p.restore_on_launch = v != "false",
-            "font_size" => {
-                if let Ok(n) = v.parse::<f32>()
-                    && n.is_finite()
-                {
-                    p.font_size = n;
-                }
-            }
-            "padding" => {
-                if let Ok(n) = v.parse::<f32>()
-                    && n.is_finite()
-                {
-                    p.padding = n;
-                }
-            }
-            "opacity" => {
-                if let Ok(n) = v.parse() {
-                    p.opacity = n;
-                }
-            }
-            "cursor" => p.cursor = cursor_from_name(v),
-            "cursor_blink" => p.cursor_blink = v != "false",
-            "bold_as_bright" => p.bold_as_bright = v != "false",
-            "line_height" => {
-                if let Ok(x) = v.parse::<f32>()
-                    && x.is_finite()
-                {
-                    p.line_height = x;
-                }
-            }
-            "theme" => {
-                if v.eq_ignore_ascii_case("auto") {
-                    p.theme_auto = true;
-                } else {
-                    p.theme = color::ThemeId::from_name(v);
-                    p.theme_auto = false;
-                }
-            }
-            "theme_dark" => p.theme_dark = color::ThemeId::from_name(v),
-            "theme_light" => p.theme_light = color::ThemeId::from_name(v),
-            "font" => {
-                if !v.is_empty() {
-                    p.font = Some(v.to_string());
-                }
-            }
-            "font_weight" => {
-                if let Some(w) = font_weight_from_label(v) {
-                    p.font_weight = w;
-                }
-            }
-            "min_contrast" => {
-                if let Ok(x) = v.parse::<f32>()
-                    && x.is_finite()
-                {
-                    p.min_contrast = x.clamp(1.0, 21.0);
-                }
-            }
-            "ligatures" => p.ligatures = v != "false" && v != "off",
-            "background_image" => p.background_image = (!v.is_empty()).then(|| v.to_string()),
-            "background_image_opacity" => {
-                if let Ok(x) = v.parse::<f32>()
-                    && x.is_finite()
-                {
-                    p.background_image_opacity = x.clamp(0.0, 1.0);
-                }
-            }
-            "quake_key" => {
-                p.quake_key_raw = (!v.is_empty()).then(|| v.to_string());
-                #[cfg(windows)]
-                {
-                    p.quake_key = parse_quake_key(v);
-                    if p.quake_key.is_none() {
-                        p.quake_key_raw = None;
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    p.quake_key = quake_portal_trigger(v);
-                    if p.quake_key.is_none() {
-                        p.quake_key_raw = None;
-                    }
-                }
-            }
-            "wsl_distro" => {
-                if !v.is_empty() {
-                    p.wsl_distro = Some(v.to_string());
-                }
-            }
-            "plugin_sandbox" => {
-                p.plugin_sandbox = v == "appcontainer" || v == "bwrap" || v == "on" || v == "true"
-            }
-            "osc52" => p.osc52 = v == "true" || v == "on",
-            "acrylic" | "mica" => p.acrylic = v == "true" || v == "on",
-            "inline_paint" => p.inline_paint = v == "true" || v == "on",
-            "latency_hud" => p.latency_hud = v == "true" || v == "on",
-            "update_check" => p.update_check = v != "false" && v != "off",
-            "term_program" => {
-                // empty falls back to the default at spawn time
-                if !v.is_empty() {
-                    p.term_program = v.to_string();
-                }
-            }
-            "bookmark" => {
-                if !v.is_empty()
-                    && p.bookmarks.len() < MAX_BOOKMARKS
-                    && !p.bookmarks.iter().any(|path| same_location(path, v))
-                {
-                    p.bookmarks.push(v.to_string());
-                }
-            }
-            other => {
-                if let Some(name) = other.strip_prefix("theme.") {
-                    if !name.is_empty() && !v.is_empty() {
-                        if p.shell_themes.len() < MAX_SHELL_THEMES {
-                            p.shell_themes.push((name.to_string(), color::ThemeId::from_name(v)));
-                        }
-                    } else {
-                        log::warn!("config: per-profile theme line `{other}` needs a name and a theme");
-                    }
-                } else if let Some(rest) = other.strip_prefix("profile.") {
-                    // profile.<name>=<argv>, profile.<name>.cwd=<dir>,
-                    // profile.<name>.env.<VAR>=<value>; sub-keys attach to the
-                    // profile of that name whatever order the lines appear in
-                    if let Some(name) = rest.strip_suffix(".cwd") {
-                        if !name.is_empty() && !v.is_empty() {
-                            if let Some(profile) = profile_mut(&mut p.profiles, name) {
-                                profile.cwd = Some(v.to_string());
-                                record_profile_line(&mut p, rest, v);
-                            }
-                        } else {
-                            log::warn!("config: profile line `{other}` needs a name and a directory");
-                        }
-                    } else if let Some((name, var)) = rest.split_once(".env.") {
-                        if !name.is_empty() && !var.is_empty() {
-                            if let Some(profile) = profile_mut(&mut p.profiles, name)
-                                && profile.env.len() < MAX_PROFILE_ENV
-                            {
-                                profile.env.push((var.to_string(), v.to_string()));
-                                record_profile_line(&mut p, rest, v);
-                            }
-                        } else {
-                            log::warn!("config: profile env line `{other}` needs a name and a variable");
-                        }
-                    } else {
-                        let argv = split_cmdline(v);
-                        if !rest.is_empty() && !argv.is_empty() {
-                            if let Some(profile) = profile_mut(&mut p.profiles, rest) {
-                                profile.argv = argv;
-                                record_profile_line(&mut p, rest, v);
-                            }
-                        } else {
-                            log::warn!("config: profile line `{other}` needs a name and a command");
-                        }
-                    }
-                } else {
-                    // a typo used to be discarded with zero feedback
-                    log::warn!("config: unknown key `{other}` ignored");
-                }
-            }
-        }
-    }
-    // a .cwd / .env line for a profile with no command line leaves an argv-less
-    // entry — drop it (it must never reach the spawn path) and say so, like the
-    // other malformed-config warns
-    p.profiles.retain(|pr| {
-        if pr.argv.is_empty() {
-            log::warn!("config: profile `{}` has .cwd/.env lines but no profile.{}=<command>; ignored", pr.name, pr.name);
-        }
-        !pr.argv.is_empty()
-    });
-    p
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZoomDeltaKind {
     Lines,
@@ -4307,7 +3948,7 @@ struct App {
     #[cfg(not(windows))]
     theme_watch_spawned: bool,
     /// persisted settings loaded at startup; renderer-owned ones applied in boot
-    persisted: Persisted,
+    persisted: config::Persisted,
     /// broadcast input: typed keys go to every pane in the active tab
     broadcast: bool,
     /// button + pane that received a forwarded press; drag motion and release
@@ -4384,7 +4025,7 @@ impl App {
     }
 
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
-        let p = load_persisted();
+        let p = config::load();
         // install profiles before anything derives from them (palette entries,
         // shell labels in a restored session). each installed wsl distro joins
         // the config profiles as a synthetic "wsl: <name>" so it appears in the
@@ -9093,105 +8734,46 @@ impl App {
     }
 
     fn save_config(&self) {
-        use std::fmt::Write as _;
         // never persist a partial file: renderer-owned keys would be dropped and
         // fall back to defaults on the next load. always read the MAIN window's
         // renderer (a satellite may be swapped into self.pw when this is called)
         let Some(r) = self.main_pw().renderer.as_ref() else {
             return;
         };
+        if self.persisted.unreadable {
+            return;
+        }
         let Some(path) = config_path() else {
             return;
         };
         if let Some(dir) = path.parent() {
             let _ = ensure_user_dir(dir);
         }
-        let mut s = String::new();
-        let _ = writeln!(s, "scrollback={}", self.config.scrollback);
-        let _ = writeln!(s, "copy_on_select={}", self.config.copy_on_select);
-        let _ = writeln!(s, "shell={}", self.config.shell.label());
-        let _ = writeln!(s, "load_profile={}", self.config.load_profile);
-        let _ = writeln!(s, "close_action={}", self.config.close_action.label());
-        let _ = writeln!(s, "right_click={}", self.config.right_click.label());
-        let _ = writeln!(s, "backend={}", self.config.backend.label());
-        let _ = writeln!(s, "restore_on_launch={}", self.config.restore_on_launch);
-        let _ = writeln!(s, "font_size={}", r.content_pt() as i32);
-        let _ = writeln!(s, "padding={}", r.pane_pad_px() as i32);
-        let _ = writeln!(s, "opacity={}", r.opacity_pct());
-        let _ = writeln!(s, "cursor={}", r.cursor_style_name());
-        let _ = writeln!(s, "cursor_blink={}", r.cursor_blink());
-        let _ = writeln!(s, "bold_as_bright={}", r.bold_as_bright());
-        let _ = writeln!(s, "line_height={}", r.line_height());
-        if self.persisted.theme_auto {
-            let _ = writeln!(s, "theme=auto");
-        } else {
-            let _ = writeln!(s, "theme={}", r.theme().name());
-        }
-        if self.persisted.theme_dark != color::ThemeId::Instrument {
-            let _ = writeln!(s, "theme_dark={}", self.persisted.theme_dark.name());
-        }
-        if self.persisted.theme_light != color::ThemeId::Paper {
-            let _ = writeln!(s, "theme_light={}", self.persisted.theme_light.name());
-        }
-        let _ = writeln!(s, "font={}", r.font_name());
-        if r.font_weight() != 400 {
-            let _ = writeln!(s, "font_weight={}", r.font_weight());
-        }
-        if r.min_contrast() > 1.0 {
-            let _ = writeln!(s, "min_contrast={}", r.min_contrast());
-        }
-        if let Some(bi) = &self.persisted.background_image {
-            let _ = writeln!(s, "background_image={bi}");
-            let _ = writeln!(s, "background_image_opacity={}", self.persisted.background_image_opacity);
-        }
-        if !r.ligatures() {
-            let _ = writeln!(s, "ligatures=false");
-        }
-        if let Some(q) = &self.persisted.quake_key_raw {
-            // an opt-in the panel can't edit; dropping it here silently killed
-            // the user's drop-down hotkey on every settings change
-            let _ = writeln!(s, "quake_key={q}");
-        }
-        if let Some(d) = &self.persisted.wsl_distro {
-            let _ = writeln!(s, "wsl_distro={d}");
-        }
-        if !self.persisted.plugin_sandbox {
-            let _ = writeln!(s, "plugin_sandbox=off");
-        }
-        if self.persisted.osc52 {
-            let _ = writeln!(s, "osc52=true");
-        }
-        if self.persisted.acrylic {
-            let _ = writeln!(s, "acrylic=true");
-        }
-        for (name, line) in &self.persisted.profiles_raw {
-            // config-file-only like quake_key: re-emit exactly as written
-            let _ = writeln!(s, "profile.{name}={line}");
-        }
-        for (name, id) in &self.persisted.shell_themes {
-            // config-file-only like profiles: panes of this shell/profile
-            // render with their own theme
-            let _ = writeln!(s, "theme.{name}={}", id.name());
-        }
-        for path in &self.persisted.bookmarks {
-            let _ = writeln!(s, "bookmark={path}");
-        }
-        if self.persisted.term_program != "termie" {
-            // default is termie; only persist an override so the file stays short
-            let _ = writeln!(s, "term_program={}", self.persisted.term_program);
-        }
-        if !self.persisted.inline_paint {
-            // on by default; persist only the opt-out
-            let _ = writeln!(s, "inline_paint=false");
-        }
-        if self.persisted.latency_hud {
-            let _ = writeln!(s, "latency_hud=true");
-        }
-        if !self.persisted.update_check {
-            // on by default; persist only the opt-out
-            let _ = writeln!(s, "update_check=false");
-        }
-        let _ = write_atomic(&path, s.as_bytes());
+        let c = &self.config;
+        let p = config::Persisted {
+            scrollback: c.scrollback,
+            copy_on_select: c.copy_on_select,
+            shell: c.shell,
+            load_profile: c.load_profile,
+            close_action: c.close_action,
+            right_click: c.right_click,
+            backend: c.backend,
+            restore_on_launch: c.restore_on_launch,
+            font_size: r.content_pt(),
+            padding: r.pane_pad_px(),
+            opacity: r.opacity_pct(),
+            cursor: r.cursor_style(),
+            cursor_blink: r.cursor_blink(),
+            bold_as_bright: r.bold_as_bright(),
+            line_height: r.line_height(),
+            theme: r.theme(),
+            font: Some(r.font_name().to_string()),
+            font_weight: r.font_weight(),
+            min_contrast: r.min_contrast(),
+            ligatures: r.ligatures(),
+            ..self.persisted.clone()
+        };
+        let _ = write_atomic(&path, config::render(&p).as_bytes());
     }
 
     /// build a snapshot of every live tab and split tree for persistence
@@ -13099,6 +12681,13 @@ mod tests {
     }
 
     #[test]
+    fn text_reader_drops_a_bom_and_keeps_text_around_a_bad_byte() {
+        let bytes = b"\xef\xbb\xbftheme=nord\nbookmark=C:\\caf\xe9\nosc52=true\n";
+        let text = read_text(std::io::Cursor::new(bytes), 1024).unwrap();
+        assert_eq!(text, "theme=nord\nbookmark=C:\\caf\u{fffd}\nosc52=true\n");
+    }
+
+    #[test]
     fn wheel_prefers_an_alternate_screens_existing_scrollback() {
         assert!(wheel_uses_local_scrollback(false, false));
         assert!(wheel_uses_local_scrollback(true, true));
@@ -13240,17 +12829,6 @@ mod tests {
         assert!(attrs.window_icon.is_none());
         assert!(attrs.inner_size.is_some());
         assert!(attrs.min_inner_size.is_some());
-    }
-
-    #[test]
-    fn font_weight_labels_and_numbers_parse() {
-        assert_eq!(font_weight_from_label("semibold"), Some(600));
-        assert_eq!(font_weight_from_label("Regular"), Some(400));
-        assert_eq!(font_weight_from_label("350"), Some(350));
-        // out-of-range numbers clamp, garbage leaves the setting untouched
-        assert_eq!(font_weight_from_label("1000"), Some(900));
-        assert_eq!(font_weight_from_label("55"), Some(100));
-        assert_eq!(font_weight_from_label("heavyish"), None);
     }
 
     #[test]
@@ -13581,45 +13159,6 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_feature_flags_and_aliases() {
-        // the sandbox is on unless explicitly disabled
-        assert!(parse_persisted("plugin_sandbox=appcontainer").plugin_sandbox);
-        assert!(parse_persisted("plugin_sandbox=on").plugin_sandbox);
-        assert!(parse_persisted("plugin_sandbox=true").plugin_sandbox);
-        assert!(!parse_persisted("plugin_sandbox=off").plugin_sandbox);
-        assert!(Persisted::default().plugin_sandbox);
-        assert!(!Persisted::default().osc52);
-        assert!(parse_persisted("osc52=true").osc52);
-
-        assert!(parse_persisted("inline_paint=true").inline_paint);
-        assert!(parse_persisted("inline_paint=on").inline_paint);
-        assert!(!parse_persisted("inline_paint=false").inline_paint);
-
-        assert!(parse_persisted("latency_hud=true").latency_hud);
-        assert!(parse_persisted("latency_hud=on").latency_hud);
-        assert!(!parse_persisted("latency_hud=nope").latency_hud);
-
-        assert_eq!(parse_persisted("wsl_distro=Ubuntu").wsl_distro.as_deref(), Some("Ubuntu"));
-        // an empty value leaves the default (no distro pinned)
-        assert_eq!(parse_persisted("wsl_distro=").wsl_distro, None);
-
-        // the system backdrop accepts both spellings, off by default
-        assert!(parse_persisted("acrylic=true").acrylic);
-        assert!(parse_persisted("mica=on").acrylic);
-        assert!(!parse_persisted("acrylic=false").acrylic);
-        assert!(!Persisted::default().acrylic);
-    }
-
-    #[test]
-    fn config_parses_right_click() {
-        assert_eq!(parse_persisted("right_click=paste").right_click, RightClick::Paste);
-        assert_eq!(parse_persisted("right_click=menu").right_click, RightClick::Menu);
-        // an unknown value warns and keeps the default (menu)
-        assert_eq!(parse_persisted("right_click=bogus").right_click, RightClick::Menu);
-        assert_eq!(Persisted::default().right_click, RightClick::Menu);
-    }
-
-    #[test]
     fn window_bounds_clamp_to_a_visible_monitor() {
         let one = [(0, 0, 1920u32, 1080u32)];
         // fully inside: untouched
@@ -13664,67 +13203,6 @@ mod tests {
             cwd: None,
             env: Vec::new(),
         }
-    }
-
-    #[test]
-    fn config_parses_custom_profiles() {
-        let p = parse_persisted(
-            "profile.git-bash=\"C:\\Git\\bin\\bash.exe\" -i -l\nprofile.nu=nu.exe\nprofile.=broken\nprofile.empty=\n",
-        );
-        assert_eq!(p.profiles.len(), 2);
-        assert_eq!(p.profiles[0].name, "git-bash");
-        assert_eq!(p.profiles[0].argv, ["C:\\Git\\bin\\bash.exe", "-i", "-l"]);
-        assert_eq!(p.profiles[1].name, "nu");
-        assert_eq!(p.profiles[1].argv, ["nu.exe"]);
-        // the raw lines round-trip for save_config
-        assert_eq!(p.profiles_raw[1], ("nu".to_string(), "nu.exe".to_string()));
-    }
-
-    #[test]
-    fn config_caps_profile_and_theme_collections() {
-        let profiles = (0..=MAX_CUSTOM_PROFILES)
-            .map(|i| format!("profile.p{i}=shell{i}\n"))
-            .collect::<String>();
-        let p = parse_persisted(&profiles);
-        assert_eq!(p.profiles.len(), MAX_CUSTOM_PROFILES);
-        assert_eq!(p.profiles_raw.len(), MAX_CUSTOM_PROFILES);
-
-        let env = (0..=MAX_PROFILE_ENV)
-            .map(|i| format!("profile.dev.env.V{i}=value{i}\n"))
-            .collect::<String>();
-        let p = parse_persisted(&format!("profile.dev=shell\n{env}"));
-        assert_eq!(p.profiles[0].env.len(), MAX_PROFILE_ENV);
-
-        let raw = std::iter::repeat_n("profile.dev=shell\n", MAX_PROFILE_RAW_LINES + 1).collect::<String>();
-        assert_eq!(parse_persisted(&raw).profiles_raw.len(), MAX_PROFILE_RAW_LINES);
-
-        let themes = (0..=MAX_SHELL_THEMES)
-            .map(|i| format!("theme.shell{i}=nord\n"))
-            .collect::<String>();
-        assert_eq!(parse_persisted(&themes).shell_themes.len(), MAX_SHELL_THEMES);
-    }
-
-    #[test]
-    fn config_parses_profile_cwd_and_env() {
-        let p = parse_persisted(
-            "profile.dev=pwsh.exe\nprofile.dev.cwd=C:\\repo\nprofile.dev.env.RUST_LOG=debug\nprofile.dev.env.API=1\n",
-        );
-        assert_eq!(p.profiles.len(), 1);
-        let dev = &p.profiles[0];
-        assert_eq!(dev.argv, ["pwsh.exe"]);
-        assert_eq!(dev.cwd.as_deref(), Some("C:\\repo"));
-        assert_eq!(
-            dev.env,
-            [("RUST_LOG".to_string(), "debug".to_string()), ("API".to_string(), "1".to_string())]
-        );
-        // sub-keys attach in any line order; an orphaned sub-key (no command
-        // line) leaves no profile but the raw line still round-trips
-        let q = parse_persisted("profile.x.cwd=C:\\a\nprofile.x=cmd.exe\nprofile.orphan.env.FOO=bar\n");
-        assert_eq!(q.profiles.len(), 1);
-        assert_eq!(q.profiles[0].name, "x");
-        assert_eq!(q.profiles[0].cwd.as_deref(), Some("C:\\a"));
-        assert!(q.profiles_raw.iter().any(|(k, v)| k == "x.cwd" && v == "C:\\a"));
-        assert!(q.profiles_raw.iter().any(|(k, v)| k == "orphan.env.FOO" && v == "bar"));
     }
 
     #[test]
@@ -13778,66 +13256,6 @@ mod tests {
         assert_eq!(stack.first().unwrap().cwd.as_deref(), Some("3"));
         // pop is last-in-first-out: the most recently closed comes back first
         assert_eq!(stack.pop().unwrap().cwd.as_deref(), Some((n - 1).to_string().as_str()));
-    }
-
-    #[test]
-    fn config_parses_per_profile_themes() {
-        let p = parse_persisted("theme=paper\ntheme.cmd=nord\ntheme.git-bash=gruvbox\ntheme.=broken\ntheme.wsl=\n");
-        // the global theme key is untouched by the per-profile lines
-        assert_eq!(p.theme, color::ThemeId::Paper);
-        assert_eq!(
-            p.shell_themes,
-            [
-                ("cmd".to_string(), color::ThemeId::Nord),
-                ("git-bash".to_string(), color::ThemeId::Gruvbox)
-            ]
-        );
-    }
-
-    #[test]
-    fn config_parses_theme_auto() {
-        let p = parse_persisted("theme=auto\ntheme_dark=nord\ntheme_light=paper\n");
-        assert!(p.theme_auto);
-        assert_eq!(p.theme_dark, color::ThemeId::Nord);
-        assert_eq!(p.theme_light, color::ThemeId::Paper);
-        // a concrete theme after auto wins and turns auto off (last line rules)
-        let p = parse_persisted("theme=auto\ntheme=koi\n");
-        assert!(!p.theme_auto);
-        assert_eq!(p.theme, color::ThemeId::Koi);
-    }
-
-    #[test]
-    fn config_round_trips_the_serialized_flag_lines() {
-        // exactly what the settings writer emits for non-default feature values
-        let text = "plugin_sandbox=off\nosc52=true\ninline_paint=true\nlatency_hud=true\nwsl_distro=Arch\n";
-        let p = parse_persisted(text);
-        assert!(!p.plugin_sandbox && p.osc52 && p.inline_paint && p.latency_hud);
-        assert_eq!(p.wsl_distro.as_deref(), Some("Arch"));
-    }
-
-    #[test]
-    fn config_ignores_unknown_keys_and_malformed_lines() {
-        let text = "\nfrobnicate=yes\nlatency_hud=true\n   \nplugin_sandbox\n";
-        let p = parse_persisted(text);
-        // the one real key still takes effect
-        assert!(p.latency_hud);
-        // a bare key with no '=' is skipped, leaving the secure default
-        assert!(p.plugin_sandbox);
-        // unknown keys leave everything else at its default
-        assert_eq!(p.scrollback, Persisted::default().scrollback);
-    }
-
-    #[test]
-    fn config_ignores_non_finite_renderer_values() {
-        let p = parse_persisted(
-            "font_size=NaN\npadding=inf\nline_height=-inf\nmin_contrast=NaN\nbackground_image_opacity=NaN\n",
-        );
-        let defaults = Persisted::default();
-        assert_eq!(p.font_size, defaults.font_size);
-        assert_eq!(p.padding, defaults.padding);
-        assert_eq!(p.line_height, defaults.line_height);
-        assert_eq!(p.min_contrast, defaults.min_contrast);
-        assert_eq!(p.background_image_opacity, defaults.background_image_opacity);
     }
 
     #[test]
@@ -14248,23 +13666,6 @@ mod tests {
         assert!(r.iter().all(|(l, _)| fuzzy_score("split", l).is_some()));
         assert!(r.first().map(|(l, _)| l.starts_with("split")).unwrap_or(false));
         assert_eq!(palette_filter("").len(), all_palette_actions().len());
-    }
-
-    #[test]
-    fn bookmarks_parse_once_and_keep_roots_distinct() {
-        let parsed = parse_persisted(
-            "bookmark=C:\\work\\termie\nbookmark=c:/work/termie/\nbookmark=/\nbookmark=\n",
-        );
-        #[cfg(windows)]
-        assert_eq!(parsed.bookmarks, ["C:\\work\\termie", "/"]);
-        #[cfg(not(windows))]
-        assert_eq!(
-            parsed.bookmarks,
-            ["C:\\work\\termie", "c:/work/termie/", "/"]
-        );
-        assert!(!same_location("/", ""));
-        #[cfg(windows)]
-        assert_eq!(bookmark_name("C:\\work\\termie"), "termie");
     }
 
     #[test]

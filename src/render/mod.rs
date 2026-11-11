@@ -1983,12 +1983,12 @@ impl Renderer {
         };
     }
 
+    pub fn cursor_style(&self) -> CursorShape {
+        self.cursor_style
+    }
+
     pub fn cursor_style_name(&self) -> &'static str {
-        match self.cursor_style {
-            CursorShape::Bar => "beam",
-            CursorShape::Block => "block",
-            CursorShape::Underline => "underline",
-        }
+        crate::config::cursor_name(self.cursor_style)
     }
 
     pub fn cycle_theme(&mut self) {
