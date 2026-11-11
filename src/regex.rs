@@ -63,57 +63,23 @@ impl Parser {
         self.prog[at] = inst;
     }
 
-    /// alternation: concat ('|' concat)*
+    /// alternation: concat ('|' alt)?, right-nested so each split is placed
+    /// only once its first branch is known to be followed by '|'
     fn alt(&mut self) -> Option<()> {
-        let mut starts: Vec<usize> = Vec::new();
-        let mut jumps: Vec<usize> = Vec::new();
-        loop {
-            let split_at = if self.peek_is_branch_start() { Some(self.hole()) } else { None };
-            let branch_start = self.prog.len();
-            self.concat()?;
-            if let Some(at) = split_at {
-                starts.push(at);
-                // the split's first arm is the branch we just emitted
-                self.patch(at, Inst::Split(branch_start, usize::MAX));
-            }
-            if self.peek() == Some('|') {
-                self.bump();
-                jumps.push(self.hole());
-                // patch the pending split's second arm to the NEXT branch,
-                // which begins right here
-                if let Some(&at) = starts.last()
-                    && let Inst::Split(a, _) = self.prog[at]
-                {
-                    self.patch(at, Inst::Split(a, self.prog.len()));
-                }
-            } else {
-                break;
-            }
+        let start = self.prog.len();
+        self.concat()?;
+        if self.peek() != Some('|') {
+            return Some(());
         }
+        self.bump();
+        self.prog.insert(start, Inst::Jmp(usize::MAX));
+        Self::shift(&mut self.prog, start, 1);
+        let skip = self.hole();
+        self.patch(start, Inst::Split(start + 1, self.prog.len()));
+        self.alt()?;
         let end = self.prog.len();
-        for j in jumps {
-            self.patch(j, Inst::Jmp(end));
-        }
+        self.patch(skip, Inst::Jmp(end));
         Some(())
-    }
-
-    /// whether the upcoming branch needs a split (only when a '|' follows it —
-    /// resolved by scanning ahead at this nesting depth)
-    fn peek_is_branch_start(&self) -> bool {
-        let mut depth = 0usize;
-        let mut i = self.pos;
-        while let Some(&c) = self.pat.get(i) {
-            match c {
-                '\\' => i += 1,
-                '(' => depth += 1,
-                ')' if depth == 0 => return false,
-                ')' => depth -= 1,
-                '|' if depth == 0 => return true,
-                _ => {}
-            }
-            i += 1;
-        }
-        false
     }
 
     /// concatenation: repeat*
@@ -161,19 +127,23 @@ impl Parser {
         Some(())
     }
 
-    /// fix absolute targets after inserting `by` slots at `at`
+    /// fix absolute targets after inserting `by` slots at `at`. code that
+    /// moved (now past `at`) follows its targets; code before `at` that aimed
+    /// at `at` keeps aiming there, at the newly inserted instruction
     fn shift(prog: &mut [Inst], at: usize, by: usize) {
-        for inst in prog.iter_mut() {
+        for (i, inst) in prog.iter_mut().enumerate() {
+            let moved = i > at;
+            let fix = |t: &mut usize| {
+                if *t != usize::MAX && (*t > at || (moved && *t == at)) {
+                    *t += by;
+                }
+            };
             match inst {
                 Inst::Split(a, b) => {
-                    if *a >= at && *a != usize::MAX {
-                        *a += by;
-                    }
-                    if *b >= at && *b != usize::MAX {
-                        *b += by;
-                    }
+                    fix(a);
+                    fix(b);
                 }
-                Inst::Jmp(t) if *t >= at && *t != usize::MAX => *t += by,
+                Inst::Jmp(t) => fix(t),
                 _ => {}
             }
         }
@@ -424,6 +394,40 @@ mod tests {
         assert_eq!(all("cat|dog", "a dog, a cat"), vec![(2, 5), (9, 12)]);
         assert_eq!(all("(ab)+", "ababab x ab"), vec![(0, 6), (9, 11)]);
         assert_eq!(all("gr(a|e)y", "gray grey"), vec![(0, 4), (5, 9)]);
+    }
+
+    #[test]
+    fn metachars_inside_classes_stay_literal() {
+        assert_eq!(all("[|]", "a|b"), vec![(1, 2)]);
+        assert_eq!(all("[(]|x", "(x"), vec![(0, 1), (1, 2)]);
+        assert_eq!(all("a[)|]b", "a)b a|b"), vec![(0, 3), (4, 7)]);
+    }
+
+    #[test]
+    fn a_repeat_opening_a_branch_keeps_its_split() {
+        assert_eq!(all("a|b*", "bbb a"), vec![(0, 3), (4, 5)]);
+        assert_eq!(all("x(a|b*)y", "xy xby xay"), vec![(0, 2), (3, 6), (7, 10)]);
+        assert_eq!(all("a|b|c?d", "d cd b"), vec![(0, 1), (2, 4), (5, 6)]);
+        assert_eq!(all("(c|d)*e", "e cde"), vec![(0, 1), (2, 5)]);
+    }
+
+    #[test]
+    fn random_patterns_never_panic() {
+        let alphabet: Vec<char> = "ab|()[]^-*+?.\\$d".chars().collect();
+        let hay: Vec<char> = "ab|()[]-*.$d ba".chars().collect();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = 1 + (seed % 9) as usize;
+            let pat: String = (0..len)
+                .map(|i| alphabet[((seed >> (i * 5)) as usize) % alphabet.len()])
+                .collect();
+            if let Some(re) = Regex::compile(&pat) {
+                re.find_all(&hay, &mut 10_000, 64);
+            }
+        }
     }
 
     #[test]
