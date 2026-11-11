@@ -2358,6 +2358,8 @@ struct Drive {
     steps: Vec<(Duration, DriveStep)>,
     next: usize,
     started: Option<Instant>,
+    /// start the clock once tab one exists instead of at its first output
+    now: bool,
 }
 
 /// parse a drive script into steps with delays relative to the previous line
@@ -4334,11 +4336,8 @@ impl App {
                     if steps.is_empty() {
                         log::warn!("--drive: no runnable steps in {path}");
                     } else {
-                        #[cfg(debug_assertions)]
-                        let started = std::env::var_os("TERMIE_DRIVE_NOW").map(|_| Instant::now());
-                        #[cfg(not(debug_assertions))]
-                        let started = None;
-                        self.drive = Some(Drive { steps, next: 0, started });
+                        let now = cfg!(debug_assertions) && std::env::var_os("TERMIE_DRIVE_NOW").is_some();
+                        self.drive = Some(Drive { steps, next: 0, started: None, now });
                         self.pw.focused = true;
                     }
                 }
@@ -9311,6 +9310,15 @@ impl App {
     fn drive_tick(&mut self, event_loop: &ActiveEventLoop) {
         // collect due steps first: injecting them re-borrows self
         let mut due = Vec::new();
+        // tab one comes from the async warm pool, so a clock armed at window
+        // creation would race the spawn on a loaded machine
+        if let Some(d) = self.drive.as_mut()
+            && d.now
+            && d.started.is_none()
+            && !self.pw.tabs.is_empty()
+        {
+            d.started = Some(Instant::now());
+        }
         if let Some(d) = self.drive.as_mut()
             && let Some(started) = d.started
         {
