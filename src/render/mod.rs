@@ -193,6 +193,11 @@ pub(crate) fn preedit_cell_offset(text: &str, at: usize) -> usize {
         .sum()
 }
 
+/// first row of the nine-row palette window that keeps `selected` in view
+fn palette_first(selected: usize, total: usize) -> usize {
+    selected.saturating_sub(8).min(total.saturating_sub(9))
+}
+
 /// command-palette display state
 pub struct PaletteView {
     pub query: String,
@@ -5311,7 +5316,7 @@ impl Renderer {
         // row scrolls instead of highlighting off-screen (fonts lists easily
         // exceed nine); clicks map back through `first` to absolute indices
         let total = pv.items.len();
-        let first = pv.selected.saturating_sub(8).min(total.saturating_sub(9));
+        let first = palette_first(pv.selected, total);
         let items: Vec<(String, String)> = pv
             .items
             .iter()
@@ -5640,6 +5645,233 @@ impl Renderer {
         } else {
             None
         }
+    }
+
+    /// the open overlays as accessibility panels, bottom to top, placed where
+    /// they were last drawn
+    pub fn a11y_panels(&self) -> Vec<crate::a11y::Panel> {
+        use crate::a11y::{rect, Item, Layer, Panel, INPUT, LIST, PANEL, STATUS, CLOSE};
+        use accesskit::Role;
+        let button = |id: u32, label: &str, bounds: Option<Rect>, toggled: Option<bool>| Item {
+            id,
+            role: Role::Button,
+            label: label.to_string(),
+            bounds: bounds.map(rect),
+            toggled,
+            click: true,
+            ..Default::default()
+        };
+        let mut panels = Vec::new();
+        if let Some(fv) = self.find_view.as_ref() {
+            let status = if fv.bad {
+                "bad pattern".to_string()
+            } else if fv.query.is_empty() {
+                String::new()
+            } else if fv.count == 0 {
+                if fv.capped { "search incomplete" } else { "no matches" }.to_string()
+            } else {
+                format!("match {} of {}{}", fv.current + 1, fv.count, if fv.capped { " or more" } else { "" })
+            };
+            let btns = self.find_btns;
+            panels.push(Panel {
+                layer: Layer::Find,
+                focus: Some(INPUT),
+                root: Item {
+                    id: PANEL,
+                    role: Role::Group,
+                    label: "Find".to_string(),
+                    children: vec![
+                        Item { id: INPUT, role: Role::SearchInput, label: "Find".to_string(), value: Some(fv.query.clone()), ..Default::default() },
+                        Item { id: STATUS, role: Role::Status, label: status, live: true, ..Default::default() },
+                        button(0, "Regular expression", btns.map(|b| b.0), Some(fv.regex_on)),
+                        button(1, "Previous match", btns.map(|b| b.1), None),
+                        button(2, "Next match", btns.map(|b| b.2), None),
+                        button(3, "Close find", btns.map(|b| b.3), None),
+                    ],
+                    ..Default::default()
+                },
+            });
+        }
+        if let Some(mv) = self.market_view.as_ref() {
+            let hit = |h: MarketHit| self.market_hits.iter().find(|(_, x)| *x == h).map(|(r, _)| *r);
+            let total = mv.rows.len();
+            let options = mv
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let id = i as u32 * 2;
+                    let mut description = r.description.clone();
+                    if !r.permissions.is_empty() {
+                        description = format!("{description}. permissions: {}", r.permissions.join(", "));
+                    }
+                    let chip = if r.installed { "Enabled" } else { "Install" };
+                    Item {
+                        id,
+                        role: Role::ListBoxOption,
+                        label: format!("{} {}", r.name, r.version),
+                        description: Some(description),
+                        bounds: hit(MarketHit::Card(i)).map(rect),
+                        selected: Some(i == mv.selected),
+                        position: Some((i + 1, total)),
+                        click: true,
+                        children: vec![button(id + 1, chip, hit(MarketHit::Chip(i)), r.installed.then_some(r.enabled))],
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let status = if mv.loading {
+                "Fetching the catalog\u{2026}".to_string()
+            } else if mv.fetch_failed {
+                "Couldn't reach the plugin catalog.".to_string()
+            } else if total == 0 {
+                "No plugins in the catalog yet.".to_string()
+            } else {
+                mv.status.clone()
+            };
+            panels.push(Panel {
+                layer: Layer::Market,
+                focus: Some(if total == 0 { PANEL } else { mv.selected.min(total - 1) as u32 * 2 }),
+                root: Item {
+                    id: PANEL,
+                    role: Role::Dialog,
+                    label: "Plugins".to_string(),
+                    modal: true,
+                    children: vec![
+                        button(CLOSE, "Close plugins", hit(MarketHit::Close), None),
+                        Item { id: LIST, role: Role::ListBox, label: "Plugins".to_string(), children: options, ..Default::default() },
+                        Item { id: STATUS, role: Role::Status, label: status, live: true, ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+            });
+        }
+        if let Some(pv) = self.palette_view.as_ref() {
+            let total = pv.items.len();
+            let first = palette_first(pv.selected, total);
+            let geom = self.palette_geom;
+            let gap = tokens::px(tokens::SPACE_XS, self.scale);
+            let options = pv
+                .items
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(9)
+                .map(|(i, label)| Item {
+                    id: i as u32,
+                    role: Role::ListBoxOption,
+                    label: label.clone(),
+                    shortcut: pv.hints.get(i).cloned(),
+                    bounds: geom.map(|((bx, by, bw, _), row_h, ..)| rect((bx, by + row_h * (i - first + 1) as f32 + gap, bw, row_h))),
+                    selected: Some(i == pv.selected),
+                    position: Some((i + 1, total)),
+                    click: true,
+                    ..Default::default()
+                })
+                .collect();
+            let label = match pv.scope {
+                "tabs" => "Switch to tab",
+                "fonts" => "Choose font",
+                _ => "Command palette",
+            };
+            panels.push(Panel {
+                layer: Layer::Palette,
+                focus: Some(INPUT),
+                root: Item {
+                    id: PANEL,
+                    role: Role::Dialog,
+                    label: label.to_string(),
+                    modal: true,
+                    bounds: geom.map(|(r, ..)| rect(r)),
+                    children: vec![
+                        Item {
+                            id: INPUT,
+                            role: Role::EditableComboBox,
+                            label: label.to_string(),
+                            value: Some(pv.query.clone()),
+                            bounds: geom.map(|((bx, by, bw, _), row_h, ..)| rect((bx, by, bw, row_h))),
+                            active: (total > 0).then_some(pv.selected as u32),
+                            ..Default::default()
+                        },
+                        Item { id: LIST, role: Role::ListBox, label: label.to_string(), children: options, ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+            });
+        }
+        if let Some(mv) = self.pane_menu_view.as_ref() {
+            let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mv.x, mv.y, &mv.items, !mv.accents.is_empty());
+            let radio = !mv.accents.is_empty();
+            let total = mv.items.len();
+            let items = mv
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let (label, checked) = label.strip_suffix(" \u{f00c}").map_or((label.as_str(), false), |l| (l, true));
+                    Item {
+                        id: i as u32,
+                        role: if radio { Role::MenuItemRadio } else { Role::MenuItem },
+                        label: label.to_string(),
+                        bounds: Some(rect((bx, by + pad + row_h * i as f32, mw, row_h))),
+                        toggled: radio.then_some(checked),
+                        position: Some((i + 1, total)),
+                        click: true,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            panels.push(Panel {
+                layer: Layer::Menu,
+                focus: Some(mv.hovered.map_or(PANEL, |i| i as u32)),
+                root: Item {
+                    id: PANEL,
+                    role: Role::Menu,
+                    label: "Menu".to_string(),
+                    bounds: Some(rect((bx, by, mw, row_h * total as f32 + pad * 2.0))),
+                    children: items,
+                    ..Default::default()
+                },
+            });
+        }
+        // a confirm answers before a rename, matching the app's key routing
+        let dialog = if let Some(cv) = self.confirm_view.as_ref() {
+            Some((cv.prompt.as_str(), None, cv.buttons))
+        } else {
+            self.rename_view.as_ref().map(|rv| ("Rename tab", Some(rv.buf.clone()), ("rename", "cancel")))
+        };
+        if let Some((title, field, (yes, no))) = dialog {
+            let btns = self.dialog_btns;
+            let mut children = Vec::new();
+            let focus = if let Some(buf) = field {
+                children.push(Item { id: INPUT, role: Role::TextInput, label: "Tab name".to_string(), value: Some(buf), ..Default::default() });
+                INPUT
+            } else {
+                1
+            };
+            children.push(button(0, no, btns.map(|b| b.0), None));
+            children.push(Item { role: Role::DefaultButton, ..button(1, yes, btns.map(|b| b.1), None) });
+            panels.push(Panel {
+                layer: Layer::Dialog,
+                focus: Some(focus),
+                root: Item {
+                    id: PANEL,
+                    role: if self.confirm_view.is_some() { Role::AlertDialog } else { Role::Dialog },
+                    label: title.to_string(),
+                    modal: true,
+                    children,
+                    ..Default::default()
+                },
+            });
+        }
+        if let Some(notice) = self.notice.as_ref() {
+            panels.push(Panel {
+                layer: Layer::Notice,
+                focus: None,
+                root: Item { id: PANEL, role: Role::Status, label: notice.clone(), live: true, ..Default::default() },
+            });
+        }
+        panels
     }
 
     /// plugins marketplace overlay: a centered panel listing installed + catalog
@@ -7371,6 +7603,108 @@ mod hit_tests {
         assert_eq!(r.find_btn_at(2.0, 2.0), None);
         let _ = std::fs::remove_file(tmp_png("palette"));
         let _ = std::fs::remove_file(tmp_png("find"));
+    }
+
+    /// each accessible item's bounds must land on the control the mouse hits
+    /// there, so a screen reader's click and a pointer click agree
+    #[test]
+    fn a11y_panel_bounds_hit_their_own_controls() {
+        use crate::a11y::{Item, Layer, Panel, INPUT, PANEL};
+        fn centre(item: &Item) -> (f32, f32) {
+            let b = item.bounds.expect("drawn item has bounds");
+            (((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+        }
+        fn walk<'a>(item: &'a Item, out: &mut Vec<&'a Item>) {
+            out.push(item);
+            for child in &item.children {
+                walk(child, out);
+            }
+        }
+        fn items(panel: &Panel) -> Vec<&Item> {
+            let mut out = Vec::new();
+            walk(&panel.root, &mut out);
+            out.into_iter().filter(|item| item.click).collect()
+        }
+        let _gpu = gpu_serial();
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_tabs(vec!["a".into()], 0);
+        r.set_palette(Some(PaletteView {
+            query: String::new(),
+            items: (0..20).map(|i| format!("font {i}")).collect(),
+            hints: Vec::new(),
+            selected: 15,
+            scope: "fonts",
+        }));
+        r.set_find(Some(FindView { query: "err".into(), count: 4, current: 1, capped: false, matches: Vec::new(), regex_on: true, bad: false }));
+        r.settle_overlay();
+        let _ = r.render_png(&[], true, false, false, &tmp_png("a11y"));
+        let panels = r.a11y_panels();
+        assert_eq!(panels.iter().map(|p| p.layer).collect::<Vec<_>>(), [Layer::Find, Layer::Palette]);
+        let palette = &panels[1];
+        assert_eq!(palette.focus, Some(INPUT));
+        let rows = items(palette);
+        assert_eq!(rows.len(), 9);
+        for row in rows {
+            let (x, y) = centre(row);
+            assert_eq!(r.palette_row_at(x, y), Some(row.id as usize), "{}", row.label);
+        }
+        for button in items(&panels[0]) {
+            let (x, y) = centre(button);
+            assert_eq!(r.find_btn_at(x, y), Some(button.id as u8), "{}", button.label);
+        }
+
+        r.set_palette(None);
+        r.set_find(None);
+        let menu: Vec<String> = TAB_COLOR_ITEMS.iter().map(|s| s.to_string()).chain(["blue \u{f00c}".to_string()]).collect();
+        r.set_pane_menu(Some(PaneMenuView { x: 60.0, y: 60.0, hovered: Some(2), accents: (0..menu.len()).map(|i| (i > 0).then_some(i as u8)).collect(), items: menu }));
+        r.set_confirm(Some(ConfirmView { prompt: "Close 2 tabs?".into(), buttons: ("close", "cancel") }));
+        let _ = r.render_png(&[], true, false, false, &tmp_png("a11y"));
+        let panels = r.a11y_panels();
+        assert_eq!(panels.iter().map(|p| p.layer).collect::<Vec<_>>(), [Layer::Menu, Layer::Dialog]);
+        assert_eq!(panels[0].focus, Some(2));
+        let entries = items(&panels[0]);
+        for entry in &entries {
+            let (x, y) = centre(entry);
+            assert_eq!(r.pane_menu_item_at(x, y), Some(entry.id as usize), "{}", entry.label);
+        }
+        let last = entries.last().expect("menu rows");
+        assert_eq!((last.label.as_str(), last.toggled), ("blue", Some(true)));
+        let dialog = &panels[1];
+        assert_eq!((dialog.root.id, dialog.focus), (PANEL, Some(1)));
+        for button in items(dialog) {
+            let (x, y) = centre(button);
+            assert_eq!(r.dialog_btn_at(x, y), Some(button.id == 1), "{}", button.label);
+        }
+
+        r.set_pane_menu(None);
+        r.set_confirm(None);
+        r.set_market(Some(MarketView {
+            rows: vec![
+                MarketRowView { name: "tamagotchi".into(), version: "1.2".into(), description: "a pet".into(), permissions: vec![], installed: true, enabled: false },
+                MarketRowView { name: "relay".into(), version: "0.4".into(), description: "bus".into(), permissions: vec!["write_pty".into()], installed: false, enabled: false },
+            ],
+            selected: 1,
+            status: String::new(),
+            loading: false,
+            fetch_failed: false,
+        }));
+        let _ = r.render_png(&[], true, false, false, &tmp_png("a11y"));
+        let panels = r.a11y_panels();
+        assert_eq!(panels[0].focus, Some(2));
+        let controls = items(&panels[0]);
+        assert_eq!(controls.len(), 5);
+        for control in controls {
+            let (x, y) = centre(control);
+            let want = match control.id {
+                crate::a11y::CLOSE => MarketHit::Close,
+                id if id % 2 == 0 => MarketHit::Card(id as usize / 2),
+                id => MarketHit::Chip(id as usize / 2),
+            };
+            assert_eq!(r.market_hit_at(x, y), Some(want), "{}", control.label);
+        }
+        let _ = std::fs::remove_file(tmp_png("a11y"));
     }
 
     #[test]

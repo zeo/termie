@@ -5076,6 +5076,60 @@ impl App {
 
     /// settle the open confirm or rename dialog: run or commit it on accept,
     /// drop it otherwise
+    /// run palette row `i` as a click does: the font picker commits that font,
+    /// the command palette runs the entry
+    fn pick_palette_row(&mut self, i: usize, event_loop: &ActiveEventLoop) {
+        if let Some(p) = self.font_pick.as_mut() {
+            p.selected = i;
+            self.close_font_picker(true);
+        } else if let Some(p) = self.palette.take() {
+            self.run_palette_choice(p.mode, &p.query, i, event_loop);
+            self.redraw();
+        }
+    }
+
+    /// close the open context menu, running `item` first when one was picked
+    fn pick_pane_menu(&mut self, item: Option<usize>, event_loop: &ActiveEventLoop) {
+        let Some(menu) = self.pw.pane_menu.take() else {
+            return;
+        };
+        if let Some(i) = item {
+            self.pane_menu_action(menu.target, i, (menu.x, menu.y), event_loop);
+        }
+        self.redraw();
+    }
+
+    /// find-bar button: 0 regex toggle, 1 previous, 2 next, anything else closes
+    fn find_button(&mut self, btn: u8) {
+        match btn {
+            0 => {
+                self.find_regex = !self.find_regex;
+                self.find_recompute();
+            }
+            1 => self.find_step(false),
+            2 => self.find_step(true),
+            _ => self.close_find(),
+        }
+    }
+
+    /// a screen reader's click on an overlay item, routed to the path the
+    /// mouse takes for the same control
+    fn run_overlay_item(&mut self, layer: a11y::Layer, id: u32, event_loop: &ActiveEventLoop) {
+        match layer {
+            a11y::Layer::Dialog if id <= 1 => self.answer_dialog(id == 1, event_loop),
+            a11y::Layer::Palette if id < a11y::CLOSE => self.pick_palette_row(id as usize, event_loop),
+            a11y::Layer::Menu if id < a11y::CLOSE => self.pick_pane_menu(Some(id as usize), event_loop),
+            a11y::Layer::Find if id <= 3 && self.find_is_open_here() => self.find_button(id as u8),
+            a11y::Layer::Market if self.market.is_some() => self.market_hit(match id {
+                a11y::CLOSE => render::MarketHit::Close,
+                id if id % 2 == 0 => render::MarketHit::Card(id as usize / 2),
+                id => render::MarketHit::Chip(id as usize / 2),
+            }),
+            _ => return,
+        }
+        self.redraw();
+    }
+
     fn answer_dialog(&mut self, accept: bool, event_loop: &ActiveEventLoop) {
         if let Some(c) = self.pw.confirm.take() {
             if accept {
@@ -6391,11 +6445,21 @@ impl App {
             .map(|p| a11y::flatten(&p.term))
             .unwrap_or_default();
         let Some(renderer) = self.pw.renderer.as_ref() else {
-            return a11y::build_tree(&text, "termie", window_bounds, None, None, Vec::new(), Vec::new());
+            return a11y::build_tree(&text, "termie", window_bounds, None, None, Vec::new(), Vec::new(), Vec::new());
         };
-        let rect = |(x, y, w, h): (f32, f32, f32, f32)| {
-            accesskit::Rect::new(x as f64, y as f64, (x + w) as f64, (y + h) as f64)
-        };
+        let rect = a11y::rect;
+        let mut panels = renderer.a11y_panels();
+        if let Some(menu) = self.pw.pane_menu.as_ref()
+            && let Some(panel) = panels.iter_mut().find(|p| p.layer == a11y::Layer::Menu)
+        {
+            panel.root.label = match menu.target {
+                MenuTarget::Pane => "Pane menu",
+                MenuTarget::Tab(_) => "Tab menu",
+                MenuTarget::TabColor(_) => "Tab color",
+                MenuTarget::NewTab => "New tab profiles",
+            }
+            .to_string();
+        }
         let chrome = renderer.a11y_chrome_layout();
         let tabs = chrome
             .tabs
@@ -6451,6 +6515,7 @@ impl App {
             Some(rect(chrome.title_bar)),
             tabs,
             controls,
+            panels,
         )
     }
 
@@ -6477,6 +6542,11 @@ impl App {
             a11y::Target::Minimize => Hot::Minimize,
             a11y::Target::Maximize => Hot::Maximize,
             a11y::Target::Close => Hot::Close,
+            a11y::Target::Item(layer, id) => {
+                self.run_overlay_item(layer, id, event_loop);
+                self.update_a11y();
+                return;
+            }
         };
         self.button_action(event_loop, hot);
         self.update_a11y();
@@ -7223,9 +7293,12 @@ impl App {
     /// route a left-click in the open marketplace to a row, its action chip, or
     /// the close control — mouse parity with the keyboard navigation
     fn market_click(&mut self, cx: f32, cy: f32) {
-        let Some(hit) = self.pw.renderer.as_ref().and_then(|r| r.market_hit_at(cx, cy)) else {
-            return;
-        };
+        if let Some(hit) = self.pw.renderer.as_ref().and_then(|r| r.market_hit_at(cx, cy)) {
+            self.market_hit(hit);
+        }
+    }
+
+    fn market_hit(&mut self, hit: render::MarketHit) {
         match hit {
             render::MarketHit::Close => {
                 self.market = None;
@@ -10574,10 +10647,7 @@ impl App {
                         let inside =
                             self.pw.renderer.as_ref().is_some_and(|r| r.palette_contains(cx, cy));
                         if let Some(i) = row {
-                            if let Some(p) = self.font_pick.as_mut() {
-                                p.selected = i;
-                            }
-                            self.close_font_picker(true);
+                            self.pick_palette_row(i, event_loop);
                         } else if !inside {
                             self.close_font_picker(false);
                         }
@@ -10592,14 +10662,7 @@ impl App {
                         let inside =
                             self.pw.renderer.as_ref().is_some_and(|r| r.palette_contains(cx, cy));
                         if let Some(i) = row {
-                            let (mode, q) = self
-                                .palette
-                                .as_ref()
-                                .map(|p| (p.mode, p.query.clone()))
-                                .unwrap_or((PaletteMode::Commands, String::new()));
-                            self.palette = None;
-                            self.run_palette_choice(mode, &q, i, event_loop);
-                            self.redraw();
+                            self.pick_palette_row(i, event_loop);
                         } else if !inside {
                             self.palette = None;
                             self.redraw();
@@ -10613,15 +10676,7 @@ impl App {
                     && state == ElementState::Pressed
                     && let Some(btn) = self.pw.renderer.as_ref().and_then(|r| r.find_btn_at(cx, cy))
                 {
-                    match btn {
-                        0 => {
-                            self.find_regex = !self.find_regex;
-                            self.find_recompute();
-                        }
-                        1 => self.find_step(false),
-                        2 => self.find_step(true),
-                        _ => self.close_find(),
-                    }
+                    self.find_button(btn);
                     return;
                 }
                 // the status-bar UPDATE chip opens the install confirm
@@ -10657,17 +10712,9 @@ impl App {
                 let hit = self.pw.renderer.as_ref().map(|r| r.hit_test(cx, cy));
                 // a left-press while the pane menu is open runs the clicked item
                 // (or dismisses it when the click lands elsewhere)
-                if let Some(menu) = self.pw.pane_menu.as_ref()
-                    && state == ElementState::Pressed
-                {
-                    let target = menu.target;
-                    let at = (menu.x, menu.y);
+                if self.pw.pane_menu.is_some() && state == ElementState::Pressed {
                     let item = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(cx, cy));
-                    self.pw.pane_menu = None;
-                    if let Some(i) = item {
-                        self.pane_menu_action(target, i, at, event_loop);
-                    }
-                    self.redraw();
+                    self.pick_pane_menu(item, event_loop);
                     return;
                 }
                 // always finalize a forwarded press with a release report, even if
