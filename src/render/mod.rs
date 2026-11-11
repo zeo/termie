@@ -948,9 +948,12 @@ pub struct Renderer {
     tab_colors: Vec<Option<u8>>,
     active_tab: usize,
     status: StatusView,
-    /// transient program-notification text shown in the status bar's right
-    /// cluster in place of READY (the app expires it after a few seconds)
+    /// program-notification text shown in the status bar's right cluster in
+    /// place of READY; the app expires it after a few seconds unless it is an
+    /// error, which stays until dismissed
     notice: Option<String>,
+    notice_error: bool,
+    notice_hit: Option<(f32, f32, f32, f32)>,
     link_preview: Option<LinkPreview>,
     /// a newer release's version: draws a clickable UPDATE chip on the status
     /// bar until installed. its hit rect is rebuilt each paint
@@ -1675,6 +1678,8 @@ impl Renderer {
             link_preview: None,
             update_chip: None,
             update_hit: None,
+            notice_error: false,
+            notice_hit: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
             status_cmd: (u64::MAX, String::new()),
             plugins_installed: Vec::new(),
@@ -2300,9 +2305,29 @@ impl Renderer {
         self.tab_colors = colors;
     }
 
-    /// transient status-bar notification text (None clears the readout)
+    /// transient status-bar notification text (None clears the readout); a
+    /// standing error keeps the bar until it is dismissed
     pub fn set_notice(&mut self, notice: Option<String>) {
-        self.notice = notice;
+        if !self.notice_error || notice.is_none() {
+            self.notice = notice;
+            self.notice_error = false;
+        }
+    }
+
+    pub fn set_error(&mut self, text: String) {
+        self.notice = Some(text);
+        self.notice_error = true;
+    }
+
+    /// the notice timer ran out: drop an informational notice, keep an error
+    pub fn expire_notice(&mut self) {
+        if !self.notice_error {
+            self.notice = None;
+        }
+    }
+
+    pub fn notice_at(&self, x: f32, y: f32) -> bool {
+        self.notice_hit.is_some_and(|r| in_rect(x, y, r))
     }
 
     pub fn set_link_preview(&mut self, target: Option<&str>) {
@@ -4629,13 +4654,26 @@ impl Renderer {
             rx = chip.0 - gap;
         }
         let room = (rx - left_end - gap).max(0.0);
+        self.notice_hit = None;
         if let Some(n) = self.notice.clone() {
             let maxc = ((room - sicon - ig) / sw).floor().max(0.0) as usize;
             let shown = truncate_tail(&n, maxc);
             let nw = self.text_w(FontId::Small, &shown, st_track);
             let nx = (rx - nw).max(left_end + gap + sicon + ig);
-            Self::draw_icon(&mut self.atlas, &mut out, Icon::Bell, (nx - sicon - ig, sbar.1, sicon, sbar.3), sicon, stroke, PAPER, 1.0);
+            let ix = nx - sicon - ig;
+            // an error carries a cross as well as the danger colour, so it
+            // reads without colour vision
+            let (icon, tint) = if self.notice_error {
+                let danger = Rgb::from_triple(crate::instrument::DANGER);
+                (Icon::Close, crate::color::apply_min_contrast(danger, self.palette.ink1, tokens::ICON_CONTRAST))
+            } else {
+                (Icon::Bell, PAPER)
+            };
+            Self::draw_icon(&mut self.atlas, &mut out, icon, (ix, sbar.1, sicon, sbar.3), sicon, stroke, tint, 1.0);
             let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, nx, st_top, &shown, PAPER, 1.0, st_track);
+            if self.notice_error {
+                self.notice_hit = Some((ix, sb_y, rx - ix, self.status_bar_h));
+            }
         } else if self.broadcast {
             let bw = self.text_w(FontId::Small, "BROADCAST", key_track);
             let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, rx - bw, st_top, "BROADCAST", PAPER, 1.0, key_track);
@@ -5681,7 +5719,7 @@ impl Renderer {
                     label: "Find".to_string(),
                     children: vec![
                         Item { id: INPUT, role: Role::SearchInput, label: "Find".to_string(), value: Some(fv.query.clone()), ..Default::default() },
-                        Item { id: STATUS, role: Role::Status, label: status, live: true, ..Default::default() },
+                        Item { id: STATUS, role: Role::Status, label: status, live: Some(accesskit::Live::Polite), ..Default::default() },
                         button(0, "Regular expression", btns.map(|b| b.0), Some(fv.regex_on)),
                         button(1, "Previous match", btns.map(|b| b.1), None),
                         button(2, "Next match", btns.map(|b| b.2), None),
@@ -5739,7 +5777,7 @@ impl Renderer {
                     children: vec![
                         button(CLOSE, "Close plugins", hit(MarketHit::Close), None),
                         Item { id: LIST, role: Role::ListBox, label: "Plugins".to_string(), children: options, ..Default::default() },
-                        Item { id: STATUS, role: Role::Status, label: status, live: true, ..Default::default() },
+                        Item { id: STATUS, role: Role::Status, label: status, live: Some(accesskit::Live::Polite), ..Default::default() },
                     ],
                     ..Default::default()
                 },
@@ -5864,11 +5902,21 @@ impl Renderer {
             });
         }
         if let Some(notice) = self.notice.as_ref() {
-            panels.push(Panel {
-                layer: Layer::Notice,
-                focus: None,
-                root: Item { id: PANEL, role: Role::Status, label: notice.clone(), live: true, ..Default::default() },
-            });
+            let root = if self.notice_error {
+                Item {
+                    id: PANEL,
+                    role: Role::Alert,
+                    label: notice.clone(),
+                    description: Some("activate to dismiss".to_string()),
+                    bounds: self.notice_hit.map(rect),
+                    click: true,
+                    live: Some(accesskit::Live::Assertive),
+                    ..Default::default()
+                }
+            } else {
+                Item { id: PANEL, role: Role::Status, label: notice.clone(), live: Some(accesskit::Live::Polite), ..Default::default() }
+            };
+            panels.push(Panel { layer: Layer::Notice, focus: None, root });
         }
         panels
     }

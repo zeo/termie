@@ -76,6 +76,11 @@ pub fn capture(
             r.set_tab_status(vec![0, 3, 0]);
             r.set_notice(Some("deploy: waiting for approval in web-ui".into()));
         }
+        "error" => {
+            // a failure that stays on the status bar until dismissed
+            r.set_error("couldn't start the requested shell".into());
+            r.set_notice(Some("copied".into()));
+        }
         "link" => {
             r.set_link_preview(Some(
                 "https://example.com/releases/termie?channel=stable#checksums",
@@ -307,9 +312,9 @@ mod tests {
     use crate::color::ThemeId;
 
     /// every chrome surface worth guarding, each rendered in every theme
-    const SCENES: [&str; 15] = [
+    const SCENES: [&str; 16] = [
         "split", "attention", "hover", "palette", "menu", "find", "confirm", "rename", "market",
-        "settings", "settings2", "panemode", "notice", "welcome-hints", "readme",
+        "settings", "settings2", "panemode", "notice", "error", "welcome-hints", "readme",
     ];
     const W: u32 = 1100;
     const H: u32 = 680;

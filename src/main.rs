@@ -617,6 +617,8 @@ enum PaletteAction {
     ScrollTop,
     ScrollBottom,
     ClearScrollback,
+    /// clear the status-bar notice, including an error that stays until dismissed
+    DismissNotice,
     /// write the focused pane's history + screen as plain text to Downloads
     ExportScrollback,
     /// check for a newer release / confirm installing a pending one
@@ -685,6 +687,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("scroll to top", PaletteAction::ScrollTop),
     ("scroll to bottom", PaletteAction::ScrollBottom),
     ("clear scrollback", PaletteAction::ClearScrollback),
+    ("dismiss notice", PaletteAction::DismissNotice),
     ("export scrollback", PaletteAction::ExportScrollback),
     ("update termie", PaletteAction::InstallUpdate),
     ("default terminal", PaletteAction::DefaultTerminal),
@@ -4505,7 +4508,7 @@ impl App {
         if self.kb_ignored > 0 {
             let noun = if self.kb_ignored == 1 { "line" } else { "lines" };
             let msg = format!("keybindings.conf: {} {noun} ignored", self.kb_ignored);
-            self.show_notice(&msg);
+            self.show_error(&msg);
         }
         // refresh the launcher's shell actions and keep the default-terminal
         // registration pointed at this exe, both off the startup render path
@@ -5157,6 +5160,7 @@ impl App {
                 id if id % 2 == 0 => render::MarketHit::Card(id as usize / 2),
                 id => render::MarketHit::Chip(id as usize / 2),
             }),
+            a11y::Layer::Notice => self.dismiss_notice(),
             _ => return,
         }
         self.redraw();
@@ -5412,7 +5416,7 @@ impl App {
             }
         }
         if self.font_families.is_empty() {
-            self.show_notice("no monospace fonts found");
+            self.show_error("no monospace fonts found");
             return;
         }
         self.font_pick_orig =
@@ -5943,7 +5947,7 @@ impl App {
         let text = match win::clipboard_get() {
             win::ClipboardRead::Text(text) => text,
             win::ClipboardRead::TooLarge => {
-                self.show_notice("clipboard paste exceeds 4 MiB");
+                self.show_error("clipboard paste exceeds 4 MiB");
                 return;
             }
         };
@@ -6003,7 +6007,7 @@ impl App {
             true
         };
         if !queued {
-            self.show_notice("pane input queue is full");
+            self.show_error("pane input queue is full");
         }
     }
 
@@ -6025,7 +6029,7 @@ impl App {
                     } else if win::open_url(&update::release_page_url(&u.version)) {
                         self.show_notice(&format!("release page for {} opened", u.version));
                     } else {
-                        self.show_notice("couldn't open the release page");
+                        self.show_error("couldn't open the release page");
                     }
                 }
             }
@@ -6755,7 +6759,7 @@ impl App {
             self.persisted.bookmarks.remove(i);
             self.show_notice(&format!("removed bookmark: {name}"));
         } else if self.persisted.bookmarks.len() >= MAX_BOOKMARKS {
-            self.show_notice("bookmark limit reached");
+            self.show_error("bookmark limit reached");
             return;
         } else {
             self.persisted.bookmarks.push(path);
@@ -6997,6 +7001,7 @@ impl App {
                 }
                 self.redraw();
             }
+            PaletteAction::DismissNotice => self.dismiss_notice(),
             PaletteAction::ClearScrollback => {
                 if let Some(g) = self.focused_grid_mut() {
                     g.clear_scrollback();
@@ -7008,7 +7013,7 @@ impl App {
                     let text = g.full_text();
                     match export_scrollback(&text) {
                         Ok(path) => self.show_notice(&format!("exported to {}", path.display())),
-                        Err(e) => self.show_notice(&format!("export failed: {e}")),
+                        Err(e) => self.show_error(&format!("export failed: {e}")),
                     }
                 }
                 self.redraw();
@@ -7081,10 +7086,10 @@ impl App {
                     let tab = tab_from_pane(pane);
                     if let Some(tab) = self.open_tab_window(event_loop, tab, point) {
                         self.insert_tab_here(tab, self.pw.tabs.len());
-                        self.show_notice("couldn't open a new window");
+                        self.show_error("couldn't open a new window");
                     }
                 } else {
-                    self.show_notice("couldn't open a new window");
+                    self.show_error("couldn't open a new window");
                 }
                 self.redraw();
             }
@@ -7127,7 +7132,7 @@ impl App {
                             .is_ok()
                     });
                     if !launched {
-                        self.show_notice("pkexec or sudo is unavailable");
+                        self.show_error("pkexec or sudo is unavailable");
                     }
                 }
                 self.redraw();
@@ -8108,7 +8113,7 @@ impl App {
             Ok(pw) => pw,
             Err(error) => {
                 log::error!("forwarded launch window failed: {error:#}");
-                self.show_notice("couldn't open the requested window");
+                self.show_error("couldn't open the requested window");
                 return;
             }
         };
@@ -8152,7 +8157,7 @@ impl App {
         });
         if self.satellites[slot].tabs.is_empty() {
             self.satellites.remove(slot);
-            self.show_notice("couldn't start the requested shell");
+            self.show_error("couldn't start the requested shell");
             return;
         }
         if let Some(window) = self.satellites[slot].window.as_ref() {
@@ -8214,7 +8219,7 @@ impl App {
         if let Some((target, index)) = target {
             if let Some(tab) = self.insert_tab_into_window(target, tab, index) {
                 let _ = self.insert_tab_into_window(drag.source, tab, drag.index);
-                self.show_notice("the destination window closed during the drag");
+                self.show_error("the destination window closed during the drag");
             } else {
                 self.focus_window(target);
             }
@@ -8224,7 +8229,7 @@ impl App {
             drag.screen.map(|point| drag_window_origin(point, drag.start)),
         ) {
             let _ = self.insert_tab_into_window(drag.source, tab, drag.index);
-            self.show_notice("couldn't open a new window");
+            self.show_error("couldn't open a new window");
         }
         self.cleanup_empty_windows();
     }
@@ -8426,7 +8431,7 @@ impl App {
                 drag.screen.map(|point| drag_window_origin(point, drag.start)),
             ) {
                 let _ = self.insert_tab_into_window(drag.source_window, tab, drag.source_tab);
-                self.show_notice("couldn't open a new window");
+                self.show_error("couldn't open a new window");
             }
         }
         self.cleanup_empty_windows();
@@ -8563,7 +8568,7 @@ impl App {
             let dir = if path.is_dir() { Some(path) } else { path.parent() };
             if let Some(d) = dir {
                 let Some(cwd) = d.to_str() else {
-                    self.show_notice("path is not valid unicode");
+                    self.show_error("path is not valid unicode");
                     return;
                 };
                 self.new_tab_cwd(Some(cwd.to_owned()), None);
@@ -8595,7 +8600,7 @@ impl App {
         let mut text = match pty::quote_path_for_shell(shell, path) {
             Ok(text) => text,
             Err(message) => {
-                self.show_notice(message);
+                self.show_error(message);
                 return;
             }
         };
@@ -8608,7 +8613,7 @@ impl App {
             .and_then(|root| find_pane_mut(root, id))
             .is_some_and(|pane| pane.write_user_input(&text));
         if !queued {
-            self.show_notice("terminal input queue is full");
+            self.show_error("terminal input queue is full");
         }
     }
 
@@ -10752,6 +10757,10 @@ impl App {
                     self.run_action(PaletteAction::InstallUpdate, event_loop);
                     return;
                 }
+                if state == ElementState::Pressed && self.pw.renderer.as_ref().is_some_and(|r| r.notice_at(cx, cy)) {
+                    self.dismiss_notice();
+                    return;
+                }
                 // scroll-thumb drag: a press on the thumb (or its track) grabs it
                 // and takes priority over selection / TUI mouse forwarding; the
                 // matching release just ends the drag
@@ -10884,7 +10893,7 @@ impl App {
                             return;
                         }
                         if !win::open_url(&url) {
-                            self.show_notice("couldn't open browser");
+                            self.show_error("couldn't open browser");
                         }
                         return;
                     }
@@ -11136,6 +11145,24 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// put a failure on the status bar until the user dismisses it (a click,
+    /// the "dismiss notice" action, or a screen reader's activate); lands on
+    /// whichever window's renderer is swapped in
+    fn show_error(&mut self, text: &str) {
+        log::warn!("{text}");
+        if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_error(text.to_string());
+        }
+        self.redraw();
+    }
+
+    fn dismiss_notice(&mut self) {
+        if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_notice(None);
+        }
+        self.redraw();
     }
 
     /// put a program notification's text on the status bar for a few seconds;
@@ -12020,6 +12047,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.market_installing = None;
+                let failed = result.is_err();
                 let status = match result {
                     Ok(()) => {
                         self.set_plugin_enabled(&id, true);
@@ -12031,6 +12059,8 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if let Some(m) = self.market.as_mut() {
                     m.status = status;
+                } else if failed {
+                    self.show_error(&status);
                 } else {
                     self.show_notice(&status);
                 }
@@ -12053,7 +12083,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if ignored > 0 {
                     let noun = if ignored == 1 { "line" } else { "lines" };
                     let msg = format!("keybindings.conf: {ignored} {noun} ignored");
-                    self.show_notice(&msg);
+                    self.show_error(&msg);
                 }
                 let overrides = load_color_overrides();
                 if let Some(r) = self.pw.renderer.as_mut() {
@@ -12117,9 +12147,9 @@ impl ApplicationHandler<UserEvent> for App {
                 Ok(path) => match update::run_setup(&path) {
                     // the installer takes over: update, relaunch, session restore
                     Ok(()) => self.quit_app(event_loop),
-                    Err(e) => self.show_notice(&format!("update failed to start: {e}")),
+                    Err(e) => self.show_error(&format!("update failed to start: {e}")),
                 },
-                Err(e) => self.show_notice(&format!("update download failed: {e}")),
+                Err(e) => self.show_error(&format!("update download failed: {e}")),
             },
             UserEvent::Accessibility(e) => match e.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => self.send_initial_a11y_tree(e.window_id),
@@ -12531,11 +12561,11 @@ impl ApplicationHandler<UserEvent> for App {
         {
             self.notice_until = None;
             if let Some(r) = self.pw.renderer.as_mut() {
-                r.set_notice(None);
+                r.expire_notice();
             }
             for sat in &mut self.satellites {
                 if let Some(r) = sat.renderer.as_mut() {
-                    r.set_notice(None);
+                    r.expire_notice();
                 }
                 if let Some(w) = sat.window.as_ref() {
                     w.request_redraw();

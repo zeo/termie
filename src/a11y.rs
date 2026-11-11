@@ -129,7 +129,7 @@ pub struct Item {
     pub toggled: Option<bool>,
     pub click: bool,
     pub modal: bool,
-    pub live: bool,
+    pub live: Option<Live>,
     pub position: Option<(usize, usize)>,
     pub active: Option<u32>,
     pub children: Vec<Item>,
@@ -175,8 +175,8 @@ fn push_item(layer: Layer, item: Item, nodes: &mut Vec<(NodeId, Node)>) -> NodeI
     if item.modal {
         node.set_modal();
     }
-    if item.live {
-        node.set_live(Live::Polite);
+    if let Some(live) = item.live {
+        node.set_live(live);
     }
     if let Some((position, size)) = item.position {
         node.set_position_in_set(position);
@@ -724,7 +724,7 @@ mod tests {
     fn topmost_focusing_panel_wins_and_notices_leave_focus_alone() {
         let notice = Panel {
             layer: Layer::Notice,
-            root: Item { id: PANEL, role: Role::Status, label: "copied".to_string(), live: true, ..Default::default() },
+            root: Item { id: PANEL, role: Role::Status, label: "copied".to_string(), live: Some(Live::Polite), ..Default::default() },
             focus: None,
         };
         let find = Panel {
