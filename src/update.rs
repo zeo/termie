@@ -18,6 +18,8 @@ const MAX_UPDATE_ARCHIVE_LISTING_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_UPDATE_ARCHIVE_ENTRIES: usize = 4096;
 #[cfg(target_os = "linux")]
+const MAX_UPDATE_ARCHIVE_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_UPDATE_ARCHIVE_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_UPDATE_INSTALLER_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -330,6 +332,7 @@ fn validate_update_archive_listing(bytes: Vec<u8>, root: &str) -> Result<usize, 
 fn validate_update_archive_types(bytes: Vec<u8>, expected: usize) -> Result<(), String> {
     let listing = String::from_utf8(bytes).map_err(|_| "archive contains non-UTF-8 metadata")?;
     let mut entries = 0;
+    let mut unpacked = 0u64;
     for line in listing.lines() {
         if line.is_empty() {
             continue;
@@ -337,6 +340,12 @@ fn validate_update_archive_types(bytes: Vec<u8>, expected: usize) -> Result<(), 
         entries += 1;
         if !matches!(line.as_bytes().first(), Some(b'-' | b'd')) {
             return Err("archive contains a link or special file".into());
+        }
+        // `tar -tv` rows read "mode owner/group size date time path"
+        let size = line.split_whitespace().nth(2).and_then(|size| size.parse::<u64>().ok());
+        unpacked = unpacked.saturating_add(size.ok_or("archive metadata has no entry size")?);
+        if unpacked > MAX_UPDATE_ARCHIVE_UNPACKED_BYTES {
+            return Err("archive unpacks past the 512 MiB limit".into());
         }
     }
     (entries == expected)
@@ -658,8 +667,15 @@ mod tests {
         let root = "termie-1.2.3-linux-x86_64";
         let listing = format!("{root}/bin/termie\n{root}/install.sh\n");
         assert_eq!(validate_update_archive_listing(listing.into_bytes(), root), Ok(2));
-        assert!(validate_update_archive_types(b"- file\n- file\n".to_vec(), 2).is_ok());
-        assert!(validate_update_archive_types(b"- file\n".to_vec(), 2).is_err());
+        let file = "-rw-r--r-- me/me 3 2026-11-11 19:02 termie/file\n";
+        assert!(validate_update_archive_types(file.repeat(2).into_bytes(), 2).is_ok());
+        assert!(validate_update_archive_types(file.as_bytes().to_vec(), 2).is_err());
+        assert!(validate_update_archive_types(b"- file\n".to_vec(), 1).is_err());
+        let bomb = "-rw-r--r-- me/me 300000000 2026-11-11 19:02 termie/file\n".repeat(2);
+        assert_eq!(
+            validate_update_archive_types(bomb.into_bytes(), 2),
+            Err("archive unpacks past the 512 MiB limit".into())
+        );
 
         let oversized = std::iter::repeat_n(format!("{root}/file\n"), MAX_UPDATE_ARCHIVE_ENTRIES + 1)
             .collect::<String>();
