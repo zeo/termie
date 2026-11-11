@@ -282,7 +282,9 @@ impl Terminal {
         } else {
             self.grid.cursor.col = col;
         }
-        for _ in 0..down {
+        // past a screen plus the scrollback every further linefeed only scrolls
+        // blank rows, so a hostile 1x16M image can't stall the pump
+        for _ in 0..down.min(self.grid.rows + self.grid.scrollback_limit) {
             self.grid.linefeed();
         }
         self.grid.cursor.wrap_pending = false;
@@ -1508,6 +1510,17 @@ mod tests {
         let after_resize = t.revision;
         feed(&mut t, b"\x1b]133;D;0\x1b\\");
         assert!(t.revision > after_resize);
+    }
+
+    #[test]
+    fn a_huge_image_advance_stops_at_screen_plus_scrollback() {
+        let mut t = Terminal::new(4, 10);
+        t.grid.set_scrollback_limit(50);
+        let started = std::time::Instant::now();
+        t.advance_cursor_past_image(1, 16_000_000, 0, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(t.grid.cursor.row, 3);
+        assert_eq!(t.grid.scrollback.len(), 50);
     }
 
     #[test]
