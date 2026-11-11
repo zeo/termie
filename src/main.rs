@@ -7439,11 +7439,8 @@ impl App {
         }
     }
 
-    /// route a key to the open marketplace overlay; returns true if it consumed it
-    fn market_input(&mut self, key: &Key) -> bool {
-        if self.market.is_none() {
-            return false;
-        }
+    /// route a key to the open marketplace overlay
+    fn market_input(&mut self, key: &Key) {
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.market = None;
@@ -7465,9 +7462,8 @@ impl App {
             }
             Key::Named(NamedKey::Enter) => self.market_activate(),
             Key::Character(s) if s.as_str() == "r" => self.market_remove(),
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
     /// request closing a tab; one holding several panes confirms first so a
@@ -11265,8 +11261,10 @@ impl App {
             self.redraw();
             return true;
         }
-        // the plugins marketplace overlay captures keys while open
-        if self.market.is_some() && self.market_input(logical) {
+        // the plugins marketplace is a full-page modal: keys it doesn't use are
+        // swallowed rather than typed into the hidden pane
+        if self.market.is_some() {
+            self.market_input(logical);
             return true;
         }
         // find-in-scrollback overlay captures every key while open
