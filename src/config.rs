@@ -85,6 +85,9 @@ pub struct Persisted {
     /// a BEL flashes the pane border, dots a background tab and flashes the
     /// taskbar; `bell=off` drops all three
     pub bell: bool,
+    /// chrome text and controls size, multiplied by the os text size;
+    /// 0.75 to 2.0, the terminal grid keeps font_size
+    pub ui_scale: f32,
     /// value of $TERM_PROGRAM for child processes. default "termie". set to a
     /// known host name (e.g. ghostty) only for apps that refuse the kitty
     /// keyboard protocol unless the name is on their allowlist
@@ -138,6 +141,7 @@ impl Default for Persisted {
             latency_hud: false,
             update_check: true,
             bell: true,
+            ui_scale: 1.0,
             term_program: String::from("termie"),
             bookmarks: Vec::new(),
             unreadable: false,
@@ -250,6 +254,9 @@ pub fn render(p: &Persisted) -> String {
     if !p.bell {
         let _ = writeln!(s, "bell=off");
     }
+    if p.ui_scale != 1.0 {
+        let _ = writeln!(s, "ui_scale={}", p.ui_scale);
+    }
     s
 }
 
@@ -329,6 +336,13 @@ pub fn parse(text: &str) -> Persisted {
                     && x.is_finite()
                 {
                     p.line_height = x;
+                }
+            }
+            "ui_scale" => {
+                if let Ok(x) = v.parse::<f32>()
+                    && x.is_finite()
+                {
+                    p.ui_scale = x.clamp(0.75, 2.0);
                 }
             }
             "theme" => {
@@ -668,7 +682,7 @@ mod tests {
     #[test]
     fn config_ignores_non_finite_renderer_values() {
         let p = parse(
-            "font_size=NaN\npadding=inf\nline_height=-inf\nmin_contrast=NaN\nbackground_image_opacity=NaN\n",
+            "font_size=NaN\npadding=inf\nline_height=-inf\nmin_contrast=NaN\nbackground_image_opacity=NaN\nui_scale=inf\n",
         );
         let defaults = Persisted::default();
         assert_eq!(p.font_size, defaults.font_size);
@@ -676,6 +690,8 @@ mod tests {
         assert_eq!(p.line_height, defaults.line_height);
         assert_eq!(p.min_contrast, defaults.min_contrast);
         assert_eq!(p.background_image_opacity, defaults.background_image_opacity);
+        assert_eq!(p.ui_scale, defaults.ui_scale);
+        assert_eq!(parse("ui_scale=9").ui_scale, 2.0);
     }
 
     #[test]
@@ -713,11 +729,11 @@ mod tests {
             font=Cascadia Code\nfont_weight=600\nmin_contrast=4.5\nbackground_image=C:\\bg.png\n\
             background_image_opacity=0.25\nligatures=false\nwsl_distro=Arch\nplugin_sandbox=off\nosc52=true\n\
             acrylic=true\nprofile.dev=pwsh.exe -NoLogo\nprofile.dev.cwd=C:\\repo\ntheme.cmd=koi\n\
-            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\n";
+            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\nui_scale=1.25\n";
         let first = render(&parse(text));
         assert_eq!(render(&parse(&first)), first);
         let p = parse(&first);
-        assert_eq!((p.font_size, p.padding), (10.5, 3.5));
+        assert_eq!((p.font_size, p.padding, p.ui_scale), (10.5, 3.5, 1.25));
         assert_eq!(p.cursor, grid::CursorShape::Underline);
         assert!(p.theme_auto && !p.restore_on_launch && !p.plugin_sandbox && !p.update_check && !p.bell);
         assert!(parse("").bell);

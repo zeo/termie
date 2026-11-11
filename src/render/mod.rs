@@ -548,6 +548,8 @@ struct TabLayout {
     newtab: (f32, f32, f32, f32),
     /// the profile-menu chevron, flush against the right edge of `newtab`
     newtab_menu: (f32, f32, f32, f32),
+    /// the "termie" wordmark beside the badge; dropped when tabs need its room
+    wordmark: bool,
 }
 
 pub(crate) struct A11yChromeLayout {
@@ -859,7 +861,12 @@ pub struct Renderer {
     /// demand in build() and dropped when the color overrides change
     pane_palettes: Vec<(ThemeId, Palette)>,
 
+    /// chrome scale: device scale times ui_factor
     scale: f32,
+    /// window dpi scale; the terminal grid, pane pad and cursor stay on it
+    device_scale: f32,
+    /// os text size times the ui_scale setting
+    ui_factor: f32,
     pad: f32,
     content_pt: f32,
     content_line_height: f32,
@@ -1624,6 +1631,8 @@ impl Renderer {
             color_overrides: Vec::new(),
             broadcast: false,
             scale,
+            device_scale: scale,
+            ui_factor: 1.0,
             pad,
             content_pt,
             content_line_height: 1.32,
@@ -1803,7 +1812,7 @@ impl Renderer {
 
     /// inner padding inside each pane rect (keeps text off the dividers)
     fn pane_pad(&self) -> f32 {
-        (self.pane_pad_px * self.scale).round()
+        (self.pane_pad_px * self.device_scale).round()
     }
 
     /// given a pane's pixel rect, the grid origin + cols/rows that fit inside it
@@ -1849,7 +1858,7 @@ impl Renderer {
     /// cursor-beam / scroll-thumb width in pixels (kept in one place so the
     /// painter and the scrollbar hit-test agree)
     fn beam_w(&self) -> f32 {
-        tokens::px(tokens::SPACE_2XS, self.scale).max(1.0)
+        tokens::px(tokens::SPACE_2XS, self.device_scale).max(1.0)
     }
 
     /// scroll thumb geometry for a pane grid, or None when there is nothing to
@@ -2077,7 +2086,7 @@ impl Renderer {
         // at exactly this size. still recompute the grid (cols/rows start at 0)
         if pt != self.content_pt {
             self.content_pt = pt;
-            self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, self.content_line_height, self.content_weight);
+            self.atlas.reconfigure(self.content_pt, self.chrome_pt * self.ui_factor, self.device_scale, self.content_font, self.content_line_height, self.content_weight);
         }
         self.recompute_grid_size();
         (self.cols, self.rows)
@@ -2087,16 +2096,35 @@ impl Renderer {
     /// scale (per-monitor dpi change), so a window dragged between monitors of
     /// different dpi stays crisp; mirrors the scale-derived geometry in from_parts
     pub fn set_scale(&mut self, scale: f32) {
-        if (scale - self.scale).abs() < f32::EPSILON {
+        if (scale - self.device_scale).abs() < f32::EPSILON {
             return;
         }
-        self.scale = scale;
-        // re-raster glyphs at the new device scale (clears + repacks the atlas)
-        self.atlas.reconfigure(self.content_pt, self.chrome_pt, scale, self.content_font, self.content_line_height, self.content_weight);
-        self.pad = tokens::px(tokens::WINDOW_PAD, scale);
-        self.title_bar_h = tokens::px(tokens::TITLE_BAR, scale);
-        self.status_bar_h = tokens::px(tokens::STATUS_BAR, scale);
+        self.device_scale = scale;
+        self.rescale();
+    }
+
+    /// grow chrome text and layout by the os text size and the ui_scale
+    /// setting; the terminal grid keeps its own font size
+    pub fn set_ui_factor(&mut self, factor: f32) {
+        let factor = factor.clamp(0.75, 3.0);
+        if (factor - self.ui_factor).abs() < f32::EPSILON {
+            return;
+        }
+        self.ui_factor = factor;
+        self.rescale();
+    }
+
+    fn rescale(&mut self) {
+        self.scale = self.device_scale * self.ui_factor;
+        // re-raster glyphs (clears + repacks the atlas)
+        self.atlas.reconfigure(self.content_pt, self.chrome_pt * self.ui_factor, self.device_scale, self.content_font, self.content_line_height, self.content_weight);
+        self.pad = tokens::px(tokens::WINDOW_PAD, self.device_scale);
+        self.title_bar_h = tokens::px(tokens::TITLE_BAR, self.scale);
+        self.status_bar_h = tokens::px(tokens::STATUS_BAR, self.scale);
+        // the grid refits, but nobody dragged an edge, so no size readout
+        let flash = self.size_flash;
         self.recompute_grid_size();
+        self.size_flash = flash;
     }
 
     pub fn pane_pad_px(&self) -> f32 {
@@ -2174,7 +2202,7 @@ impl Renderer {
             return;
         }
         self.content_line_height = lh;
-        self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, lh, self.content_weight);
+        self.atlas.reconfigure(self.content_pt, self.chrome_pt * self.ui_factor, self.device_scale, self.content_font, lh, self.content_weight);
         self.recompute_grid_size();
     }
 
@@ -2188,7 +2216,7 @@ impl Renderer {
         let w = w.clamp(100, 900);
         if w != self.content_weight {
             self.content_weight = w;
-            self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, self.content_line_height, w);
+            self.atlas.reconfigure(self.content_pt, self.chrome_pt * self.ui_factor, self.device_scale, self.content_font, self.content_line_height, w);
         }
         self.recompute_grid_size();
         (self.cols, self.rows)
@@ -2279,7 +2307,7 @@ impl Renderer {
             && i != self.font_idx {
                 self.font_idx = i;
                 self.content_font = if i == 0 { None } else { Some(self.fonts[i]) };
-                self.atlas.reconfigure(self.content_pt, self.chrome_pt, self.scale, self.content_font, self.content_line_height, self.content_weight);
+                self.atlas.reconfigure(self.content_pt, self.chrome_pt * self.ui_factor, self.device_scale, self.content_font, self.content_line_height, self.content_weight);
                 self.recompute_grid_size();
             }
         (self.cols, self.rows)
@@ -2576,9 +2604,15 @@ impl Renderer {
         self.rename_view = r;
     }
 
+    /// caption buttons keep their device width under large text, as the os
+    /// caption buttons do, so the tab strip keeps its room
+    fn control_w(&self) -> f32 {
+        tokens::px(tokens::CONTROL_W, self.device_scale)
+    }
+
     /// title-bar buttons, left→right: splitV, splitH, pane mode, gear, minimize, maximize, close
     fn control_rects(&self) -> [(Hot, f32, f32); 7] {
-        let cw = tokens::px(tokens::CONTROL_W, self.scale);
+        let cw = self.control_w();
         let w = self.config.width as f32;
         [
             (Hot::SplitV, w - cw * 7.0, w - cw * 6.0),
@@ -2629,13 +2663,14 @@ impl Renderer {
     }
 
     /// where the wordmark ends and tabs begin
-    fn tabs_start_x(&self) -> f32 {
+    fn tabs_start_x(&self, wordmark: bool) -> f32 {
         let t = |pt| tokens::px(pt, self.scale);
-        self.pad
-            + self.badge_size()
-            + t(tokens::SPACE_S)
-            + self.text_w(FontId::Chrome, "termie", self.track_for(FontId::Chrome))
-            + t(tokens::SPACE_M)
+        let base = self.pad + self.badge_size() + t(tokens::SPACE_S);
+        if wordmark {
+            base + self.text_w(FontId::Chrome, "termie", self.track_for(FontId::Chrome)) + t(tokens::SPACE_M)
+        } else {
+            base
+        }
     }
 
     fn window_tabs_rect(&self) -> Rect {
@@ -2646,15 +2681,14 @@ impl Renderer {
         let s = self.scale;
         let t = |pt| tokens::px(pt, s);
         let h = self.title_bar_h;
-        let cw = t(tokens::CONTROL_W);
+        let cw = self.control_w();
         let newtab_w = t(tokens::SPACE_2XL);
         let chev_w = t(tokens::HIT_MIN);
-        let start = self.tabs_start_x();
         // reserve all 7 title-bar control buttons (control_rects starts at w-7cw,
         // the SplitV slot) so the new-tab '+' and its chevron never overrun the
         // split icon
         let controls_start = self.config.width as f32 - cw * 7.0;
-        let avail = (controls_start - start - newtab_w - chev_w - t(tokens::SPACE_S)).max(0.0);
+        let room = |start: f32| (controls_start - start - newtab_w - chev_w - t(tokens::SPACE_S)).max(0.0);
 
         // each tab sizes to its label plus the insets and the close slot,
         // clamped; when the strip overflows the widest tabs give way first, and
@@ -2671,7 +2705,10 @@ impl Renderer {
                     .clamp(t(tokens::TAB_MIN), t(tokens::TAB_MAX))
             })
             .collect();
-        let widths = fit_widths(&natural, avail);
+        // a narrow window or large text gives the wordmark's room to the tabs
+        let wordmark = natural.iter().sum::<f32>() <= room(self.tabs_start_x(true));
+        let start = self.tabs_start_x(wordmark);
+        let widths = fit_widths(&natural, room(start));
         let mut tabs = Vec::new();
         let mut x = start;
         for (i, &tab_w) in widths.iter().enumerate() {
@@ -2688,6 +2725,7 @@ impl Renderer {
             tabs,
             newtab: (newtab_x, 0.0, newtab_w, h),
             newtab_menu: (newtab_x + newtab_w, 0.0, chev_w, h),
+            wordmark,
         }
     }
 
@@ -4400,12 +4438,13 @@ impl Renderer {
         let badge = self.badge_size();
         let badge_y = ((tbh - badge) / 2.0).round();
         Self::push_icon(&mut out, pad, badge_y, badge, 1.0);
-        let wx = pad + badge + t(tokens::SPACE_S);
-        Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", hair, track);
-        let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", BAR_TEXT, 1.0, track);
-
         // tabs: snapshot to owned data so the atlas can be borrowed mutably
         let tl = self.tab_layout();
+        if tl.wordmark {
+            let wx = pad + badge + t(tokens::SPACE_S);
+            Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", hair, track);
+            let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", BAR_TEXT, 1.0, track);
+        }
         let active_tab = self.active_tab;
         let tab_items: Vec<TabItem> = tl
             .tabs
@@ -4456,7 +4495,9 @@ impl Renderer {
             let show_close = (*active || *ha > 0.0) && close.2 > 0.0;
             let label_x = tx + t(tokens::TAB_INSET);
             let label_end = if close.2 > 0.0 { close.0 - t(tokens::SPACE_XS) } else { tx + tw - t(tokens::SPACE_S) };
-            let maxc = ((label_end - label_x).max(0.0) / cw_c).floor() as usize;
+            // a pixel of slack: the tab and close rects round to whole pixels,
+            // and a tab sized to its label exactly must not lose a glyph to that
+            let maxc = ((label_end - label_x + 1.0).max(0.0) / cw_c).floor() as usize;
             let label_bg = if *active { nav[3] } else { BAR_BG };
             // borrow the already-owned snapshot label; only allocate when the
             // label actually needs truncating (the common case fits as-is)
@@ -7585,6 +7626,27 @@ mod hit_tests {
         );
         assert!(drag_hint_variants(Some(Hot::TabClose(2))).is_empty());
         assert!(drag_hint_variants(Some(Hot::Gear)).is_empty());
+    }
+
+    #[test]
+    fn large_text_grows_the_chrome_and_keeps_the_grid_font() {
+        let _gpu = gpu_serial();
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_tabs(vec!["backend".into(), "web-ui".into()], 0);
+        let (cell, bar, caption) = (r.cell_px(), r.title_bar_h, r.control_w());
+        r.set_ui_factor(1.75);
+        assert_eq!(r.cell_px(), cell);
+        assert_eq!(r.control_w(), caption);
+        assert!((r.title_bar_h - bar * 1.75).abs() <= 1.0);
+        assert!(r.size_flash.is_none(), "a text size change is not a resize");
+        // the tabs and the new-tab button stay clear of the caption buttons
+        let tl = r.tab_layout();
+        let split = r.control_rects()[0].1;
+        assert!(tl.newtab_menu.0 + tl.newtab_menu.2 <= split);
+        r.set_ui_factor(9.0);
+        assert!((r.title_bar_h - bar * 3.0).abs() <= 1.0, "the factor clamps at 3");
     }
 
     #[test]

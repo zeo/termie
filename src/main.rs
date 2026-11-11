@@ -210,8 +210,8 @@ enum UserEvent {
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
-    /// a worker re-read the os reduced-motion and caret blink settings
-    MotionPrefsRead,
+    /// a worker re-read the os reduced-motion, caret blink and text size
+    OsPrefsRead { text_scale: f32 },
     /// another ordinary launch joined this process and needs its own window
     Launch { request: instance::LaunchRequest, _permit: EventPermit },
     #[cfg(target_os = "linux")]
@@ -3923,6 +3923,8 @@ struct App {
     pw: PaneWindow,
     /// torn-off windows, each a full PaneWindow (keyed by window id at routing)
     satellites: Vec<PaneWindow>,
+    /// the os text size factor, last read by read_os_prefs
+    os_text_scale: f32,
     /// windows removed during input dispatch, kept alive until the callback ends
     retired_windows: Vec<PaneWindow>,
     /// while a satellite is swapped into self.pw for handling, the index it came
@@ -4130,6 +4132,9 @@ impl App {
             launch_fg: win::foreground_window(),
             pw: pane_window(None, None, Vec::new()),
             satellites: Vec::new(),
+            // a registry read on windows, so the first frame is already sized;
+            // the linux portal read blocks and arrives with read_os_prefs
+            os_text_scale: if cfg!(windows) { win::text_scale() } else { 1.0 },
             retired_windows: Vec::new(),
             cur_sat: None,
             next_id: 0,
@@ -4244,6 +4249,7 @@ impl App {
         renderer.set_cursor_blink(settings.cursor_blink);
         renderer.set_bold_as_bright(settings.bold_as_bright);
         renderer.set_line_height(settings.line_height);
+        renderer.set_ui_factor(settings.ui_scale * self.os_text_scale);
         renderer.set_pane_pad_px(settings.padding);
         renderer.set_opacity_pct(settings.opacity);
         if let Some(font) = settings.font.as_deref() {
@@ -8921,17 +8927,37 @@ impl App {
         });
     }
 
-    /// re-read the os reduced-motion and caret blink settings on a worker (the
-    /// linux reads block on d-bus); the user can change either while termie runs
-    fn read_motion_prefs(&self) {
+    /// re-read the os reduced-motion, caret blink and text size settings on a
+    /// worker (the linux reads block on d-bus); the user can change any of them
+    /// while termie runs
+    fn read_os_prefs(&self) {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             render::motion::set_reduced(win::reduced_motion());
             if let Some(ms) = win::caret_blink_ms() {
                 render::motion::set_blink_cycle(ms);
             }
-            let _ = proxy.send_event(UserEvent::MotionPrefsRead);
+            let _ = proxy.send_event(UserEvent::OsPrefsRead { text_scale: win::text_scale() });
         });
+    }
+
+    /// size every window's chrome by the ui_scale setting on top of the os
+    /// text size, then refit the grids to the new bar heights
+    fn apply_ui_factor(&mut self) {
+        let factor = self.persisted.ui_scale * self.os_text_scale;
+        let apply = move |app: &mut Self| {
+            if let Some(r) = app.pw.renderer.as_mut() {
+                r.set_ui_factor(factor);
+            }
+            app.relayout_all();
+            if let Some(w) = app.pw.window.as_ref() {
+                w.request_redraw();
+            }
+        };
+        apply(self);
+        for idx in 0..self.satellites.len() {
+            self.with_window(idx, apply);
+        }
     }
 
     /// re-resolve and apply the auto theme on every window (called on the OS
@@ -9904,7 +9930,7 @@ impl App {
             }
             WindowEvent::Focused(f) => {
                 if f {
-                    self.read_motion_prefs();
+                    self.read_os_prefs();
                 } else {
                     self.pw.alt_tap = false;
                     self.set_chrome_focus(None);
@@ -12188,7 +12214,11 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(any(windows, target_os = "linux"))]
             UserEvent::ToggleQuake => self.toggle_quake(),
             // repaint so a cursor caught in its off phase shows once blinking stops
-            UserEvent::MotionPrefsRead => {
+            UserEvent::OsPrefsRead { text_scale } => {
+                if (text_scale - self.os_text_scale).abs() > f32::EPSILON {
+                    self.os_text_scale = text_scale;
+                    self.apply_ui_factor();
+                }
                 for w in self.satellites.iter().filter_map(|sat| sat.window.as_ref()) {
                     w.request_redraw();
                 }
@@ -12303,7 +12333,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 if f {
-                    self.read_motion_prefs();
+                    self.read_os_prefs();
                 } else {
                     self.pw.alt_tap = false;
                     self.set_chrome_focus(None);
@@ -12895,7 +12925,7 @@ fn main() -> Result<()> {
         });
     }
     let mut app = App::new(proxy);
-    app.read_motion_prefs();
+    app.read_os_prefs();
     #[cfg(windows)]
     {
         app.handoff = handoff;

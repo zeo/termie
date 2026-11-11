@@ -953,6 +953,31 @@ pub fn caret_blink_ms() -> Option<u32> {
     }
 }
 
+/// the "text size" slider in accessibility settings, 1.0 to 2.25
+#[cfg(windows)]
+pub fn text_scale() -> f32 {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let mut percent = 100u32;
+    let mut bytes = 4u32;
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Accessibility"),
+            w!("TextScaleFactor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut percent as *mut u32 as *mut _),
+            Some(&mut bytes),
+        )
+    };
+    if read != ERROR_SUCCESS {
+        return 1.0;
+    }
+    percent.clamp(100, 225) as f32 / 100.0
+}
+
 /// kde's animation speed slider at "instant", or gnome's animations switch
 /// off (read through the settings portal); blocking, so call it off the ui thread
 #[cfg(target_os = "linux")]
@@ -999,6 +1024,19 @@ pub fn caret_blink_ms() -> Option<u32> {
     })
 }
 
+/// gnome's large text / text scaling factor; blocking, so call it off the ui thread
+#[cfg(target_os = "linux")]
+pub fn text_scale() -> f32 {
+    settings_portal()
+        .and_then(|proxy| {
+            gnome_interface(&proxy, "text-scaling-factor", |v| match v {
+                zbus::zvariant::Value::F64(f) if f.is_finite() => Some((*f as f32).clamp(0.5, 3.0)),
+                _ => None,
+            })
+        })
+        .unwrap_or(1.0)
+}
+
 #[cfg(target_os = "linux")]
 fn settings_portal() -> Option<zbus::blocking::Proxy<'static>> {
     let connection = zbus::blocking::Connection::session().ok()?;
@@ -1040,6 +1078,11 @@ pub fn reduced_motion() -> bool {
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn caret_blink_ms() -> Option<u32> {
     None
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn text_scale() -> f32 {
+    1.0
 }
 
 #[cfg(windows)]

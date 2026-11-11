@@ -80,6 +80,11 @@ pub fn capture(
             // keyboard focus on the title bar after a lone alt tap
             r.set_chrome_focus(Some(Hot::Tab(0)));
         }
+        "large-text" => {
+            // windows text size at 175%: the chrome grows, the grid keeps its font
+            r.set_ui_factor(1.75);
+            r.set_tab_status(vec![0, 4, 2]);
+        }
         "error" => {
             // a failure that stays on the status bar until dismissed
             r.set_error("couldn't start the requested shell".into());
@@ -316,9 +321,10 @@ mod tests {
     use crate::color::ThemeId;
 
     /// every chrome surface worth guarding, each rendered in every theme
-    const SCENES: [&str; 17] = [
+    const SCENES: [&str; 18] = [
         "split", "attention", "hover", "palette", "menu", "find", "confirm", "rename", "market",
-        "settings", "settings2", "panemode", "notice", "error", "focus", "welcome-hints", "readme",
+        "settings", "settings2", "panemode", "notice", "error", "focus", "large-text", "welcome-hints",
+        "readme",
     ];
     const W: u32 = 1100;
     const H: u32 = 680;
