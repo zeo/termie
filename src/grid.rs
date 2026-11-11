@@ -963,6 +963,8 @@ impl Grid {
                 let pull = needed.min(self.scrollback.len());
                 for _ in 0..pull {
                     if let Some(line) = self.scrollback.pop_back() {
+                        // the line keeps its absolute id as it moves to the screen
+                        self.total_scrolled -= 1;
                         self.lines.insert(0, line);
                         self.cursor.row = (self.cursor.row + 1).min(rows - 1);
                     }
@@ -1293,7 +1295,8 @@ impl Grid {
         }
         self.region_top = top;
         self.region_bottom = bottom;
-        self.cursor.row = self.region_top;
+        // decstbm homes the cursor: the screen's top-left, or the region's in origin mode
+        self.cursor.row = if self.origin_mode { self.region_top } else { 0 };
         self.cursor.col = 0;
         self.cursor.wrap_pending = false;
     }
@@ -1373,6 +1376,10 @@ impl Grid {
         }
         self.lines[row][col] = Cell { c, fg, bg, attrs, link, cluster: 0 };
         if w == 2 && col + 1 < self.cols {
+            // claiming col+1 may take the lead of another wide pair: blank its continuation
+            if col + 2 < self.cols && self.lines[row][col + 2].c == '\0' {
+                self.lines[row][col + 2] = Cell { c: ' ', fg, bg, attrs, link, cluster: 0 };
+            }
             // continuation cell marks the second half of a wide glyph
             self.lines[row][col + 1] = Cell { c: '\0', fg, bg, attrs, link, cluster: 0 };
         }
@@ -2215,6 +2222,28 @@ mod tests {
         assert_eq!(g2.cursor.col, 1);
     }
 
+    #[test]
+    fn a_wide_glyph_one_column_left_of_another_blanks_its_orphan() {
+        let mut g = Grid::new(2, 8);
+        g.put_char('x');
+        g.put_char('世'); // wide pair at cols 1-2
+        g.carriage_return();
+        g.put_char('界'); // cols 0-1, taking 世's lead
+        assert_eq!((g.lines[0][0].c, g.lines[0][1].c, g.lines[0][2].c), ('界', '\0', ' '));
+    }
+
+    #[test]
+    fn setting_margins_homes_to_the_screen_unless_origin_mode_is_on() {
+        let mut g = Grid::new(10, 5);
+        g.goto(6, 3);
+        g.set_scroll_region(3, 7);
+        assert_eq!((g.cursor.row, g.cursor.col), (0, 0));
+        g.set_origin_mode(true);
+        g.goto(6, 3);
+        g.set_scroll_region(2, 8);
+        assert_eq!((g.cursor.row, g.cursor.col), (2, 0));
+    }
+
     // VS16 promotion overwriting the lead of an old wide pair blanks the
     // orphaned continuation, and a base at the right margin stays narrow
     #[test]
@@ -2620,6 +2649,21 @@ mod tests {
         // forward brings the view back down toward the live screen
         assert!(g.jump_prompt(true));
         assert!(g.view_offset < v2);
+    }
+
+    #[test]
+    fn growing_the_screen_keeps_prompt_marks_on_their_lines() {
+        let mut g = Grid::new(3, 8);
+        g.put_char('p');
+        g.mark_prompt();
+        for _ in 0..5 {
+            g.linefeed();
+        }
+        let before: Vec<_> = g.prompt_rows().collect();
+        let abs = g.prompts[0].line;
+        g.resize(6, 8);
+        assert_eq!(g.prompt_rows().collect::<Vec<_>>(), before);
+        assert_eq!(g.line_at_abs(abs).map(|line| line[0].c), Some('p'));
     }
 
     // exit codes stamp the newest mark, survive reflow, and come back out of

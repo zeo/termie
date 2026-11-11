@@ -486,6 +486,15 @@ impl Terminal {
         self.mark_dirty();
     }
 
+    /// cap history on the live grid and, while the alt screen is up, on the
+    /// primary waiting underneath it
+    pub fn set_scrollback_limit(&mut self, n: usize) {
+        self.grid.set_scrollback_limit(n);
+        if let Some(primary) = self.saved_primary.as_mut() {
+            primary.set_scrollback_limit(n);
+        }
+    }
+
     fn enter_alt(&mut self) {
         if self.using_alt {
             return;
@@ -493,6 +502,7 @@ impl Terminal {
         let (rows, cols) = (self.grid.rows, self.grid.cols);
         let mut alt = Grid::new(rows, cols);
         alt.is_alt = true;
+        alt.set_scrollback_limit(self.grid.scrollback_limit);
         let primary = std::mem::replace(&mut self.grid, alt);
         self.grid_epoch = self.grid_epoch.wrapping_add(1);
         self.saved_primary = Some(primary);
@@ -1521,6 +1531,17 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(t.grid.cursor.row, 3);
         assert_eq!(t.grid.scrollback.len(), 50);
+    }
+
+    #[test]
+    fn the_alt_screen_follows_the_users_scrollback_limit() {
+        let mut t = Terminal::new(4, 10);
+        t.set_scrollback_limit(50);
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(t.grid.scrollback_limit, 50);
+        t.set_scrollback_limit(20);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.grid.scrollback_limit, 20);
     }
 
     #[test]

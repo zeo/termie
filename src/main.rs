@@ -2987,7 +2987,7 @@ fn build_pane(
         cell_h,
     )?;
     let mut term = Terminal::new(rows, cols);
-    term.grid.set_scrollback_limit(scrollback);
+    term.set_scrollback_limit(scrollback);
     term.set_cell_px(cell_w, cell_h);
     Ok(Pane {
         id,
@@ -3700,6 +3700,22 @@ struct PaneWindow {
     // raised here can only be resolved here (never targets another window's tab)
     confirm: Option<ConfirmState>,
     rename: Option<RenameState>,
+    /// set when this window's paint is deferred because a pane is mid
+    /// synchronized-output (DEC 2026) frame; the deadline forces a paint if the frame stalls
+    sync_redraw_pending: Option<Instant>,
+}
+
+const SYNC_PAINT_DEADLINE: Duration = Duration::from_millis(100);
+
+/// whether pane output should paint now: held while a DEC 2026 frame is open
+fn paint_after_output(pending: &mut Option<Instant>, in_sync: bool) -> bool {
+    if in_sync {
+        pending.get_or_insert_with(Instant::now);
+        false
+    } else {
+        *pending = None;
+        true
+    }
 }
 
 fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Vec<Tab>) -> PaneWindow {
@@ -3730,6 +3746,7 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         zoom_delta_kind: None,
         confirm: None,
         rename: None,
+        sync_redraw_pending: None,
     }
 }
 
@@ -3966,9 +3983,6 @@ struct App {
     /// can't spin a busy respawn loop with a permanently empty window
     warm_fails: usize,
     warm_backoff_until: Option<Instant>,
-    /// set when a paint is deferred because a pane is mid synchronized-output
-    /// (DEC 2026) frame; the safety deadline forces a paint if the frame stalls
-    sync_redraw_pending: Option<Instant>,
     /// armed on every resize event; the grid/pty reflow is held until the drag
     /// settles (about_to_wait fires it once the deadline passes) so a live
     /// resize doesn't rebuild all scrollback per pixel-step
@@ -4103,7 +4117,6 @@ impl App {
             ascii_warmed: false,
             warm_fails: 0,
             warm_backoff_until: None,
-            sync_redraw_pending: None,
             resize_settle: None,
             pty_dirty: false,
             input_at: None,
@@ -4538,7 +4551,7 @@ impl App {
         let pty = Pty::from_handoff(h.reader, h.writer, h.signal, h.reference, h.server, h.client);
         let (cw, ch) = self.pw.renderer.as_ref().map(|r| r.cell_px()).unwrap_or((0, 0));
         let mut term = Terminal::new(rows, cols);
-        term.grid.set_scrollback_limit(self.config.scrollback);
+        term.set_scrollback_limit(self.config.scrollback);
         term.set_cell_px(cw, ch);
         let mut pane = Pane {
             id,
@@ -4973,11 +4986,11 @@ impl App {
         let n = self.config.scrollback;
         for tab in &mut self.pw.tabs {
             if let Some(root) = tab.root.as_mut() {
-                each_pane_mut(root, &mut |p| p.term.grid.set_scrollback_limit(n));
+                each_pane_mut(root, &mut |p| p.term.set_scrollback_limit(n));
             }
         }
         for sp in &mut self.pool {
-            sp.term.grid.set_scrollback_limit(n);
+            sp.term.set_scrollback_limit(n);
         }
     }
 
@@ -7467,10 +7480,17 @@ impl App {
             kill_all(root);
         }
         if self.pw.tabs.is_empty() {
-            // emptying the MAIN window exits the app; emptying a torn-off window
-            // (cur_sat set) just closes that window — satellite_event removes it
-            // after the swap-back
-            if self.cur_sat.is_none() {
+            // emptying the main window promotes a surviving torn-off window and
+            // exits only when none is left; emptying a torn-off window (cur_sat
+            // set) just closes it, satellite_event removes it after the swap-back
+            if self.cur_sat.is_none() && self.satellites.iter().any(|s| !s.tabs.is_empty()) {
+                self.cleanup_empty_windows();
+                self.sync_tabs();
+                if let Some(w) = self.pw.window.as_ref() {
+                    w.focus_window();
+                    w.request_redraw();
+                }
+            } else if self.cur_sat.is_none() {
                 self.kill_pool();
                 win::clipboard_shutdown();
                 self.release_window_resources();
@@ -11507,11 +11527,13 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut sat_rang = false;
                     let mut sat_rang_tab: Option<usize> = None;
                     let mut sat_note: Option<String> = None;
+                    let mut sat_in_sync = false;
                     for (ti, tab) in self.pw.tabs.iter_mut().enumerate() {
                         if let Some(root) = tab.root.as_mut()
                             && let Some(p) = find_pane_mut(root, id)
                         {
                             pump_bytes(p, &bytes);
+                            sat_in_sync = p.term.sync_output;
                             if !p.ready {
                                 p.ready = true;
                                 sat_ready = true;
@@ -11604,7 +11626,9 @@ impl ApplicationHandler<UserEvent> for App {
                             win::request_attention(w);
                         }
                     }
-                    if let Some(w) = self.pw.window.as_ref() {
+                    if paint_after_output(&mut self.pw.sync_redraw_pending, sat_in_sync)
+                        && let Some(w) = self.pw.window.as_ref()
+                    {
                         w.request_redraw();
                     }
                     std::mem::swap(&mut self.pw, &mut self.satellites[idx]);
@@ -11740,16 +11764,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
                 if self.pw.layout_cache.iter().any(|(pid, _)| *pid == id) {
-                    if in_sync {
-                        // mid synchronized-output frame: defer the paint so the
-                        // screen isn't shown torn (cursor stranded mid-redraw)
-                        if self.sync_redraw_pending.is_none() {
-                            self.sync_redraw_pending = Some(Instant::now());
-                        }
-                    } else {
-                        // mark dirty and let about_to_wait paint once per loop
-                        // turn, so a flood of pty chunks collapses to one frame
-                        self.sync_redraw_pending = None;
+                    // mid synchronized-output frame: defer the paint so the screen
+                    // isn't shown torn. otherwise mark dirty and let about_to_wait
+                    // paint once per loop turn, so a flood of chunks is one frame
+                    if paint_after_output(&mut self.pw.sync_redraw_pending, in_sync) {
                         self.pty_dirty = true;
                     }
                 }
@@ -11788,7 +11806,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // start reading now that we own it; refresh scrollback in case
                     // it changed while the shell was spawning
                     self.start_reader(&mut pane);
-                    pane.term.grid.set_scrollback_limit(self.config.scrollback);
+                    pane.term.set_scrollback_limit(self.config.scrollback);
                     if self.pw.tabs.is_empty() {
                         // first shell of an async startup -> becomes tab one
                         self.install_first_tab(*pane);
@@ -12244,12 +12262,27 @@ impl ApplicationHandler<UserEvent> for App {
                 self.close_find();
             }
         }
-        if let Some(t) = self.sync_redraw_pending {
-            if t.elapsed() >= Duration::from_millis(100) {
-                self.sync_redraw_pending = None;
+        let mut sat_sync_due: Option<Instant> = None;
+        for sat in &mut self.satellites {
+            if let Some(t) = sat.sync_redraw_pending {
+                if t.elapsed() >= SYNC_PAINT_DEADLINE {
+                    sat.sync_redraw_pending = None;
+                    if let Some(w) = sat.window.as_ref() {
+                        w.request_redraw();
+                    }
+                } else {
+                    let due = t + SYNC_PAINT_DEADLINE;
+                    sat_sync_due = Some(sat_sync_due.map_or(due, |d| d.min(due)));
+                }
+            }
+        }
+        if let Some(t) = self.pw.sync_redraw_pending {
+            if t.elapsed() >= SYNC_PAINT_DEADLINE {
+                self.pw.sync_redraw_pending = None;
                 self.redraw();
             } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(t + Duration::from_millis(100)));
+                let due = sat_sync_due.map_or(t + SYNC_PAINT_DEADLINE, |s| s.min(t + SYNC_PAINT_DEADLINE));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
                 return;
             }
         }
@@ -12392,6 +12425,8 @@ impl ApplicationHandler<UserEvent> for App {
         // a torn-off window mid-animation needs ~60fps wakeups; take the soonest
         // of the main window's need and the satellite tick so neither is starved
         let sat_ms = sat_anim.then_some(16u64);
+        let sat_sync_ms =
+            sat_sync_due.map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64 + 1);
         // a live notice must wake the loop at its expiry even when otherwise idle
         let notice_ms: Option<u64> = self
             .notice_until
@@ -12422,6 +12457,7 @@ impl ApplicationHandler<UserEvent> for App {
         match main_ms
             .into_iter()
             .chain(sat_ms)
+            .chain(sat_sync_ms)
             .chain(notice_ms)
             .chain(session_ms)
             .chain(find_ms)
@@ -12688,6 +12724,17 @@ mod tests {
     }
 
     #[test]
+    fn a_synchronized_frame_holds_its_paint_from_the_first_chunk_until_it_ends() {
+        let mut pending = None;
+        assert!(!paint_after_output(&mut pending, true));
+        let opened = pending.expect("an open frame starts the deadline");
+        assert!(!paint_after_output(&mut pending, true));
+        assert_eq!(pending, Some(opened), "later chunks keep the first deadline");
+        assert!(paint_after_output(&mut pending, false));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
     fn wheel_prefers_an_alternate_screens_existing_scrollback() {
         assert!(wheel_uses_local_scrollback(false, false));
         assert!(wheel_uses_local_scrollback(true, true));
@@ -12918,7 +12965,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 6);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);
