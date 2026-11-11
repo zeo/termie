@@ -82,9 +82,11 @@ pub fn apply_min_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
     };
     let t = t.clamp(0.0, 1.0);
     let lut = srgb_linear_lut();
+    // round away from bg so quantizing to u8 can't drop the pair under min
+    let quantize = if lighten { f32::ceil } else { f32::floor };
     let mix = |c: u8| {
         let lin = lut[c as usize] + (toward - lut[c as usize]) * t;
-        (lin_to_srgb(lin) * 255.0).round().clamp(0.0, 255.0) as u8
+        quantize(lin_to_srgb(lin) * 255.0).clamp(0.0, 255.0) as u8
     };
     Rgb::new(mix(fg.r), mix(fg.g), mix(fg.b))
 }
@@ -726,6 +728,28 @@ mod tests {
             for surface in [p.ink0, p.ink1, p.bg] {
                 let lifted = apply_min_contrast(p.mute, surface, crate::render::tokens::TEXT_CONTRAST);
                 assert!(ratio(lifted, surface) >= 4.5, "{name}: muted text");
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_icons_hold_three_to_one_in_every_theme() {
+        use crate::instrument::{FOCUS, NAV, NAV_MUTE};
+        let floor = crate::render::tokens::ICON_CONTRAST;
+        // the graphite bar is the same in every theme; icons sit on its body
+        for stop in &NAV[1..] {
+            let bar = Rgb::from_triple(*stop);
+            assert!(ratio(Rgb::from_triple(NAV_MUTE), bar) >= floor, "title-bar icons on {stop:?}");
+            assert!(ratio(Rgb::from_triple(FOCUS), bar) >= floor, "focus ring on {stop:?}");
+        }
+        for id in ThemeId::ALL {
+            let p = Palette::from_theme(id);
+            let bars = NAV[1..].iter().map(|c| Rgb::from_triple(*c));
+            for surface in [p.ink0, p.ink1, p.bg].into_iter().chain(bars) {
+                for mark in [p.mute, p.paper, p.ansi_color(1), p.ansi_color(2)] {
+                    let lifted = apply_min_contrast(mark, surface, floor);
+                    assert!(ratio(lifted, surface) >= floor, "{}: {mark:?} on {surface:?} lifts to {lifted:?} at {}", id.name(), ratio(lifted, surface));
+                }
             }
         }
     }

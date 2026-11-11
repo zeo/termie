@@ -20,6 +20,7 @@ pub enum Icon {
     Check,
     Shield,
     Arrow,
+    Alert,
 }
 
 enum Prim {
@@ -84,6 +85,7 @@ fn prims(icon: Icon) -> Vec<Prim> {
             Arc(5.0, 5.0, 4.0, PI / 2.0, PI),
         ],
         Icon::Arrow => vec![Line(5.0, 9.0, 5.0, 1.5), Line(1.75, 4.75, 5.0, 1.5), Line(5.0, 1.5, 8.25, 4.75)],
+        Icon::Alert => vec![Line(5.0, 1.0, 5.0, 6.0), Line(5.0, 8.75, 5.0, 8.75)],
     }
 }
 
@@ -151,7 +153,7 @@ pub fn rasterize(icon: Icon, size: u32, stroke: f32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 16] = [
+    const ALL: [Icon; 17] = [
         Icon::Close,
         Icon::Minimize,
         Icon::Maximize,
@@ -168,6 +170,7 @@ mod tests {
         Icon::Check,
         Icon::Shield,
         Icon::Arrow,
+        Icon::Alert,
     ];
 
     #[test]

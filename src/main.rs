@@ -1124,6 +1124,27 @@ fn boring_title(t: &str) -> bool {
 
 /// the label a tab shows: a user rename wins, then a meaningful OSC 0/2 title
 /// from the focused pane (agents report status this way), then its cwd
+/// per-tab badge rollup: failed > bell > done > running > nothing
+fn tab_attention(tab: &Tab) -> u8 {
+    let mut s = if tab.attention { 3 } else { 0 };
+    if let Some(root) = tab.root.as_ref() {
+        each_pane(root, &mut |p| s = s.max(p.status.rank()));
+    }
+    s
+}
+
+/// the tab's name for a screen reader, with the state its badge shows
+fn tab_spoken(tab: &Tab) -> String {
+    let label = tab_label(tab);
+    match tab_attention(tab) {
+        1 => format!("{label}, running"),
+        2 => format!("{label}, command done"),
+        3 => format!("{label}, bell"),
+        4 => format!("{label}, command failed"),
+        _ => label,
+    }
+}
+
 fn tab_label(tab: &Tab) -> String {
     if let Some(title) = tab.title.as_deref().filter(|s| !s.is_empty()) {
         return title.to_string();
@@ -6422,18 +6443,7 @@ impl App {
             }
         }
         let labels: Vec<String> = self.pw.tabs.iter().map(tab_label).collect();
-        // per-tab badge rollup: failed > bell > done > running > nothing
-        let attention: Vec<u8> = self
-            .pw.tabs
-            .iter()
-            .map(|t| {
-                let mut s = if t.attention { 3 } else { 0 };
-                if let Some(root) = t.root.as_ref() {
-                    each_pane(root, &mut |p| s = s.max(p.status.rank()));
-                }
-                s
-            })
-            .collect();
+        let attention: Vec<u8> = self.pw.tabs.iter().map(tab_attention).collect();
         let active = self.pw.active_tab;
         let colors: Vec<Option<u8>> = self.pw.tabs.iter().map(|t| t.color).collect();
         if let Some(r) = self.pw.renderer.as_mut() {
@@ -6531,7 +6541,7 @@ impl App {
             .filter_map(|(index, bounds)| {
                 self.pw.tabs.get(index).map(|tab| a11y::TabInfo {
                     id: tab.a11y_id as u64,
-                    label: tab_label(tab),
+                    label: tab_spoken(tab),
                     selected: index == self.pw.active_tab,
                     bounds: rect(bounds),
                 })

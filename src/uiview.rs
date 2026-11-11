@@ -67,9 +67,9 @@ pub fn capture(
             r.set_hovered(Some(Hot::SplitV));
         }
         "attention" => {
-            // a bell rang in one background tab; the other finished a command
-            // (one ok, shown green) — the full badge spread in one shot
-            r.set_tab_status(vec![0, 3, 2]);
+            // one background tab's command failed (a bang) and the other's
+            // finished ok (a check); the bell dot shows in the notice scene
+            r.set_tab_status(vec![0, 4, 2]);
         }
         "notice" => {
             // an OSC 9 notification's text on the status bar

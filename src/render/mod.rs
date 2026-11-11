@@ -2648,7 +2648,7 @@ impl Renderer {
         let h = self.title_bar_h;
         let cw = t(tokens::CONTROL_W);
         let newtab_w = t(tokens::SPACE_2XL);
-        let chev_w = t(tokens::SPACE_XL - tokens::SPACE_XS);
+        let chev_w = t(tokens::HIT_MIN);
         let start = self.tabs_start_x();
         // reserve all 7 title-bar control buttons (control_rects starts at w-7cw,
         // the SplitV slot) so the new-tab '+' and its chevron never overrun the
@@ -2660,7 +2660,7 @@ impl Renderer {
         // clamped; when the strip overflows the widest tabs give way first, and
         // past that every tab shares the room evenly (labels truncate) so all
         // stay visible and clickable
-        let cc = t(tokens::SPACE_L);
+        let cc = t(tokens::HIT_MIN);
         let track = self.track_for(FontId::Chrome);
         let natural: Vec<f32> = self
             .tabs
@@ -4133,7 +4133,6 @@ impl Renderer {
         let INK_3 = self.palette.ink3;
         let RULE = self.palette.rule;
         let RULE_2 = self.palette.rule2;
-        let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
         let QUIET = self.quiet(self.palette.ink0);
@@ -4317,6 +4316,7 @@ impl Renderer {
         }
         let brass = self.palette.ansi_color(3);
         let dot_d = tokens::px(tokens::DOT, self.scale).max(4.0);
+        let mark_d = tokens::px(tokens::ICON_SMALL, self.scale);
         let dot_inset = tokens::px(tokens::SPACE_S, self.scale);
         for (pv, info) in panes.iter().zip(&pane_info) {
             // bell: a warm glow pooled along the pane's inner edge that decays,
@@ -4328,9 +4328,10 @@ impl Renderer {
             }
             // command badge: a corner dot answering "which agents are still
             // working, which finished" at a glance across splits
-            if let Some((dot, da)) = self.status_dot(pv.status) {
+            if let Some((dot, da)) = self.status_dot(pv.status, self.palette.bg) {
                 let (rx, ry, rw, _rh) = info.3;
-                Self::push_round(&mut out, rx + rw - dot_d - dot_inset, ry + dot_inset, dot_d, dot_d, dot_d / 2.0, dot, da);
+                let mark = (rx + rw - mark_d - dot_inset, ry + dot_inset, mark_d, mark_d);
+                Self::push_status_mark(&mut self.atlas, &mut out, pv.status, mark, mark_d, dot_d, hair, dot, da);
             }
         }
         if let Some(((x, y, w, h), side)) = self.pane_drop {
@@ -4494,13 +4495,14 @@ impl Renderer {
                 }
                 let c = BAR_MUTE.lerp(WHITE, *close_ha);
                 Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(tokens::ICON_SMALL), stroke, c, 1.0);
-            } else if let Some((dot, da)) = self.status_dot(*attn) {
+            } else if let Some((dot, da)) = self.status_dot(*attn, label_bg) {
                 let dot_a = signal.map_or(1.0, |(_, _, d)| d);
                 if dot_a > 0.0 {
                     let d = t(tokens::DOT).max(4.0);
+                    let size = t(tokens::ICON_SMALL);
                     let (cx, _cy, ccw, _cch) = *close;
-                    let slot = if ccw > 0.0 { cx + (ccw - d) / 2.0 } else { tx + tw - d - t(tokens::SPACE_S) };
-                    Self::push_round(&mut out, slot.round(), ((tbh - d) / 2.0).round(), d, d, d / 2.0, dot, da * dot_a);
+                    let slot = if ccw > 0.0 { (cx, ccw) } else { (tx + tw - size - t(tokens::SPACE_S), size) };
+                    Self::push_status_mark(&mut self.atlas, &mut out, *attn, (slot.0, 0.0, slot.1, tbh), size, d, stroke, dot, da * dot_a);
                 }
             }
         }
@@ -4759,21 +4761,16 @@ impl Renderer {
             } else if let Some((text, mark)) = self.command_readout() {
                 let tw = self.text_w(FontId::Small, &text, st_track);
                 let x = rx - tw;
-                if x - sicon - ig > left_end + gap {
-                    let (c, a) = match mark {
-                        1 => (MUTE, motion::breathe(self.start.elapsed().as_secs_f32())),
-                        4 => (self.palette.ansi_color(1), 1.0),
-                        _ => (self.palette.ansi_color(2), 1.0),
-                    };
+                if x - sicon - ig > left_end + gap
+                    && let Some((c, a)) = self.status_dot(mark, self.palette.ink1)
+                {
                     let mark_rect = (x - sicon - ig, sbar.1, sicon, sbar.3);
-                    if mark == 2 {
-                        Self::draw_icon(&mut self.atlas, &mut out, Icon::Check, mark_rect, sicon, stroke, c, a);
+                    Self::push_status_mark(&mut self.atlas, &mut out, mark, mark_rect, sicon, t(tokens::DOT).max(4.0), stroke, c, a);
+                    let tc = if mark == 4 {
+                        crate::color::apply_min_contrast(self.palette.ansi_color(1), self.palette.ink1, tokens::TEXT_CONTRAST)
                     } else {
-                        let d = t(tokens::DOT).max(4.0);
-                        let dy = (sb_y + (self.status_bar_h - d) / 2.0).round();
-                        Self::push_round(&mut out, (mark_rect.0 + (sicon - d) / 2.0).round(), dy, d, d, d / 2.0, c, a);
-                    }
-                    let tc = if mark == 4 { self.palette.ansi_color(1) } else { QUIET };
+                        QUIET
+                    };
                     let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Small, x, st_top, &text, tc, 1.0, st_track);
                 }
             }
@@ -6366,15 +6363,30 @@ impl Renderer {
         crate::color::apply_min_contrast(self.palette.mute, surface, tokens::TEXT_CONTRAST)
     }
 
-    /// color and alpha of a command/attention dot: 1 running (breathing),
-    /// 2 done, 3 bell, 4 failed; None for 0
-    fn status_dot(&self, status: u8) -> Option<(Rgb, f32)> {
+    /// color and alpha of a command/attention mark on `surface`: 1 running
+    /// (breathing), 2 done, 3 bell, 4 failed; None for 0
+    fn status_dot(&self, status: u8, surface: Rgb) -> Option<(Rgb, f32)> {
+        let (c, a) = match status {
+            0 => return None,
+            1 => (self.palette.mute, motion::breathe(self.start.elapsed().as_secs_f32())),
+            2 => (self.palette.ansi_color(2), 1.0),
+            4 => (self.palette.ansi_color(1), 1.0),
+            _ => (self.palette.paper, 1.0),
+        };
+        Some((crate::color::apply_min_contrast(c, surface, tokens::ICON_CONTRAST), a))
+    }
+
+    /// a status mark centred in `rect`: done is a check and failed a bang so
+    /// the state reads without colour; running and bell stay dots
+    #[allow(clippy::too_many_arguments)]
+    fn push_status_mark(atlas: &mut GlyphAtlas, out: &mut Vec<Instance>, status: u8, rect: Rect, icon: f32, dot: f32, stroke: f32, rgb: Rgb, alpha: f32) {
         match status {
-            0 => None,
-            1 => Some((self.palette.mute, motion::breathe(self.start.elapsed().as_secs_f32()))),
-            2 => Some((self.palette.ansi_color(2), 1.0)),
-            4 => Some((self.palette.ansi_color(1), 1.0)),
-            _ => Some((self.palette.paper, 1.0)),
+            2 => Self::draw_icon(atlas, out, Icon::Check, rect, icon, stroke, rgb, alpha),
+            4 => Self::draw_icon(atlas, out, Icon::Alert, rect, icon, stroke, rgb, alpha),
+            _ => {
+                let (x, y, w, h) = rect;
+                Self::push_round(out, (x + (w - dot) / 2.0).round(), (y + (h - dot) / 2.0).round(), dot, dot, dot / 2.0, rgb, alpha);
+            }
         }
     }
 

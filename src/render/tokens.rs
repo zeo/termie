@@ -38,8 +38,10 @@ pub const TAB_RAIL: f32 = 2.0;
 pub const TAB_DIVIDER: f32 = 16.0;
 
 pub const CONTROL_H: f32 = 28.0;
-/// gel buttons, at the 24pt hit-target floor
-pub const BUTTON_H: f32 = 24.0;
+/// the smallest pointer target, wcag 2.5.8
+pub const HIT_MIN: f32 = 24.0;
+/// gel buttons, at the hit-target floor
+pub const BUTTON_H: f32 = HIT_MIN;
 pub const BUTTON_MIN_W: f32 = 72.0;
 pub const SWITCH_W: f32 = 32.0;
 pub const SWITCH_H: f32 = 18.0;
