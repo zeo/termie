@@ -12564,6 +12564,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.drive.is_some() {
             self.drive_tick(event_loop);
         }
+        // winit only notices an exit once the coming wait returns, so an exit
+        // asked for in this pass must not sleep on ControlFlow::Wait
+        if event_loop.exiting() {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
         // first shell hasn't spawned yet after a failure: wake at the backoff
         // deadline to retry, rather than hot-looping or sleeping indefinitely
         if self.pw.tabs.is_empty() && self.warm_fails > 0 && self.warm_fails < MAX_WARM_FAILS
