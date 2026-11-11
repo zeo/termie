@@ -27,6 +27,9 @@ pub enum Claim {
 pub struct Server {
     #[cfg(target_os = "linux")]
     listener: std::os::unix::net::UnixListener,
+    // held for the primary's lifetime so a later launch can tell a stale socket from a live one
+    #[cfg(target_os = "linux")]
+    _lock: std::fs::File,
     #[cfg(windows)]
     first: WinPipe,
 }
@@ -35,7 +38,7 @@ impl Server {
     pub fn start(self, mut send: impl FnMut(LaunchRequest) -> bool + Send + 'static) {
         std::thread::spawn(move || {
             #[cfg(target_os = "linux")]
-            serve_linux(self.listener, &mut send);
+            serve_linux(self, &mut send);
             #[cfg(windows)]
             serve_windows(self.first, &mut send);
         });
@@ -181,11 +184,16 @@ fn forward(mut stream: impl Read + Write, request: &LaunchRequest) -> io::Result
     }
 }
 
+// a path socket in the private runtime dir, never the abstract namespace: abstract
+// names follow the network namespace, so a plugin jailed with --share-net could reach them
 #[cfg(target_os = "linux")]
-fn linux_addr() -> io::Result<std::os::unix::net::SocketAddr> {
-    use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::net::SocketAddr;
-
+fn linux_socket_path() -> io::Result<std::path::PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let dir = runtime.join("termie");
+    make_private_dir(&dir)?;
     let session = std::env::var("XDG_SESSION_ID")
         .or_else(|_| std::env::var("WAYLAND_DISPLAY"))
         .or_else(|_| std::env::var("DISPLAY"))
@@ -195,8 +203,25 @@ fn linux_addr() -> io::Result<std::os::unix::net::SocketAddr> {
         .map(|byte| if byte.is_ascii_alphanumeric() { byte as char } else { '_' })
         .take(48)
         .collect();
-    let name = format!("termie-launch-{}-{session}", unsafe { libc::geteuid() });
-    SocketAddr::from_abstract_name(name)
+    Ok(dir.join(format!("launch-{session}.sock")))
+}
+
+#[cfg(target_os = "linux")]
+fn make_private_dir(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "launch dir is not ours"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -235,10 +260,8 @@ fn configure_linux_stream_with_timeout(
 }
 
 #[cfg(target_os = "linux")]
-fn try_forward_linux(request: &LaunchRequest) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
-
-    let stream = UnixStream::connect_addr(&linux_addr()?)?;
+fn try_forward_linux(socket: &std::path::Path, request: &LaunchRequest) -> io::Result<()> {
+    let stream = std::os::unix::net::UnixStream::connect(socket)?;
     if !linux_peer_is_user(&stream)? {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "launch owner mismatch"));
     }
@@ -248,32 +271,51 @@ fn try_forward_linux(request: &LaunchRequest) -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn claim_linux(request: &LaunchRequest) -> Claim {
-    use std::os::unix::net::UnixListener;
-
-    if try_forward_linux(request).is_ok() {
-        return Claim::Forwarded;
-    }
-    let Ok(addr) = linux_addr() else {
-        return Claim::Standalone;
-    };
-    match UnixListener::bind_addr(&addr) {
-        Ok(listener) => Claim::Primary(Server { listener }),
-        Err(_) => {
-            for _ in 0..5 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                if try_forward_linux(request).is_ok() {
-                    return Claim::Forwarded;
-                }
-            }
-            Claim::Standalone
-        }
+    match linux_socket_path() {
+        Ok(socket) => claim_linux_at(&socket, request),
+        Err(_) => Claim::Standalone,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn serve_linux(listener: std::os::unix::net::UnixListener, send: &mut impl FnMut(LaunchRequest) -> bool) {
+fn claim_linux_at(socket: &std::path::Path, request: &LaunchRequest) -> Claim {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if try_forward_linux(socket, request).is_ok() {
+        return Claim::Forwarded;
+    }
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(socket.with_extension("lock"))
+    else {
+        return Claim::Standalone;
+    };
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // a live primary holds the lock, so its socket is about to accept
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if try_forward_linux(socket, request).is_ok() {
+                return Claim::Forwarded;
+            }
+        }
+        return Claim::Standalone;
+    }
+    let _ = std::fs::remove_file(socket);
+    match std::os::unix::net::UnixListener::bind(socket) {
+        Ok(listener) => Claim::Primary(Server { listener, _lock: lock }),
+        Err(_) => Claim::Standalone,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn serve_linux(server: Server, send: &mut impl FnMut(LaunchRequest) -> bool) {
     loop {
-        let mut stream = match listener.accept() {
+        let mut stream = match server.listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
@@ -651,6 +693,93 @@ mod tests {
         let error = read_request_with_timeout(&mut reader, Duration::from_millis(25)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let base = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("termie-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        make_private_dir(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_launch_reclaims_a_stale_socket_then_forwards_to_the_primary() {
+        let dir = scratch_dir("launch-claim");
+        let socket = dir.join("launch-test.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let request = LaunchRequest { args: vec!["--title".into(), "x".into()], process_cwd: None, launch_cwd: None };
+        let Claim::Primary(server) = claim_linux_at(&socket, &request) else { panic!("stale socket was not reclaimed") };
+        let (sent, received) = std::sync::mpsc::channel();
+        server.start(move |request| sent.send(request).is_ok());
+        assert!(matches!(claim_linux_at(&socket, &request), Claim::Forwarded));
+        assert_eq!(received.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), request);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_loose_launch_dir_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("launch-dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_private_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // runs inside the jail spawned by the test below; a no-op anywhere else
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "helper for plugin_jail_with_network_cannot_reach_the_launch_socket"]
+    fn jailed_launch_probe() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixStream};
+
+        for arg in std::env::args() {
+            let reached = if let Some(path) = arg.strip_prefix("probe-path=") {
+                UnixStream::connect(path).is_ok()
+            } else if let Some(name) = arg.strip_prefix("probe-abstract=") {
+                SocketAddr::from_abstract_name(name).and_then(|addr| UnixStream::connect_addr(&addr)).is_ok()
+            } else {
+                continue;
+            };
+            println!("{arg} reached={reached}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs bubblewrap installed"]
+    fn plugin_jail_with_network_cannot_reach_the_launch_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+
+        let dir = scratch_dir("launch-jail");
+        let socket = dir.join("launch-test.sock");
+        let _path = UnixListener::bind(&socket).unwrap();
+        let name = format!("termie-jail-probe-{}", std::process::id());
+        let _abstract = UnixListener::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "tests::jailed_launch_probe".to_string(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            "--test-threads=1".into(),
+            format!("probe-path={}", socket.display()),
+            format!("probe-abstract={name}"),
+        ];
+        let mut jail = crate::plugin::sandbox::spawn("termie.plugin.selftest", &exe, &args, exe.parent().unwrap(), true)
+            .expect("bwrap spawn");
+        let mut out = String::new();
+        jail.take_stdout().unwrap().read_to_string(&mut out).unwrap();
+        jail.kill();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(out.contains(&format!("probe-abstract={name} reached=true")), "control unreachable, probe proves nothing: {out}");
+        assert!(out.contains(&format!("probe-path={} reached=false", socket.display())), "jail reached the launch socket: {out}");
     }
 
     #[cfg(windows)]

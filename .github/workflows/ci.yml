@@ -134,7 +134,7 @@ jobs:
           if [[ "${{ steps.bubblewrap.outputs.supported }}" == true ]]; then
             cargo test -- --ignored --test-threads=1
           else
-            cargo test -- --ignored --test-threads=1 --skip plugin::sandbox::tests::sandboxed_child_cannot_see_home_or_host_environment
+            cargo test -- --ignored --test-threads=1 --skip plugin::sandbox::tests::sandboxed_child_cannot_see_home_or_host_environment --skip instance::tests::plugin_jail_with_network_cannot_reach_the_launch_socket
           fi
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
