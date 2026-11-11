@@ -940,6 +940,19 @@ pub fn reduced_motion() -> bool {
     ok.is_ok() && !on.as_bool()
 }
 
+/// the caret blink cycle (on plus off) in ms from the keyboard / text cursor
+/// settings; Some(0) when the user picked no blinking, None when unreadable
+#[cfg(windows)]
+pub fn caret_blink_ms() -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::GetCaretBlinkTime;
+    // the api reports one phase, INFINITE for never and 0 on failure
+    match unsafe { GetCaretBlinkTime() } {
+        0 => None,
+        u32::MAX => Some(0),
+        phase => Some(phase.saturating_mul(2)),
+    }
+}
+
 /// kde's animation speed slider at "instant", or gnome's animations switch
 /// off (read through the settings portal); blocking, so call it off the ui thread
 #[cfg(target_os = "linux")]
@@ -957,21 +970,57 @@ pub fn reduced_motion() -> bool {
     {
         return factor <= 0.0;
     }
-    gnome_animations_off().unwrap_or(false)
+    settings_portal()
+        .and_then(|proxy| {
+            gnome_interface(&proxy, "enable-animations", |v| match v {
+                zbus::zvariant::Value::Bool(on) => Some(!on),
+                _ => None,
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// gnome's text cursor blink switch and cycle length (read through the
+/// settings portal); blocking, so call it off the ui thread
+#[cfg(target_os = "linux")]
+pub fn caret_blink_ms() -> Option<u32> {
+    use zbus::zvariant::Value;
+    let proxy = settings_portal()?;
+    let blinks = gnome_interface(&proxy, "cursor-blink", |v| match v {
+        Value::Bool(on) => Some(*on),
+        _ => None,
+    });
+    if blinks == Some(false) {
+        return Some(0);
+    }
+    gnome_interface(&proxy, "cursor-blink-time", |v| match v {
+        Value::I32(ms) => u32::try_from(*ms).ok().filter(|&ms| ms > 0),
+        _ => None,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn gnome_animations_off() -> Option<bool> {
-    use zbus::zvariant::{OwnedValue, Value};
+fn settings_portal() -> Option<zbus::blocking::Proxy<'static>> {
     let connection = zbus::blocking::Connection::session().ok()?;
-    let proxy = zbus::blocking::Proxy::new(
+    zbus::blocking::Proxy::new(
         &connection,
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.Settings",
     )
-    .ok()?;
-    let key = ("org.gnome.desktop.interface", "enable-animations");
+    .ok()
+}
+
+/// one `org.gnome.desktop.interface` key, unwrapped from the portal's
+/// variant nesting and handed to `pick`
+#[cfg(target_os = "linux")]
+fn gnome_interface<T>(
+    proxy: &zbus::blocking::Proxy<'_>,
+    key: &str,
+    pick: impl Fn(&zbus::zvariant::Value) -> Option<T>,
+) -> Option<T> {
+    use zbus::zvariant::{OwnedValue, Value};
+    let key = ("org.gnome.desktop.interface", key);
     let value: OwnedValue = proxy
         .call("ReadOne", &key)
         .or_else(|_| proxy.call("Read", &key))
@@ -980,15 +1029,17 @@ fn gnome_animations_off() -> Option<bool> {
     while let Value::Value(inner) = v {
         v = inner;
     }
-    match v {
-        Value::Bool(on) => Some(!on),
-        _ => None,
-    }
+    pick(v)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn reduced_motion() -> bool {
     false
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn caret_blink_ms() -> Option<u32> {
+    None
 }
 
 #[cfg(windows)]

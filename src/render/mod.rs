@@ -2391,16 +2391,15 @@ impl Renderer {
     }
 
     /// the soft cursor blink only needs frames while it fades; between fades
-    /// it can sleep until the next one starts
-    pub fn cursor_wake_ms(&self) -> u64 {
-        let p = (self.start.elapsed().as_secs_f32() % motion::CURSOR_PERIOD) / motion::CURSOR_PERIOD;
-        let fading = (0.50..0.62).contains(&p) || p >= 0.88;
-        if fading && !motion::reduced() {
-            16
-        } else {
-            let next = [0.50, 0.88, 1.50].into_iter().find(|&edge| edge > p).unwrap_or(1.50);
-            (((next - p) * motion::CURSOR_PERIOD * 1000.0) as u64).max(1)
+    /// it can sleep until the next one starts. None when the cursor holds steady
+    pub fn cursor_wake_ms(&self) -> Option<u64> {
+        let period = motion::blink_period()?;
+        let p = (self.start.elapsed().as_secs_f32() % period) / period;
+        if (0.50..0.62).contains(&p) || p >= 0.88 {
+            return Some(16);
         }
+        let next = [0.50, 0.88, 1.50].into_iter().find(|&edge| edge > p).unwrap_or(1.50);
+        Some((((next - p) * period * 1000.0) as u64).max(1))
     }
 
     /// play the once-ever welcome over the first window's content

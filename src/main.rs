@@ -210,6 +210,8 @@ enum UserEvent {
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// an accesskit adapter event (screen-reader tree request / action)
     Accessibility(accesskit_winit::Event),
+    /// a worker re-read the os reduced-motion and caret blink settings
+    MotionPrefsRead,
     /// another ordinary launch joined this process and needs its own window
     Launch { request: instance::LaunchRequest, _permit: EventPermit },
     #[cfg(target_os = "linux")]
@@ -8838,6 +8840,19 @@ impl App {
         });
     }
 
+    /// re-read the os reduced-motion and caret blink settings on a worker (the
+    /// linux reads block on d-bus); the user can change either while termie runs
+    fn read_motion_prefs(&self) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            render::motion::set_reduced(win::reduced_motion());
+            if let Some(ms) = win::caret_blink_ms() {
+                render::motion::set_blink_cycle(ms);
+            }
+            let _ = proxy.send_event(UserEvent::MotionPrefsRead);
+        });
+    }
+
     /// re-resolve and apply the auto theme on every window (called on the OS
     /// light/dark switch and when auto is turned on)
     fn apply_os_theme(&mut self) {
@@ -9804,6 +9819,9 @@ impl App {
                 }
             }
             WindowEvent::Focused(f) => {
+                if f {
+                    self.read_motion_prefs();
+                }
                 if f && let Some(window) = self.pw.window.as_ref() {
                     win::clear_attention(window);
                 }
@@ -11985,6 +12003,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             #[cfg(any(windows, target_os = "linux"))]
             UserEvent::ToggleQuake => self.toggle_quake(),
+            // repaint so a cursor caught in its off phase shows once blinking stops
+            UserEvent::MotionPrefsRead => {
+                for w in self.satellites.iter().filter_map(|sat| sat.window.as_ref()) {
+                    w.request_redraw();
+                }
+                self.redraw();
+            }
             UserEvent::UserConfChanged => {
                 let (kb, sends, ignored) = load_keybindings();
                 self.keybindings = kb;
@@ -12093,6 +12118,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(f) => {
+                if f {
+                    self.read_motion_prefs();
+                }
                 if f && let Some(window) = self.pw.window.as_ref() {
                     win::clear_attention(window);
                 }
@@ -12494,8 +12522,10 @@ impl ApplicationHandler<UserEvent> for App {
             // the soft cursor blink only wakes for its fades; a running
             // command's dot and timer wake slowly; otherwise sleep
             let r = self.pw.renderer.as_ref();
-            let blink = (self.pw.focused && self.blinking_cursor_on_screen())
-                .then(|| r.map_or(530, |r| r.cursor_wake_ms().max(33)));
+            let blink = r
+                .filter(|_| self.pw.focused && self.blinking_cursor_on_screen())
+                .and_then(|r| r.cursor_wake_ms())
+                .map(|ms| ms.max(33));
             let ms = blink.into_iter().chain(r.and_then(|r| r.ambient_wake_ms())).min();
             if ms.is_some() {
                 self.redraw();
@@ -12670,8 +12700,8 @@ fn main() -> Result<()> {
             launch_proxy.send_event(UserEvent::Launch { request, _permit: permit }).is_ok()
         });
     }
-    std::thread::spawn(|| render::motion::set_reduced(win::reduced_motion()));
     let mut app = App::new(proxy);
+    app.read_motion_prefs();
     #[cfg(windows)]
     {
         app.handoff = handoff;

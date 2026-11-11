@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 pub const HOVER_IN: f32 = 0.12;
@@ -12,7 +12,6 @@ pub const SIGNAL_HOLD: f32 = 2.0;
 pub const SIGNAL_SETTLE: f32 = 0.30;
 pub const RUNNING_PULSE: f32 = 1.2;
 pub const BELL: f32 = 0.60;
-pub const CURSOR_PERIOD: f32 = 1.06;
 /// the once-ever welcome: the badge settles in, winks, then dissolves while
 /// the key hints stay until the first keystroke
 pub const WELCOME_IN: f32 = 0.25;
@@ -32,6 +31,24 @@ pub fn set_reduced(on: bool) {
 
 pub fn reduced() -> bool {
     REDUCED.load(Ordering::Relaxed)
+}
+
+static BLINK_MS: AtomicU32 = AtomicU32::new(1060);
+
+/// the os caret blink cycle (on plus off) in ms; 0 means the user turned
+/// blinking off
+pub fn set_blink_cycle(ms: u32) {
+    BLINK_MS.store(ms, Ordering::Relaxed);
+}
+
+/// the blink period in seconds, or None when the cursor holds steady because
+/// the os turned blinking off or asked for less motion
+pub fn blink_period() -> Option<f32> {
+    period(BLINK_MS.load(Ordering::Relaxed), reduced())
+}
+
+fn period(ms: u32, reduced: bool) -> Option<f32> {
+    (ms > 0 && !reduced).then(|| ms as f32 / 1000.0)
 }
 
 /// linear 0..1 progress of a timer of `dur` seconds started at `since`
@@ -79,12 +96,13 @@ pub fn travel(t: f32) -> f32 {
     if reduced() { 1.0 } else { ease_out(t) }
 }
 
-/// soft blink: full for most of the period, a quick eased dip through zero
+/// soft blink: full for most of the period, a quick eased dip through zero;
+/// a steady 1.0 when `blink_period` says not to blink
 pub fn cursor_blink(elapsed: f32) -> f32 {
-    let p = (elapsed % CURSOR_PERIOD) / CURSOR_PERIOD;
-    if reduced() {
-        return if p < 0.57 { 1.0 } else { 0.0 };
-    }
+    let Some(period) = blink_period() else {
+        return 1.0;
+    };
+    let p = (elapsed % period) / period;
     let fade = |x: f32| x * x * (3.0 - 2.0 * x);
     match p {
         p if p < 0.50 => 1.0,
@@ -114,6 +132,14 @@ mod tests {
         assert!(at(0.0).abs() < 1e-6);
         assert!(at(TAB_RAIL) > 0.98);
         assert!((0..30).map(|i| at(i as f32 * 0.01)).collect::<Vec<_>>().windows(2).all(|p| p[1] >= p[0]));
+    }
+
+    #[test]
+    fn os_blink_off_or_reduced_motion_holds_the_cursor_steady() {
+        assert_eq!(period(1060, false), Some(1.06));
+        assert_eq!(period(1200, false), Some(1.2));
+        assert_eq!(period(0, false), None);
+        assert_eq!(period(1060, true), None);
     }
 
     #[test]
