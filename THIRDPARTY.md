@@ -20,6 +20,16 @@ project (https://github.com/ryanoasis/nerd-fonts). The constituent icon sets
 carry their own permissive licenses (MIT, OFL, and others) as documented by
 that project.
 
+### Source Sans 3 (Regular, Medium)
+
+Copyright 2010-2022 Adobe (http://www.adobe.com/), with Reserved Font Name
+'Source'. Source is a trademark of Adobe in the United States and/or other
+countries.
+
+Licensed under the SIL Open Font License, Version 1.1, reproduced in
+`assets/fonts/SourceSans3-LICENSE.txt`. termie uses it unmodified for interface
+labels, menus, settings and dialogs.
+
 ## Bundled ConPTY host (`conpty.dll`, `OpenConsole.exe`)
 
 Copyright (c) Microsoft Corporation.

@@ -47,7 +47,8 @@ const RULE2: COLORREF = cref(instrument::RULE2);
 const TEXT: COLORREF = cref(instrument::FG);
 const TEXT2: COLORREF = cref(instrument::TEXT2);
 const PAPER: COLORREF = cref(instrument::PAPER);
-const CLOSE_RED: COLORREF = cref(instrument::CLOSE_RED);
+// windows' caption close-hover red, so the destructive control reads the way the platform trained it to
+const CLOSE_RED: COLORREF = rgb(0xc4, 0x2b, 0x1c);
 // the app lifts muted text to 4.5:1 on its surface; this is that lift on BG
 const MUTE: COLORREF = rgb(0x7e, 0x7e, 0x7e);
 const PAPER_DIM: COLORREF = rgb(0xdc, 0xdc, 0xdc);

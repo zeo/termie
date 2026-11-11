@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 pub const HOVER_IN: f32 = 0.12;
-pub const HOVER_OUT: f32 = 0.20;
+pub const HOVER_OUT: f32 = 0.16;
 pub const TAB_RAIL: f32 = 0.30;
-pub const OVERLAY: f32 = 0.18;
+pub const OVERLAY: f32 = 0.16;
 pub const STARTUP: f32 = 0.22;
 pub const FOCUS: f32 = 0.16;
 pub const SIGNAL_DRAW: f32 = 0.40;
@@ -39,8 +39,19 @@ pub fn progress(since: Instant, dur: f32) -> f32 {
     (since.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0)
 }
 
+/// the suite's ease, cubic-bezier(0.32, 0.72, 0, 1): a fast start that
+/// glides into place
 pub fn ease_out(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(3)
+    let (x1, y1, x2, y2) = (0.32, 0.72, 0.0, 1.0);
+    let bez = |a: f32, b: f32, u: f32| 3.0 * a * u * (1.0 - u).powi(2) + 3.0 * b * u * u * (1.0 - u) + u.powi(3);
+    let t = t.clamp(0.0, 1.0);
+    // x(u) is monotonic for these control points, so bisection always converges
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        if bez(x1, x2, mid) < t { lo = mid } else { hi = mid }
+    }
+    bez(y1, y2, (lo + hi) / 2.0)
 }
 
 /// eased 0..1 for a fade, None once it has settled
@@ -114,6 +125,15 @@ mod tests {
             assert!((v - prev).abs() < 0.2, "jump at step {i}");
             prev = v;
         }
+    }
+
+    #[test]
+    fn ease_out_runs_zero_to_one_without_overshoot() {
+        assert!(ease_out(0.0).abs() < 1e-4);
+        assert!((ease_out(1.0) - 1.0).abs() < 1e-4);
+        assert!(ease_out(0.25) > 0.6, "front-loaded: {}", ease_out(0.25));
+        let v: Vec<f32> = (0..=50).map(|i| ease_out(i as f32 / 50.0)).collect();
+        assert!(v.windows(2).all(|p| p[1] >= p[0] && p[1] <= 1.0001));
     }
 
     #[test]

@@ -959,7 +959,8 @@ fn push_closed_tab(stack: &mut Vec<ClosedTab>, closed: ClosedTab) {
 /// modal yes/no overlay state; captures keys until resolved
 struct ConfirmState {
     prompt: String,
-    hint: String,
+    /// the default and cancel button labels
+    buttons: (&'static str, &'static str),
     action: ConfirmAction,
 }
 
@@ -5074,6 +5075,24 @@ impl App {
             && self.terminal_surface_uncovered()
     }
 
+    /// settle the open confirm or rename dialog: run or commit it on accept,
+    /// drop it otherwise
+    fn answer_dialog(&mut self, accept: bool, event_loop: &ActiveEventLoop) {
+        if let Some(c) = self.pw.confirm.take() {
+            if accept {
+                self.run_confirm(c.action, event_loop);
+            }
+        } else if let Some(rs) = self.pw.rename.take()
+            && accept
+        {
+            let name = rs.buf.trim().to_string();
+            if let Some(tab) = self.pw.tabs.get_mut(rs.tab) {
+                tab.title = (!name.is_empty()).then_some(name);
+            }
+            self.sync_tabs();
+        }
+    }
+
     fn terminal_surface_uncovered(&self) -> bool {
         !self.pw.settings_open
             && self.pw.pane_menu.is_none()
@@ -5877,7 +5896,7 @@ impl App {
             let lines = normalized.split('\r').filter(|l| !l.is_empty()).count();
             self.pw.confirm = Some(ConfirmState {
                 prompt: format!("paste {lines} lines into a program with no paste protection?"),
-                hint: "enter: paste \u{b7} esc: cancel".to_string(),
+                buttons: ("paste", "cancel"),
                 action: ConfirmAction::PasteBytes { pane: id, bytes },
             });
             self.redraw();
@@ -5975,7 +5994,7 @@ impl App {
         if tabs > 1 || panes > 1 {
             self.pw.confirm = Some(ConfirmState {
                 prompt: format!("quit with {panes} panes across {tabs} tabs?"),
-                hint: "enter: quit \u{b7} esc: cancel".to_string(),
+                buttons: ("quit", "cancel"),
                 action: ConfirmAction::Quit,
             });
             self.redraw();
@@ -6107,7 +6126,7 @@ impl App {
             r.set_market(market_view);
             r.set_confirm(self.pw.confirm.as_ref().map(|c| render::ConfirmView {
                 prompt: c.prompt.clone(),
-                hint: c.hint.clone(),
+                buttons: c.buttons,
             }));
             r.set_rename(self.pw.rename.as_ref().map(|rs| render::RenameView { buf: rs.buf.clone() }));
             r.set_settings(render::SettingsView {
@@ -6881,10 +6900,10 @@ impl App {
                         } else {
                             format!("open the termie {} release page?", u.version)
                         },
-                        hint: if cfg!(windows) {
-                            "enter: update \u{b7} esc: not now".to_string()
+                        buttons: if cfg!(windows) {
+                            ("update", "not now")
                         } else {
-                            "enter: open \u{b7} esc: not now".to_string()
+                            ("open", "not now")
                         },
                         action: ConfirmAction::InstallUpdate,
                     });
@@ -7394,7 +7413,7 @@ impl App {
         if panes > 1 {
             self.pw.confirm = Some(ConfirmState {
                 prompt: format!("close this tab? it has {panes} panes"),
-                hint: "enter: close \u{b7} esc: cancel".to_string(),
+                buttons: ("close", "cancel"),
                 action: ConfirmAction::CloseTab { tab: idx },
             });
             self.redraw();
@@ -7536,7 +7555,7 @@ impl App {
             let noun = if n == 1 { "tab" } else { "tabs" };
             self.pw.confirm = Some(ConfirmState {
                 prompt: format!("close {n} other {noun}?"),
-                hint: "enter: close \u{b7} esc: cancel".to_string(),
+                buttons: ("close", "cancel"),
                 action: ConfirmAction::CloseOthers { keep },
             });
             self.redraw();
@@ -8521,7 +8540,7 @@ impl App {
                     if panes > 1 {
                         self.pw.confirm = Some(ConfirmState {
                             prompt: format!("close this window's {panes} panes?"),
-                            hint: "enter: close \u{b7} esc: cancel".to_string(),
+                            buttons: ("close", "cancel"),
                             action: ConfirmAction::CloseWindow,
                         });
                         self.redraw();
@@ -9588,7 +9607,7 @@ impl App {
                     std::mem::swap(&mut self.pw, &mut self.satellites[idx]);
                     self.pw.confirm = Some(ConfirmState {
                         prompt: format!("close this window's {panes} panes?"),
-                        hint: "enter: close \u{b7} esc: cancel".to_string(),
+                        buttons: ("close", "cancel"),
                         action: ConfirmAction::CloseWindow,
                     });
                     self.redraw();
@@ -10451,6 +10470,14 @@ impl App {
     /// left/right/middle button press+release: context menu, tab close, selection,
     /// click-to-focus, divider/pane drag, link open, widget click, title-bar buttons
     fn on_mouse_input(&mut self, state: ElementState, button: MouseButton, event_loop: &ActiveEventLoop) {
+        if button == MouseButton::Left
+            && state == ElementState::Pressed
+            && let Some(accept) = self.pw.renderer.as_ref().and_then(|r| r.dialog_btn_at(self.pw.cursor.x as f32, self.pw.cursor.y as f32))
+        {
+            self.answer_dialog(accept, event_loop);
+            self.redraw();
+            return;
+        }
         if pointer_button_consumed(self.pointer_modal(), state, button) {
             return;
         }
@@ -11104,12 +11131,8 @@ impl App {
         // dismissal and no leakage to the pane underneath)
         if self.pw.confirm.is_some() {
             match logical {
-                Key::Named(NamedKey::Enter) => {
-                    if let Some(c) = self.pw.confirm.take() {
-                        self.run_confirm(c.action, event_loop);
-                    }
-                }
-                Key::Named(NamedKey::Escape) => self.pw.confirm = None,
+                Key::Named(NamedKey::Enter) => self.answer_dialog(true, event_loop),
+                Key::Named(NamedKey::Escape) => self.answer_dialog(false, event_loop),
                 _ => {}
             }
             self.redraw();
@@ -11119,16 +11142,8 @@ impl App {
         // cwd label), esc cancels, the rest edits the buffer
         if self.pw.rename.is_some() {
             match logical {
-                Key::Named(NamedKey::Enter) => {
-                    if let Some(rs) = self.pw.rename.take() {
-                        let name = rs.buf.trim().to_string();
-                        if let Some(tab) = self.pw.tabs.get_mut(rs.tab) {
-                            tab.title = (!name.is_empty()).then_some(name);
-                        }
-                        self.sync_tabs();
-                    }
-                }
-                Key::Named(NamedKey::Escape) => self.pw.rename = None,
+                Key::Named(NamedKey::Enter) => self.answer_dialog(true, event_loop),
+                Key::Named(NamedKey::Escape) => self.answer_dialog(false, event_loop),
                 Key::Named(NamedKey::Backspace) => {
                     if let Some(rs) = self.pw.rename.as_mut() {
                         rs.buf.pop();
@@ -11953,10 +11968,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else {
                                     format!("open the termie {} release page?", u.version)
                                 },
-                                hint: if install {
-                                    "enter: update \u{b7} esc: not now".to_string()
+                                buttons: if install {
+                                    ("update", "not now")
                                 } else {
-                                    "enter: open \u{b7} esc: not now".to_string()
+                                    ("open", "not now")
                                 },
                                 action: ConfirmAction::InstallUpdate,
                             });

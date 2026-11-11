@@ -13,6 +13,10 @@ pub enum FontId {
     Chrome,
     /// status bar and secondary chrome text, one point under Chrome
     Small,
+    /// proportional sans for menus, settings, dialogs and buttons
+    Label,
+    /// the sans at the small chrome size: captions, hints, section heads
+    LabelSmall,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,8 +49,22 @@ pub struct FontMetrics {
     pub px: f32,
     line_height: f32,
     family: &'static str,
-    /// base weight regular text shapes at; bold text takes at least 700
+    /// base weight regular text shapes at
     weight: Weight,
+    /// weight bold text shapes at: at least 700 for the monos, medium for the sans
+    bold: Weight,
+}
+
+/// chars whose advances are measured up front for a proportional font: printable
+/// ascii, then the ellipsis and middle dot the chrome truncates and separates with
+const ADVANCE_EXTRA: [char; 2] = ['\u{2026}', '\u{b7}'];
+const ADVANCE_N: usize = 95 + ADVANCE_EXTRA.len();
+
+fn advance_slot(c: char) -> Option<usize> {
+    match c {
+        ' '..='~' => Some(c as usize - 32),
+        _ => ADVANCE_EXTRA.iter().position(|&e| e == c).map(|i| 95 + i),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +110,10 @@ pub struct GlyphAtlas {
     content: FontMetrics,
     chrome: FontMetrics,
     small: FontMetrics,
+    label: FontMetrics,
+    label_small: FontMetrics,
+    /// pen advances for [label, label_small], indexed by advance_slot
+    advances: [[f32; ADVANCE_N]; 2],
     /// the bundled default content family, used when no override is present
     default_family: &'static str,
 
@@ -142,7 +164,7 @@ impl GlyphAtlas {
         let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
 
         // load bundled fonts; fall back to generic monospace if unavailable
-        let (maple, chrome_family) = load_bundled_fonts(&mut font_system);
+        let (maple, chrome_family, sans) = load_bundled_fonts(&mut font_system);
         // content uses the chosen family when present, else the bundled default
         let content_family = match content_override {
             Some(name) if family_present(&font_system, name) => name,
@@ -152,9 +174,7 @@ impl GlyphAtlas {
         let swash = SwashCache::new();
 
         let content_px = (content_pt * scale).round().max(6.0);
-        let chrome_px = (chrome_pt * scale).round().max(6.0);
         let content_lh = (content_px * line_height.clamp(0.8, 3.0)).round();
-        let chrome_lh = (chrome_px * 1.4).round();
 
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(content_px, content_lh));
         buffer.set_size(None, None);
@@ -171,17 +191,13 @@ impl GlyphAtlas {
                 line_height: content_lh,
                 family: content_family,
                 weight: Weight::NORMAL,
+                bold: Weight::BOLD,
             },
-            chrome: FontMetrics {
-                cell_w: chrome_px * 0.5,
-                cell_h: chrome_lh,
-                ascent: chrome_px,
-                px: chrome_px,
-                line_height: chrome_lh,
-                family: chrome_family,
-                weight: Weight::NORMAL,
-            },
-            small: small_metrics(chrome_pt, scale, chrome_family),
+            chrome: sized_metrics(chrome_pt, scale, chrome_family, false),
+            small: sized_metrics(chrome_pt - 1.0, scale, chrome_family, false),
+            label: sized_metrics(chrome_pt + 1.0, scale, sans, true),
+            label_small: sized_metrics(chrome_pt - 1.0, scale, sans, true),
+            advances: [[0.0; ADVANCE_N]; 2],
             default_family: maple,
             data: vec![0u8; 0],
             dim: 1024,
@@ -203,9 +219,7 @@ impl GlyphAtlas {
         atlas.data = vec![0u8; (atlas.dim * atlas.dim) as usize];
         atlas.color_data = vec![0u8; (atlas.dim * atlas.dim * 4) as usize];
 
-        atlas.content = atlas.measure(atlas.content);
-        atlas.chrome = atlas.measure(atlas.chrome);
-        atlas.small = atlas.measure(atlas.small);
+        atlas.measure_all();
         atlas
     }
 
@@ -220,6 +234,23 @@ impl GlyphAtlas {
             FontId::Content => self.content,
             FontId::Chrome => self.chrome,
             FontId::Small => self.small,
+            FontId::Label => self.label,
+            FontId::LabelSmall => self.label_small,
+        }
+    }
+
+    /// horizontal pen advance for one char of chrome text: the cell pitch for
+    /// the monos, the shaped advance for the sans. chars outside the measured
+    /// table approximate by their grid width
+    pub fn advance(&self, font: FontId, c: char) -> f32 {
+        let table = match font {
+            FontId::Label => &self.advances[0],
+            FontId::LabelSmall => &self.advances[1],
+            _ => return self.metrics(font).cell_w,
+        };
+        match advance_slot(c) {
+            Some(i) => table[i],
+            None => self.metrics(font).px * if crate::grid::char_width(c) == 2 { 1.0 } else { 0.6 },
         }
     }
 
@@ -352,13 +383,12 @@ impl GlyphAtlas {
     /// existing FontSystem (avoids re-scanning all system fonts on every change)
     pub fn reconfigure(&mut self, content_pt: f32, chrome_pt: f32, scale: f32, content_override: Option<&'static str>, line_height: f32, content_weight: u16) {
         let content_px = (content_pt * scale).round().max(6.0);
-        let chrome_px = (chrome_pt * scale).round().max(6.0);
         let content_lh = (content_px * line_height.clamp(0.8, 3.0)).round();
-        let chrome_lh = (chrome_px * 1.4).round();
         let content_family = match content_override {
             Some(name) if family_present(&self.font_system, name) => name,
             _ => self.default_family,
         };
+        let weight = Weight(content_weight.clamp(100, 900));
         self.content = FontMetrics {
             cell_w: content_px * 0.5,
             cell_h: content_lh,
@@ -366,21 +396,14 @@ impl GlyphAtlas {
             px: content_px,
             line_height: content_lh,
             family: content_family,
-            weight: Weight(content_weight.clamp(100, 900)),
+            weight,
+            bold: bolded(weight),
         };
-        self.chrome = FontMetrics {
-            cell_w: chrome_px * 0.5,
-            cell_h: chrome_lh,
-            ascent: chrome_px,
-            px: chrome_px,
-            line_height: chrome_lh,
-            family: self.chrome.family,
-            weight: self.chrome.weight,
-        };
-        self.small = small_metrics(chrome_pt, scale, self.chrome.family);
-        self.content = self.measure(self.content);
-        self.chrome = self.measure(self.chrome);
-        self.small = self.measure(self.small);
+        self.chrome = sized_metrics(chrome_pt, scale, self.chrome.family, false);
+        self.small = sized_metrics(chrome_pt - 1.0, scale, self.chrome.family, false);
+        self.label = sized_metrics(chrome_pt + 1.0, scale, self.label.family, true);
+        self.label_small = sized_metrics(chrome_pt - 1.0, scale, self.label.family, true);
+        self.measure_all();
         // discard the old rasterized glyphs and repack from scratch (same dim)
         self.repack_at(self.dim);
     }
@@ -408,6 +431,33 @@ impl GlyphAtlas {
         self.dirty_y = None;
         self.color_dirty = true;
         self.color_dirty_y = None;
+    }
+
+    fn measure_all(&mut self) {
+        self.content = self.measure(self.content);
+        self.chrome = self.measure(self.chrome);
+        self.small = self.measure(self.small);
+        self.label = self.measure(self.label);
+        self.label_small = self.measure(self.label_small);
+        self.advances = [self.measure_advances(self.label), self.measure_advances(self.label_small)];
+    }
+
+    /// shape the advance table one char at a time; kerning is dropped, which
+    /// keeps text_w a plain sum that always agrees with draw_text
+    fn measure_advances(&mut self, m: FontMetrics) -> [f32; ADVANCE_N] {
+        self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
+        let attrs = Attrs::new().family(Family::Name(m.family)).weight(m.weight);
+        let mut table = [m.px * 0.5; ADVANCE_N];
+        let mut s = [0u8; 4];
+        for c in (' '..='~').chain(ADVANCE_EXTRA) {
+            let Some(i) = advance_slot(c) else { continue };
+            self.buffer.set_text(c.encode_utf8(&mut s), &attrs, Shaping::Advanced, None);
+            self.buffer.shape_until_scroll(&mut self.font_system, false);
+            if let Some(g) = self.buffer.layout_runs().next().and_then(|run| run.glyphs.first()) {
+                table[i] = g.w;
+            }
+        }
+        table
     }
 
     fn measure(&mut self, mut m: FontMetrics) -> FontMetrics {
@@ -515,7 +565,8 @@ impl GlyphAtlas {
         self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
         let mut s = [0u8; 4];
         let text = key.c.encode_utf8(&mut s);
-        let mut shaped = match self.shape_char_image(text, m.family, m.weight, key.bold, key.italic) {
+        let weight = if key.bold { m.bold } else { m.weight };
+        let mut shaped = match self.shape_char_image(text, m.family, weight, key.italic) {
             Some(i) => i,
             None => return RasterOutcome::Empty,
         };
@@ -527,7 +578,7 @@ impl GlyphAtlas {
         if key.font == FontId::Content && crate::grid::emoji_vs_base(key.c) {
             if shaped.4
                 && let Some(mono) =
-                    self.shape_char_image(text, "Segoe UI Symbol", m.weight, key.bold, key.italic)
+                    self.shape_char_image(text, "Segoe UI Symbol", weight, key.italic)
                 && !mono.4
             {
                 shaped = mono;
@@ -541,7 +592,7 @@ impl GlyphAtlas {
                 let family = if shaped.4 { m.family } else { "Segoe UI Symbol" };
                 let px = m.px * max_w / shaped.0 as f32;
                 self.buffer.set_metrics(Metrics::new(px, m.line_height));
-                if let Some(small) = self.shape_char_image(text, family, m.weight, key.bold, key.italic) {
+                if let Some(small) = self.shape_char_image(text, family, weight, key.italic) {
                     shaped = small;
                 }
                 self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
@@ -596,13 +647,10 @@ impl GlyphAtlas {
         &mut self,
         text: &str,
         family: &str,
-        base: Weight,
-        bold: bool,
+        weight: Weight,
         italic: bool,
     ) -> Option<(u32, u32, i32, i32, bool, Vec<u8>)> {
-        let mut attrs = Attrs::new()
-            .family(Family::Name(family))
-            .weight(if bold { bolded(base) } else { base });
+        let mut attrs = Attrs::new().family(Family::Name(family)).weight(weight);
         if italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -732,7 +780,7 @@ impl GlyphAtlas {
         let baseline = m.ascent.round() as i32;
         let mut attrs = Attrs::new()
             .family(Family::Name(m.family))
-            .weight(if bold { bolded(m.weight) } else { m.weight });
+            .weight(if bold { m.bold } else { m.weight });
         if italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -840,7 +888,7 @@ impl GlyphAtlas {
         let family = if emoji_seq { "Segoe UI Emoji" } else { m.family };
         let mut attrs = Attrs::new()
             .family(Family::Name(family))
-            .weight(if bold { bolded(m.weight) } else { m.weight });
+            .weight(if bold { m.bold } else { m.weight });
         if italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -1137,20 +1185,20 @@ enum ImagePack {
     NoSpace,
 }
 
-/// load Iosevka (content) + Departure Mono (chrome) from the assets dir.
-/// returns the family names to use (falling back to "monospace" if missing).
-fn load_bundled_fonts(fs: &mut FontSystem) -> (&'static str, &'static str) {
+/// load Maple Mono (content and chrome values) and Source Sans 3 (chrome
+/// labels) from the assets dir. returns (content, chrome, label) family names;
+/// a missing mono falls back to "monospace" and a missing sans to the mono
+fn load_bundled_fonts(fs: &mut FontSystem) -> (&'static str, &'static str, &'static str) {
     let dir = match assets_font_dir() {
         Some(d) => d,
         None => {
             log::warn!("assets/fonts not found; using system monospace");
-            return ("monospace", "monospace");
+            return ("monospace", "monospace", "monospace");
         }
     };
 
     let db = fs.db_mut();
-    // one mono throughout (capscr is strictly mono-only); chrome differs by size only.
-    // load every Maple* face so this survives the exact NF filenames.
+    // every Maple* face loads so this survives the exact NF filenames
     let mut loaded = false;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -1161,7 +1209,7 @@ fn load_bundled_fonts(fs: &mut FontSystem) -> (&'static str, &'static str) {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             let is_font = name.ends_with(".ttf") || name.ends_with(".otf");
-            if is_font && name.contains("maple") {
+            if is_font && (name.contains("maple") || name.contains("sourcesans")) {
                 match db.load_font_file(&path) {
                     Ok(()) => loaded = true,
                     Err(e) => log::warn!("failed to load font {}: {e}", path.display()),
@@ -1189,11 +1237,20 @@ fn load_bundled_fonts(fs: &mut FontSystem) -> (&'static str, &'static str) {
         log::warn!("no Maple font files found; using system monospace");
         "monospace"
     };
-    (family, family)
+    let sans_name = "Source Sans 3";
+    let sans = if family_present(fs, sans_name) {
+        sans_name
+    } else {
+        log::warn!("Source Sans 3 not found; chrome labels use {family}");
+        family
+    };
+    (family, family, sans)
 }
 
-fn small_metrics(chrome_pt: f32, scale: f32, family: &'static str) -> FontMetrics {
-    let px = ((chrome_pt - 1.0) * scale).round().max(6.0);
+/// chrome text metrics at `pt`, before measure() fills in the real ascent and pitch.
+/// the sans bolds to medium: its 700 is too heavy at chrome sizes
+fn sized_metrics(pt: f32, scale: f32, family: &'static str, sans: bool) -> FontMetrics {
+    let px = (pt * scale).round().max(6.0);
     let lh = (px * 1.4).round();
     FontMetrics {
         cell_w: px * 0.5,
@@ -1203,6 +1260,7 @@ fn small_metrics(chrome_pt: f32, scale: f32, family: &'static str) -> FontMetric
         line_height: lh,
         family,
         weight: Weight::NORMAL,
+        bold: if sans { Weight::MEDIUM } else { Weight::BOLD },
     }
 }
 

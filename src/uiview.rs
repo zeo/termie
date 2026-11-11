@@ -193,7 +193,7 @@ pub fn capture(
         "confirm" => {
             r.set_confirm(Some(ConfirmView {
                 prompt: "close tab with 2 panes?".into(),
-                hint: "enter confirm   esc cancel".into(),
+                buttons: ("close", "cancel"),
             }));
             r.settle_overlay();
         }

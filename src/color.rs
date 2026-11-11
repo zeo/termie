@@ -36,6 +36,13 @@ fn luminance(c: Rgb) -> f32 {
     0.2126 * t[c.r as usize] + 0.7152 * t[c.g as usize] + 0.0722 * t[c.b as usize]
 }
 
+/// WCAG contrast ratio between two colors, 1..21
+pub fn contrast(a: Rgb, b: Rgb) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// linear light back to an srgb-encoded channel in [0,1]
 fn lin_to_srgb(l: f32) -> f32 {
     if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
@@ -644,11 +651,7 @@ fn fill_ansi(base16: [Rgb; 16]) -> [Rgb; 256] {
 mod tests {
     use super::*;
 
-    fn ratio(a: Rgb, b: Rgb) -> f32 {
-        let (la, lb) = (luminance(a), luminance(b));
-        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-        (hi + 0.05) / (lo + 0.05)
-    }
+    use super::contrast as ratio;
 
     #[test]
     fn min_contrast_lifts_failing_pairs_to_the_ratio() {

@@ -252,7 +252,8 @@ pub struct FindView {
 /// until the user presses enter (confirm) or esc (cancel)
 pub struct ConfirmView {
     pub prompt: String,
-    pub hint: String,
+    /// the default and cancel button labels
+    pub buttons: (&'static str, &'static str),
 }
 
 /// the tab-rename text field overlay
@@ -555,26 +556,16 @@ pub(crate) struct A11yChromeLayout {
 /// an overlay opening: fade everything in, and grow the surfaces from 98% about
 /// their shared center (full-width scrims and pages only fade, and reduced
 /// motion keeps just the fade)
-fn bloom(range: &mut [Instance], p: f32, window_w: f32) {
-    let full = |i: &Instance| i.size[0] >= window_w;
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for i in range.iter().filter(|i| !full(i)) {
-        x0 = x0.min(i.pos[0]);
-        y0 = y0.min(i.pos[1]);
-        x1 = x1.max(i.pos[0] + i.size[0]);
-        y1 = y1.max(i.pos[1] + i.size[1]);
-    }
-    let k = if motion::reduced() || x0 > x1 { 1.0 } else { 0.98 + 0.02 * p };
-    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+fn bloom(range: &mut [Instance], p: f32, window_w: f32, rise: f32) {
+    let dy = if motion::reduced() { 0.0 } else { (rise * (1.0 - p)).round() };
     for i in range.iter_mut() {
         i.color[3] *= p;
-        if k < 1.0 && !full(i) {
-            i.pos = [cx + (i.pos[0] - cx) * k, cy + (i.pos[1] - cy) * k];
-            i.size = [i.size[0] * k, i.size[1] * k];
-            if i.kind == 4 {
-                i.uv_max = i.size;
-                i.shape = [i.shape[0] * k, i.shape[1] * k, i.shape[2] * k];
-            }
+        // a gradient carries its bottom alpha in uv_max
+        if i.kind == 5 {
+            i.uv_max[1] *= p;
+        }
+        if i.size[0] < window_w {
+            i.pos[1] += dy;
         }
     }
 }
@@ -935,9 +926,6 @@ pub struct Renderer {
     /// user color overrides loaded from disk, applied on top of the theme
     color_overrides: Vec<(String, Rgb)>,
     broadcast: bool,
-    /// cached background gradient quads, rebuilt only on size/theme change
-    gradient_cache: Vec<Instance>,
-    gradient_key: (u32, u32, ThemeId),
     pane_mode: bool,
     pane_drop: Option<((f32, f32, f32, f32), PaneDropSide)>,
     tab_drop: Option<usize>,
@@ -975,6 +963,8 @@ pub struct Renderer {
     palette_geom: Option<(Rect, f32, usize, usize)>,
     /// find-bar button rects, refreshed each build: (prev, next, close)
     find_btns: Option<(Rect, Rect, Rect, Rect)>,
+    /// the open dialog's (cancel, default) buttons
+    dialog_btns: Option<(Rect, Rect)>,
     pane_menu_view: Option<PaneMenuView>,
     find_view: Option<FindView>,
     market_view: Option<MarketView>,
@@ -1623,8 +1613,6 @@ impl Renderer {
             theme: ThemeId::Instrument,
             color_overrides: Vec::new(),
             broadcast: false,
-            gradient_cache: Vec::new(),
-            gradient_key: (0, 0, ThemeId::Instrument),
             scale,
             pad,
             content_pt,
@@ -1688,6 +1676,7 @@ impl Renderer {
             palette_view: None,
             palette_geom: None,
             find_btns: None,
+            dialog_btns: None,
             pane_menu_view: None,
             find_view: None,
             market_view: None,
@@ -2009,10 +1998,7 @@ impl Renderer {
         self.palette = self.themed_palette();
         // per-profile palettes bake the overrides in too — rebuild on demand
         self.pane_palettes.clear();
-        // overrides can arrive live (conf watcher), not just at boot: drop the
-        // cached bg wash too — its (size, theme) key can't see a bg override
         self.atlas.dirty = true;
-        self.gradient_cache.clear();
     }
 
     pub fn set_theme(&mut self, id: ThemeId) {
@@ -2488,8 +2474,7 @@ impl Renderer {
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let row_h = chrome_h + t(tokens::SPACE_M);
         let pad = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
-        let track = self.track_for(FontId::Chrome);
-        let widest = items.iter().map(|i| self.text_w(FontId::Chrome, i, track)).fold(0.0, f32::max);
+        let widest = items.iter().map(|i| self.text_w(FontId::Label, i, 0.0)).fold(0.0, f32::max);
         let swatch = if swatches { t(tokens::SPACE_M) + t(tokens::SPACE_S) } else { 0.0 };
         let w = self.config.width as f32;
         let h = self.config.height as f32;
@@ -2555,9 +2540,32 @@ impl Renderer {
         ]
     }
 
-    /// chrome text tracking for a font: a hair of air between monospace cells
+    /// a title-bar stop nudged toward the theme's own surface hue, so the
+    /// graphite sits in the theme instead of over it. light themes stay neutral
+    fn nav_tint(&self, c: [u8; 3]) -> Rgb {
+        let p = &self.palette;
+        if self.light() {
+            return Rgb::from_triple(c);
+        }
+        let s = p.ink4;
+        let avg = (s.r as i16 + s.g as i16 + s.b as i16) / 3;
+        let nudge = |v: u8, ch: u8| (v as i16 + (ch as i16 - avg) * 3 / 4).clamp(0, 255) as u8;
+        Rgb::new(nudge(c[0], s.r), nudge(c[1], s.g), nudge(c[2], s.b))
+    }
+
+    /// the engraved shadow under text on a gloss surface: one pixel above, dark
+    #[allow(clippy::too_many_arguments)]
+    fn engrave(atlas: &mut GlyphAtlas, out: &mut Vec<Instance>, font: FontId, x: f32, y_top: f32, text: &str, hair: f32, track: f32) {
+        let _ = Self::draw_text(atlas, out, font, x, y_top - hair, text, Rgb::new(0, 0, 0), 0.6, track);
+    }
+
+    /// chrome text tracking for a font: a hair of air between monospace
+    /// cells; the sans is spaced by its own advances
     fn track_for(&self, font: FontId) -> f32 {
-        (0.04 * self.atlas.metrics(font).cell_w).max(0.5)
+        match font {
+            FontId::Label | FontId::LabelSmall => 0.0,
+            _ => (0.04 * self.atlas.metrics(font).cell_w).max(0.5),
+        }
     }
 
     /// wide tracking for small-caps key labels (status bar keys, section heads)
@@ -3141,20 +3149,84 @@ impl Renderer {
         });
     }
 
-    /// banded vertical gradient from `top` (at y) to `bottom` (at y+h)
-    // a flat geometry helper; bundling the rect+colors into a struct would only
-    // obscure the call sites
+    /// vertical gradient inside a rounded rect: `top` at band.0 easing to
+    /// `bottom` at band.1, in rows local to the rect, and only those rows are
+    /// covered. a (0, 0) band spans the whole height
     #[allow(clippy::too_many_arguments)]
-    fn push_vgradient(out: &mut Vec<Instance>, x: f32, y: f32, w: f32, h: f32, top: Rgb, bottom: Rgb, bands: usize) {
-        let n = bands.max(1);
-        let band_h = h / n as f32;
-        let lerp = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-        for i in 0..n {
-            let t = (i as f32 + 0.5) / n as f32;
-            let c = Rgb::new(lerp(top.r, bottom.r, t), lerp(top.g, bottom.g, t), lerp(top.b, bottom.b, t));
-            // overlap by 1px so seams never show
-            Self::push_rect(out, x, (y + i as f32 * band_h).floor(), w, band_h.ceil() + 1.0, c, 1.0);
+    fn push_grad(out: &mut Vec<Instance>, rect: Rect, r: f32, band: (f32, f32), top: Rgb, ta: f32, bottom: Rgb, ba: f32) {
+        let (x, y, w, h) = rect;
+        let t = top.to_linear_f32();
+        let b = bottom.to_linear_f32();
+        out.push(Instance {
+            pos: [x, y],
+            size: [w, h],
+            uv_min: [b[0], b[1]],
+            uv_max: [b[2], ba],
+            color: [t[0], t[1], t[2], ta],
+            kind: 5,
+            shape: [r, band.0, band.1],
+        });
+    }
+
+    /// a gel: four stops split at the 49/50 seam, the aqua look's signature
+    fn push_gel(out: &mut Vec<Instance>, rect: Rect, r: f32, c: [Rgb; 4], alpha: f32) {
+        let seam = (rect.3 * 0.5).round();
+        Self::push_grad(out, rect, r, (0.0, seam), c[0], alpha, c[1], alpha);
+        Self::push_grad(out, rect, r, (seam, rect.3), c[2], alpha, c[3], alpha);
+    }
+
+    /// a gel button face: the split body, a lit top edge, the soft gloss over
+    /// the upper half and a dark outline. `pressed` sinks it into the surface
+    fn push_button(out: &mut Vec<Instance>, rect: Rect, r: f32, hair: f32, default: bool, pressed: bool, alpha: f32) {
+        use crate::instrument as i;
+        let stops = match (default, pressed) {
+            (true, false) => i::AQUA_GEL,
+            (true, true) => i::AQUA_PRESSED,
+            (false, false) => i::GRAPHITE_GEL,
+            (false, true) => i::GRAPHITE_PRESSED,
+        };
+        let edge = Rgb::from_triple(if default { i::AQUA_EDGE } else { i::GEL_EDGE });
+        let white = Rgb::new(255, 255, 255);
+        Self::push_gel(out, rect, r, stops.map(Rgb::from_triple), alpha);
+        if pressed {
+            Self::push_grad(out, rect, r, (0.0, (hair * 3.0).round()), Rgb::new(0, 0, 0), 0.55 * alpha, Rgb::new(0, 0, 0), 0.0);
+        } else {
+            let lift = if default { 0.32 } else { 0.2 };
+            Self::push_grad(out, rect, r, (0.0, (rect.3 * 0.52).round()), white, lift * alpha, white, 0.04 * alpha);
+            let lip = if default { 0.55 } else { 0.22 };
+            Self::push_grad(out, rect, r, (hair, hair * 2.0), white, lip * alpha, white, lip * alpha);
         }
+        Self::push_ring(out, rect, r, hair, edge, alpha);
+    }
+
+    /// an inset field: a dark well with a shadowed top edge and a lit bottom
+    /// lip; focus swaps the outline for aqua and adds a soft glow
+    /// returns the ink for text typed into it. light themes get a white well
+    fn push_well(&self, out: &mut Vec<Instance>, rect: Rect, r: f32, focused: bool) -> Rgb {
+        use crate::instrument as i;
+        let hair = self.scale.max(1.0);
+        let black = Rgb::new(0, 0, 0);
+        let light = self.light();
+        if focused {
+            let g = hair * 3.0;
+            let glow = (rect.0 - g, rect.1 - g, rect.2 + g * 2.0, rect.3 + g * 2.0);
+            Self::push_ring(out, glow, r + g, g, Rgb::new(75, 135, 225), 0.45);
+        }
+        let (lip, edge, fill, shade) = if light {
+            (Rgb::new(255, 255, 255), Rgb::new(0x8c, 0x8c, 0x8c), Rgb::new(255, 255, 255), 0.18)
+        } else {
+            (Rgb::new(0x3a, 0x3a, 0x3a), black, Rgb::from_triple(i::WELL), 0.8)
+        };
+        Self::push_shape(out, rect, [r, 0.0, 0.0], lip, 1.0);
+        let face = (rect.0, rect.1, rect.2, rect.3 - hair);
+        Self::push_shape(out, face, [r, 0.0, 0.0], edge, 1.0);
+        let inner = (rect.0 + hair, rect.1 + hair, rect.2 - hair * 2.0, rect.3 - hair * 2.0);
+        Self::push_shape(out, inner, [(r - hair).max(0.0), 0.0, 0.0], fill, 1.0);
+        Self::push_grad(out, inner, (r - hair).max(0.0), (0.0, (hair * 2.0).round()), black, shade, black, 0.0);
+        if focused {
+            Self::push_ring(out, rect, r, hair, Rgb::from_triple(i::AQUA), 1.0);
+        }
+        if light { Rgb::new(0x1c, 0x1c, 0x1c) } else { Rgb::from_triple(i::TEXT2) }
     }
 
     /// 1px outline around a rect
@@ -3938,7 +4010,7 @@ impl Renderer {
         }
     }
 
-    /// lay out a monospace string at a pixel baseline with optional tracking;
+    /// lay out a chrome string at a pixel baseline with optional tracking;
     /// returns the pen end-x
     // a low-level text helper called ~50 times; a params struct would add noise
     // at every call site without making any of them clearer
@@ -3956,6 +4028,7 @@ impl Renderer {
     ) -> f32 {
         let m = atlas.metrics(font);
         let lin = rgb.to_linear_f32();
+        let sans = matches!(font, FontId::Label | FontId::LabelSmall);
         for c in text.chars() {
             if c != ' '
                 && let Some(g) = atlas.get(GlyphKey {
@@ -3964,8 +4037,11 @@ impl Renderer {
                     bold: false,
                     italic: false,
                 }) {
+                    // the sans pen runs fractional; snapping each glyph keeps
+                    // its stems on whole pixels so small text stays crisp
+                    let gx = if sans { (x + g.left).round() } else { x + g.left };
                     out.push(Instance {
-                        pos: [x + g.left, y_top + m.ascent - g.top],
+                        pos: [gx, y_top + m.ascent - g.top],
                         size: [g.width, g.height],
                         uv_min: g.uv_min,
                         uv_max: g.uv_max,
@@ -3974,15 +4050,28 @@ impl Renderer {
                         shape: [0.0; 3],
                     });
                 }
-            x += m.cell_w + track;
+            x += atlas.advance(font, c) + track;
         }
         x
     }
 
-    /// pixel width of a tracked monospace string in the given font
+    /// pixel width of a tracked chrome string in the given font
     fn text_w(&self, font: FontId, text: &str, track: f32) -> f32 {
-        let m = self.atlas.metrics(font);
-        text.chars().count() as f32 * (m.cell_w + track)
+        text.chars().map(|c| self.atlas.advance(font, c) + track).sum()
+    }
+
+    /// `text` cut with a trailing ellipsis so it fits `room` px in `font`
+    fn fit_tail(&self, font: FontId, text: &str, room: f32, track: f32) -> String {
+        if self.text_w(font, text, track) <= room {
+            return text.to_string();
+        }
+        let mut used = self.atlas.advance(font, '\u{2026}') + track;
+        let mut cut: String = text.chars().take_while(|&c| {
+            used += self.atlas.advance(font, c) + track;
+            used <= room
+        }).collect();
+        cut.push('\u{2026}');
+        cut
     }
 
     #[allow(non_snake_case)]
@@ -3991,13 +4080,11 @@ impl Renderer {
         // chrome colors come from the active theme's palette
         let INK_0 = self.palette.ink0;
         let INK_3 = self.palette.ink3;
-        let INK_4 = self.palette.ink4;
         let RULE = self.palette.rule;
         let RULE_2 = self.palette.rule2;
         let MUTE = self.palette.mute;
         let TEXT_2 = self.palette.text2;
         let PAPER = self.palette.paper;
-        let BG = self.palette.bg;
         let QUIET = self.quiet(self.palette.ink0);
 
         let pad = self.pad;
@@ -4018,15 +4105,8 @@ impl Renderer {
         out.clear();
         out.reserve(self.cols * self.rows + 256);
 
-        // subtle per-theme vertical wash behind everything (bg → bg2); cached and
-        // rebuilt only when the size or theme changes (not every frame)
-        let grad_key = (self.config.width, self.config.height, self.theme);
-        if self.gradient_key != grad_key || self.gradient_cache.is_empty() {
-            self.gradient_cache.clear();
-            Self::push_vgradient(&mut self.gradient_cache, 0.0, 0.0, w, h, self.palette.bg, self.palette.bg2, 48);
-            self.gradient_key = grad_key;
-        }
-        out.extend_from_slice(&self.gradient_cache);
+        // subtle per-theme vertical wash behind everything (bg to bg2)
+        Self::push_grad(&mut out, (0.0, 0.0, w, h), 0.0, (0.0, 0.0), self.palette.bg, 1.0, self.palette.bg2, 1.0);
 
         // background image over the wash, under everything else: scaled to
         // cover the window and centered, the viewport cropping the overflow
@@ -4239,20 +4319,29 @@ impl Renderer {
         let icon = t(tokens::ICON);
         let stroke = hair;
 
-        // ---- title bar (flat opaque instrument) ----
-        // fill the bar with the content background, not a darker ink, so the bar
-        // never reads as a dark band above the content (the two-tone trim
-        // still divides chrome from content)
-        Self::push_rect(&mut out, 0.0, 0.0, w, tbh, BG, 1.0);
-        // two-tone trim under the bar: a brighter seam over a darker shadow line
-        // reads as a machined edge between chrome and content (instrument depth)
-        Self::push_rect(&mut out, 0.0, tbh - hair * 2.0, w, hair, RULE_2, 1.0);
-        Self::push_rect(&mut out, 0.0, tbh - hair, w, hair, RULE, 1.0);
+        // ---- title bar: graphite gloss in every theme ----
+        let nav = crate::instrument::NAV.map(|c| self.nav_tint(c));
+        let bar = (0.0, 0.0, w, tbh);
+        let lip = (hair * 2.0).round();
+        let seam = (tbh * 0.5).round();
+        let foot = (tbh * 0.92).round();
+        Self::push_grad(&mut out, bar, 0.0, (0.0, lip), nav[0], 1.0, nav[1], 1.0);
+        Self::push_grad(&mut out, bar, 0.0, (lip, seam), nav[1], 1.0, nav[2], 1.0);
+        Self::push_grad(&mut out, bar, 0.0, (seam, foot), nav[3], 1.0, nav[4], 1.0);
+        Self::push_grad(&mut out, bar, 0.0, (foot, tbh), nav[4], 1.0, nav[5], 1.0);
+        Self::push_rect(&mut out, 0.0, tbh - hair, w, hair, Rgb::new(5, 5, 5), 1.0);
+        let WHITE = Rgb::new(255, 255, 255);
+        let BAR_TEXT = Rgb::from_triple(crate::instrument::NAV_TEXT);
+        let BAR_MUTE = Rgb::from_triple(crate::instrument::NAV_MUTE);
+        // the brightest stop behind the text, so contrast holds over the whole bar
+        let BAR_BG = nav[2];
+        // the spring rail keeps the theme accent unless it vanishes on graphite
+        let RAIL = if crate::color::contrast(PAPER, BAR_BG) >= 3.0 { PAPER } else { BAR_TEXT };
 
         let wa = self.hover_a(Hot::WindowTabs);
         if wa > 0.0 {
             let (x, _, width, _) = self.window_tabs_rect();
-            Self::push_rect(&mut out, x, 0.0, width, tbh - hair * 2.0, INK_3, wa);
+            Self::push_rect(&mut out, x, 0.0, width, tbh - hair, WHITE, 0.08 * wa);
         }
 
         // app-icon badge (the ">_<" mark) + wordmark
@@ -4260,7 +4349,8 @@ impl Renderer {
         let badge_y = ((tbh - badge) / 2.0).round();
         Self::push_icon(&mut out, pad, badge_y, badge, 1.0);
         let wx = pad + badge + t(tokens::SPACE_S);
-        let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", TEXT_2, 1.0, track);
+        Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", hair, track);
+        let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, wx, text_top, "termie", BAR_TEXT, 1.0, track);
 
         // tabs: snapshot to owned data so the atlas can be borrowed mutably
         let tl = self.tab_layout();
@@ -4291,9 +4381,15 @@ impl Renderer {
         for (i, rect, close, label, active, ha, close_ha, attn, tint) in &tab_items {
             let (tx, _ty, tw, _th) = *rect;
             if *active {
-                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, INK_4, 1.0);
+                // the active tab sits pressed into the bar
+                let slot = (tx, bar_y, tw, bar_h);
+                Self::push_gel(&mut out, slot, 0.0, crate::instrument::NAV_ACTIVE.map(|c| self.nav_tint(c)), 1.0);
+                let black = Rgb::new(0, 0, 0);
+                Self::push_grad(&mut out, slot, 0.0, (0.0, (hair * 3.0).round()), black, 0.65, black, 0.0);
+                Self::push_rect(&mut out, tx, bar_y, hair, bar_h, black, 0.5);
+                Self::push_rect(&mut out, tx + tw - hair, bar_y, hair, bar_h, black, 0.5);
             } else if *ha > 0.0 {
-                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, INK_3, *ha);
+                Self::push_rect(&mut out, tx, bar_y, tw, bar_h, WHITE, 0.06 * ha);
             }
             // a user-picked tab color washes over the base fill, stronger on
             // the active tab so the tint reads without drowning the label
@@ -4309,6 +4405,7 @@ impl Renderer {
             let label_x = tx + t(tokens::TAB_INSET);
             let label_end = if close.2 > 0.0 { close.0 - t(tokens::SPACE_XS) } else { tx + tw - t(tokens::SPACE_S) };
             let maxc = ((label_end - label_x).max(0.0) / cw_c).floor() as usize;
+            let label_bg = if *active { nav[3] } else { BAR_BG };
             // borrow the already-owned snapshot label; only allocate when the
             // label actually needs truncating (the common case fits as-is)
             let truncated;
@@ -4323,11 +4420,12 @@ impl Renderer {
                 label
             };
             let lc = if *active {
-                TEXT_2
+                WHITE
             } else {
-                let mix = BG.lerp(TEXT_2, tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha);
-                crate::color::apply_min_contrast(mix, BG, tokens::TEXT_CONTRAST)
+                let mix = label_bg.lerp(BAR_TEXT, tokens::SECONDARY + (0.85 - tokens::SECONDARY) * ha);
+                crate::color::apply_min_contrast(mix, label_bg, tokens::TEXT_CONTRAST)
             };
+            Self::engrave(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, hair, track);
             let _ = Self::draw_text(&mut self.atlas, &mut out, FontId::Chrome, label_x, text_top, lab, lc, 1.0, track);
 
             let signal = if *active { None } else { self.tab_signal_phase(*i) };
@@ -4341,10 +4439,9 @@ impl Renderer {
             if show_close {
                 let (cx, cy, ccw, cch) = *close;
                 if *close_ha > 0.0 {
-                    Self::push_round(&mut out, cx, cy, ccw, cch, t(tokens::RADIUS_CHIP), TEXT_2, 0.12 * close_ha);
+                    Self::push_round(&mut out, cx, cy, ccw, cch, t(tokens::RADIUS_CHIP), WHITE, 0.12 * close_ha);
                 }
-                let base = if *active { MUTE } else { MUTE.lerp(BG, 0.3) };
-                let c = base.lerp(TEXT_2, *close_ha);
+                let c = BAR_MUTE.lerp(WHITE, *close_ha);
                 Self::draw_icon(&mut self.atlas, &mut out, Icon::Close, *close, t(tokens::ICON_SMALL), stroke, c, 1.0);
             } else if let Some((dot, da)) = self.status_dot(*attn) {
                 let dot_a = signal.map_or(1.0, |(_, _, d)| d);
@@ -4363,8 +4460,11 @@ impl Renderer {
             let (a, b) = (&pair[0], &pair[1]);
             let quiet = 1.0 - a.5.max(b.5);
             if !a.4 && !b.4 && quiet > 0.0 {
+                // an etched groove: a dark cut with light catching its far edge
                 let x = (b.1.0 - hair / 2.0).round();
-                Self::push_rect(&mut out, x, ((tbh - div_h) / 2.0).round(), hair, div_h, RULE_2, 0.5 * quiet);
+                let y = ((tbh - div_h) / 2.0).round();
+                Self::push_rect(&mut out, x, y, hair, div_h, Rgb::new(0, 0, 0), 0.5 * quiet);
+                Self::push_rect(&mut out, x + hair, y, hair, div_h, WHITE, 0.08 * quiet);
             }
         }
 
@@ -4380,7 +4480,7 @@ impl Renderer {
                 None => (ax, aw),
             };
             // a tinted active tab colors its rail too
-            let rail = item.8.map(|ci| self.palette.ansi_color(ci)).unwrap_or(PAPER);
+            let rail = item.8.map(|ci| self.palette.ansi_color(ci)).unwrap_or(RAIL);
             Self::push_round(&mut out, ux + rail_inset, rail_y, uw - rail_inset * 2.0, rail_h, rail_h / 2.0, rail, 1.0);
         }
         if let Some(index) = self.tab_drop {
@@ -4391,7 +4491,7 @@ impl Renderer {
                 .unwrap_or(tl.newtab.0);
             let marker_w = t(tokens::SPACE_XS).max(hair * 2.0);
             let my = t(tokens::SPACE_S);
-            Self::push_round(&mut out, x - marker_w / 2.0, my, marker_w, tbh - my * 2.0, marker_w / 2.0, PAPER, 1.0);
+            Self::push_round(&mut out, x - marker_w / 2.0, my, marker_w, tbh - my * 2.0, marker_w / 2.0, RAIL, 1.0);
         }
 
         // new-tab '+' and its profile chevron: rounded chips that hover apart
@@ -4402,22 +4502,26 @@ impl Renderer {
             let chip_h = t(tokens::CONTROL_H - tokens::SPACE_2XS);
             let chip = (x + t(tokens::SPACE_2XS), ((tbh - chip_h) / 2.0).round(), bw - t(tokens::SPACE_XS), chip_h);
             if a > 0.0 {
-                Self::push_shape(&mut out, chip, [t(tokens::RADIUS_ROW), 0.0, 0.0], INK_3, a);
+                Self::push_shape(&mut out, chip, [t(tokens::RADIUS_ROW), 0.0, 0.0], WHITE, 0.1 * a);
             }
-            Self::draw_icon(&mut self.atlas, &mut out, glyph, chip, icon, stroke, MUTE.lerp(TEXT_2, a), 1.0);
+            Self::draw_icon(&mut self.atlas, &mut out, glyph, chip, icon, stroke, BAR_MUTE.lerp(WHITE, a), 1.0);
         }
 
         // title-bar buttons: split right|left, split top/bottom, pane mode,
         // gear, min, max, close. full-height hover fills, the platform's
         // convention; close goes red
-        let close_red = Rgb::from_triple(crate::instrument::CLOSE_RED);
         for (c, x0, x1) in self.control_rects() {
             let a = self.hover_a(c);
             let pinned = (c == Hot::Gear && self.settings_open) || (c == Hot::PaneMode && self.pane_mode);
-            let fill = if c == Hot::Close { close_red } else { INK_4 };
             let fa = if pinned { 1.0 } else { a };
-            if fa > 0.0 {
-                Self::push_rect(&mut out, x0, 0.0, x1 - x0, tbh - hair * 2.0, fill, fa);
+            let cell = (x0, 0.0, x1 - x0, tbh - hair);
+            if c == Hot::Close && a > 0.0 {
+                Self::push_gel(&mut out, cell, 0.0, crate::instrument::CLOSE_GEL.map(Rgb::from_triple), a);
+            } else if pinned {
+                Self::push_gel(&mut out, cell, 0.0, crate::instrument::NAV_ACTIVE.map(|c| self.nav_tint(c)), 1.0);
+                Self::push_grad(&mut out, cell, 0.0, (0.0, (hair * 3.0).round()), Rgb::new(0, 0, 0), 0.65, Rgb::new(0, 0, 0), 0.0);
+            } else if a > 0.0 {
+                Self::push_rect(&mut out, x0, 0.0, x1 - x0, tbh - hair, WHITE, 0.1 * a);
             }
             let glyph = match c {
                 Hot::SplitV => Icon::SplitV,
@@ -4430,20 +4534,21 @@ impl Renderer {
                 _ => Icon::Close,
             };
             let color = if c == Hot::Close {
-                MUTE.lerp(Rgb::new(255, 255, 255), a)
+                BAR_MUTE.lerp(WHITE, a)
             } else if c == Hot::PaneMode && self.pane_mode {
-                PAPER
+                RAIL
             } else {
-                MUTE.lerp(TEXT_2, fa)
+                BAR_MUTE.lerp(WHITE, fa)
             };
             let size = icon;
             Self::draw_icon(&mut self.atlas, &mut out, glyph, (x0, 0.0, x1 - x0, tbh - hair * 2.0), size, stroke, color, 1.0);
         }
 
-        // ---- status bar (flat) ----
+        // ---- status bar: a shallow brushed band under the content ----
         let sb_y = h - self.status_bar_h;
-        Self::push_rect(&mut out, 0.0, sb_y, w, self.status_bar_h, INK_0, 1.0);
+        Self::push_grad(&mut out, (0.0, sb_y, w, self.status_bar_h), 0.0, (0.0, 0.0), self.palette.ink1, 1.0, INK_0, 1.0);
         Self::push_rect(&mut out, 0.0, sb_y, w, hair, RULE, 1.0);
+        Self::push_rect(&mut out, 0.0, sb_y + hair, w, hair, WHITE, 0.04);
         let small = self.atlas.metrics(FontId::Small);
         let st_top = (sb_y + (self.status_bar_h - small.cell_h) / 2.0).round();
         let st_track = self.track_for(FontId::Small);
@@ -4619,7 +4724,7 @@ impl Renderer {
         self.overlay_shown = overlay_now;
         let overlay_start = out.len();
         if self.pane_menu_view.is_some() {
-            self.build_pane_menu(&mut out, track);
+            self.build_pane_menu(&mut out);
         }
         if self.palette_view.is_some() {
             self.build_palette(&mut out, track);
@@ -4630,6 +4735,7 @@ impl Renderer {
         if self.find_view.is_some() {
             self.build_find(&mut out, track);
         }
+        self.dialog_btns = None;
         if self.confirm_view.is_some() {
             self.build_confirm(&mut out, track);
         }
@@ -4642,7 +4748,7 @@ impl Renderer {
                 .map(|t| motion::ease_out(motion::progress(t, motion::OVERLAY)))
                 .unwrap_or(1.0);
             if p < 1.0 {
-                bloom(&mut out[overlay_start..], p, w);
+                bloom(&mut out[overlay_start..], p, w, tokens::px(tokens::SPACE_XS, self.scale));
             }
         }
         // the settings panel draws last so its scrollable body is the final
@@ -4700,7 +4806,7 @@ impl Renderer {
                 .clamp(edge, (h - box_h - edge).max(edge))
                 .round();
             let card = (box_x, box_y, box_w, box_h);
-            let r = t(tokens::RADIUS_ROW + 2.0);
+            let r = t(tokens::RADIUS_OVERLAY);
             Self::push_shadow(&mut out, card, r, t(tokens::SPACE_L), t(tokens::SPACE_XS + tokens::SPACE_2XS), INK_0, 0.45);
             Self::push_shape(&mut out, card, [r, 0.0, 0.0], INK_3, 0.98);
             Self::push_ring(&mut out, card, r, hair, RULE_2, 1.0);
@@ -4780,10 +4886,10 @@ impl Renderer {
         Self::push_rect(out, g.panel_x, g.panel_top, g.panel_w, g.panel_h, INK_1, 1.0);
         Self::push_rect(out, g.panel_x, g.panel_top, hair, g.panel_h, RULE, 1.0); // left edge
 
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, g.head_y, "Settings", PAPER, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, cx, g.head_y, "Settings", PAPER, 1.0, 0.0);
         let qa = self.hover_a(Hot::PanelClose);
         if qa > 0.0 {
-            Self::push_shape(out, g.close_btn, [t(tokens::RADIUS_CHIP + 2.0), 0.0, 0.0], self.palette.ink3, qa);
+            Self::push_shape(out, g.close_btn, [t(tokens::RADIUS_ROW), 0.0, 0.0], self.palette.ink3, qa);
         }
         Self::draw_icon(&mut self.atlas, out, Icon::Close, g.close_btn, t(tokens::ICON_STATUS), hair, MUTE.lerp(TEXT_2, qa), 1.0);
         Self::push_rect(out, cx, g.body_top - t(tokens::SPACE_M), cw, hair, RULE, 1.0);
@@ -4801,7 +4907,7 @@ impl Renderer {
         self.section_label(out, cx, g.sec_plugins_y, plug_rule_w, "PLUGINS");
         self.cycle_btn(out, g.plugins_btn, "browse", Hot::OpenPlugins, track);
         if g.plugin_rows.is_empty() {
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(g.sec_plugins_y + t(tokens::SPACE_2XL)), "no plugins installed", QUIET, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, cx, lbl(g.sec_plugins_y + t(tokens::SPACE_2XL)), "no plugins installed", QUIET, 1.0, 0.0);
         } else {
             for (i, (name, on, rect, ry)) in g.plugin_rows.iter().enumerate() {
                 let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx, lbl(*ry), name, TEXT_2, 1.0, track);
@@ -4811,32 +4917,32 @@ impl Renderer {
 
         // APPEARANCE
         self.section_label(out, cx, g.sec_app_y, cw, "APPEARANCE");
-        self.setting_label(out, cx, g.font_y, bh, "FONT SIZE");
+        self.setting_label(out, cx, g.font_y, bh, "Font size");
         self.stepper(out, g.font_dec, g.font_inc, &format!("{font_size}"), Hot::FontDec, Hot::FontInc, g.val_w, track);
-        self.setting_label(out, cx, g.fontfam_y, bh, "FONT");
+        self.setting_label(out, cx, g.fontfam_y, bh, "Font");
         self.cycle_btn(out, g.fontfam_btn, font_name, Hot::FontCycle, track);
-        self.setting_label(out, cx, g.pad_y, bh, "PADDING");
+        self.setting_label(out, cx, g.pad_y, bh, "Padding");
         self.stepper(out, g.pad_dec, g.pad_inc, &format!("{pad_px}"), Hot::PadDec, Hot::PadInc, g.val_w, track);
-        self.setting_label(out, cx, g.opacity_y, bh, "OPACITY");
+        self.setting_label(out, cx, g.opacity_y, bh, "Opacity");
         self.stepper(out, g.op_dec, g.op_inc, &format!("{opacity_pct}%"), Hot::OpacityDec, Hot::OpacityInc, g.val_w, track);
         let lh_label = format!("{:.2}", self.content_line_height);
-        self.setting_label(out, cx, g.line_height_y, bh, "LINE HEIGHT");
+        self.setting_label(out, cx, g.line_height_y, bh, "Line height");
         self.stepper(out, g.lh_dec, g.lh_inc, &lh_label, Hot::LineHeightDec, Hot::LineHeightInc, g.val_w, track);
         let bb = self.bold_as_bright;
-        self.setting_label(out, cx, g.boldbright_y, bh, "BOLD AS BRIGHT");
+        self.setting_label(out, cx, g.boldbright_y, bh, "Bold as bright");
         self.toggle_btn(out, g.boldbright_btn, bb, Hot::BoldBright, track);
         let backdrop_label = if cfg!(windows) {
-            "MICA BACKDROP"
+            "Mica backdrop"
         } else {
-            "SYSTEM BLUR"
+            "System blur"
         };
         self.setting_label(out, cx, g.mica_y, bh, backdrop_label);
         self.toggle_btn(out, g.mica_btn, sv.acrylic, Hot::Mica, track);
-        self.setting_label(out, cx, g.cursor_y, bh, "CURSOR");
+        self.setting_label(out, cx, g.cursor_y, bh, "Cursor");
         self.cycle_btn(out, g.cursor_btn, cur_name, Hot::CursorCycle, track);
-        self.setting_label(out, cx, g.blink_y, bh, "CURSOR BLINK");
+        self.setting_label(out, cx, g.blink_y, bh, "Cursor blink");
         self.toggle_btn(out, g.blink_btn, blink, Hot::CursorBlink, track);
-        self.setting_label(out, cx, g.theme_label_y, bh, "THEME");
+        self.setting_label(out, cx, g.theme_label_y, bh, "Theme");
         for (i, id) in ThemeId::ALL.into_iter().enumerate() {
             self.theme_chip(out, g.theme_chips[i], id, theme == id && !sv.theme_auto, track);
         }
@@ -4844,26 +4950,27 @@ impl Renderer {
 
         // BEHAVIOR
         self.section_label(out, cx, g.sec_beh_y, cw, "BEHAVIOR");
-        self.setting_label(out, cx, g.scrollback_y, bh, "SCROLLBACK");
+        self.setting_label(out, cx, g.scrollback_y, bh, "Scrollback");
         self.stepper(out, g.sb_dec, g.sb_inc, &format!("{}", sv.scrollback), Hot::ScrollbackDec, Hot::ScrollbackInc, g.val_w, track);
-        self.setting_label(out, cx, g.copysel_y, bh, "COPY ON SELECT");
+        self.setting_label(out, cx, g.copysel_y, bh, "Copy on select");
         self.toggle_btn(out, g.copysel_btn, sv.copy_on_select, Hot::CopyOnSelect, track);
 
         // SHELL
         self.section_label(out, cx, g.sec_shell_y, cw, "SHELL");
-        self.setting_label(out, cx, g.shell_y, bh, "DEFAULT SHELL");
+        self.setting_label(out, cx, g.shell_y, bh, "Default shell");
         self.cycle_btn(out, g.shell_btn, sv.shell_name, Hot::ShellCycle, track);
-        self.setting_label(out, cx, g.profile_y, bh, "LOAD PROFILE");
+        self.setting_label(out, cx, g.profile_y, bh, "Load profile");
         self.toggle_btn(out, g.profile_btn, sv.load_profile, Hot::LoadProfile, track);
-        self.setting_label(out, cx, g.close_y, bh, "CLOSE BUTTON");
+        self.setting_label(out, cx, g.close_y, bh, "Close button");
         self.cycle_btn(out, g.close_action_btn, sv.close_action_name, Hot::CloseActionCycle, track);
-        self.setting_label(out, cx, g.backend_y, bh, "BACKEND");
+        self.setting_label(out, cx, g.backend_y, bh, "Backend");
         self.cycle_btn(out, g.backend_btn, sv.backend_name, Hot::BackendCycle, track);
         // backend can't swap live; hint that it applies next launch
         let (bbx, _, bbw, _) = g.backend_btn;
         let small_h = self.atlas.metrics(FontId::Small).cell_h;
         let small_track = self.track_for(FontId::Small);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - small_h) / 2.0).round(), "applies on restart", QUIET, 1.0, small_track);
+        let note_h = self.atlas.metrics(FontId::LabelSmall).cell_h;
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::LabelSmall, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - note_h) / 2.0).round(), "applies on restart", QUIET, 1.0, 0.0);
 
         // KEYBINDINGS (two sub-columns)
         self.section_label(out, cx, g.sec_keys_y, cw, "KEYBINDINGS");
@@ -4891,7 +4998,7 @@ impl Renderer {
                 (sub2, g.keys_start_y + (i - 6) as f32 * key_row)
             };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, kx, ky + (chrome_h - small_h) / 2.0, k, TEXT_2, 1.0, small_track);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, kx + desc_dx, ky, d, QUIET, 1.0, track);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, kx + desc_dx, ky, d, QUIET, 1.0, 0.0);
         }
 
         // ABOUT
@@ -5119,30 +5226,36 @@ impl Renderer {
         let t = |pt| tokens::px(pt, self.scale);
         let hair = self.scale.max(1.0);
         let p = &self.palette;
-        Self::push_shadow(out, rect, r, t(tokens::SPACE_XL), t(tokens::SPACE_S), p.ink0, 0.35);
-        Self::push_shadow(out, rect, r, t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), p.ink0, 0.25);
+        let black = Rgb::new(0, 0, 0);
+        let light = self.light();
+        Self::push_shadow(out, rect, r, t(tokens::SPACE_XL), t(tokens::SPACE_M), black, if light { 0.28 } else { 0.6 });
+        Self::push_shadow(out, rect, r, t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), black, if light { 0.18 } else { 0.35 });
         Self::push_shape(out, rect, [r, 0.0, 0.0], p.ink1, 1.0);
-        Self::push_ring(out, rect, r, hair, p.rule2, 1.0);
+        Self::push_ring(out, rect, r, hair, if light { p.rule2 } else { Rgb::new(5, 5, 5) }, 1.0);
         let (x, y, w, _) = rect;
         Self::push_rect(out, x + r, y + hair, (w - r * 2.0).max(0.0), hair, Rgb::new(255, 255, 255), 0.06);
     }
 
-    /// a row highlight inset from the overlay edge
+    /// the picked-row highlight, aqua in every theme, inset from the overlay
+    /// edge. text on it should ease toward `PICKED_TEXT` by the same alpha
     fn row_fill(&self, out: &mut Vec<Instance>, rect: Rect, alpha: f32) {
         let t = |pt| tokens::px(pt, self.scale);
         let (x, y, w, h) = rect;
         let inset = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
-        Self::push_shape(
-            out,
-            (x + inset, y + t(tokens::SPACE_3XS), w - inset * 2.0, h - t(tokens::SPACE_2XS)),
-            [t(tokens::RADIUS_ROW), 0.0, 0.0],
-            self.palette.ink3,
-            alpha,
-        );
+        let row = (x + inset, y + t(tokens::SPACE_3XS), w - inset * 2.0, h - t(tokens::SPACE_2XS));
+        let [top, bottom] = crate::instrument::PICKED.map(Rgb::from_triple);
+        Self::push_grad(out, row, t(tokens::RADIUS_ROW), (0.0, 0.0), top, alpha, bottom, alpha);
+        Self::push_grad(out, row, t(tokens::RADIUS_ROW), (0.0, self.scale.max(1.0)), Rgb::new(255, 255, 255), 0.18 * alpha, Rgb::new(255, 255, 255), 0.18 * alpha);
+    }
+
+    /// light themes keep softer shadows and drawn edges
+    fn light(&self) -> bool {
+        let b = self.palette.bg;
+        b.r as u16 + b.g as u16 + b.b as u16 > 384
     }
 
     #[allow(non_snake_case)]
-    fn build_pane_menu(&mut self, out: &mut Vec<Instance>, track: f32) {
+    fn build_pane_menu(&mut self, out: &mut Vec<Instance>) {
         let Some(v) = self.pane_menu_view.as_ref() else {
             return;
         };
@@ -5159,16 +5272,16 @@ impl Renderer {
         let TEXT_2 = self.palette.text2;
         let RULE_2 = self.palette.rule2;
         let hair = self.scale.max(1.0);
-        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
+        let label_h = self.atlas.metrics(FontId::Label).cell_h;
         let mh = row_h * items.len() as f32 + pad * 2.0;
-        self.overlay_frame(out, (bx, by, mw, mh), t(tokens::RADIUS_ROW + 4.0));
+        self.overlay_frame(out, (bx, by, mw, mh), t(tokens::RADIUS_OVERLAY));
         for (i, lbl) in items.iter().enumerate() {
             let ry = by + pad + row_h * i as f32;
             let a = lit.filter(|(li, _)| *li == i).map_or(0.0, |(_, a)| a);
             if a > 0.0 {
                 self.row_fill(out, (bx, ry, mw, row_h), a);
             }
-            let ty = (ry + (row_h - chrome_h) / 2.0).round();
+            let ty = (ry + (row_h - label_h) / 2.0).round();
             let mut lx = bx + pad + t(tokens::SPACE_M) - t(tokens::SPACE_XS);
             // color-menu rows lead with their swatch; "none" gets a hollow ring
             if !accents.is_empty() {
@@ -5180,7 +5293,8 @@ impl Renderer {
                 }
                 lx += d + t(tokens::SPACE_S);
             }
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, lx, ty, lbl, TEXT_2, 0.85 + 0.15 * a, track);
+            let picked = Rgb::from_triple(crate::instrument::PICKED_TEXT);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ty, lbl, TEXT_2.lerp(picked, a), 0.85 + 0.15 * a, 0.0);
         }
     }
 
@@ -5276,15 +5390,18 @@ impl Renderer {
             if is_sel {
                 self.row_fill(out, (bx, ry, bw, row_h), 1.0);
             }
-            let ty = (ry + (row_h - chrome_h) / 2.0).round();
+            // tab titles stay in the mono, like the tab strip they mirror
+            let (font, ftrack) = if scope == "tabs" { (FontId::Chrome, track) } else { (FontId::Label, 0.0) };
+            let ty = (ry + (row_h - self.atlas.metrics(font).cell_h) / 2.0).round();
             let hint_w = if hint.is_empty() { 0.0 } else { self.text_w(FontId::Small, hint, small_track) };
             let room = bw - pad * 2.0 - hint_w - if hint_w > 0.0 { t(tokens::SPACE_L) } else { 0.0 };
-            let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
-            let shown = truncate_tail(lbl, (room / cw).floor().max(4.0) as usize);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, ty, &shown, TEXT_2, if is_sel { 1.0 } else { 0.8 }, track);
+            let shown = self.fit_tail(font, lbl, room, ftrack);
+            let picked = Rgb::from_triple(crate::instrument::PICKED_TEXT);
+            let (lc, hc) = if is_sel { (picked, Rgb::from_triple(crate::instrument::PICKED_META)) } else { (TEXT_2, QUIET) };
+            let _ = Self::draw_text(&mut self.atlas, out, font, bx + pad, ty, &shown, lc, if is_sel { 1.0 } else { 0.8 }, ftrack);
             if hint_w > 0.0 {
                 let hy = (ry + (row_h - small_h) / 2.0).round();
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hint_w, hy, hint, QUIET, 1.0, small_track);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + bw - pad - hint_w, hy, hint, hc, 1.0, small_track);
             }
         }
         if font_preview {
@@ -5322,9 +5439,7 @@ impl Renderer {
         let regex_on = fv.regex_on;
         let bad = fv.bad;
         let INK_1 = self.palette.ink1;
-        let TEXT_2 = self.palette.text2;
         let MUTE = self.palette.mute;
-        let PAPER = self.palette.paper;
         let QUIET = self.quiet(INK_1);
         let s = self.scale;
         let t = |pt| tokens::px(pt, s);
@@ -5337,7 +5452,7 @@ impl Renderer {
         let bx = ((w - bw) / 2.0).round();
         let by = (self.title_bar_h + t(tokens::SPACE_M)).round();
         let bh = chrome_h + t(tokens::SPACE_L) + t(tokens::SPACE_XS);
-        self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_ROW + 4.0));
+        self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_OVERLAY));
         let pad = t(tokens::SPACE_M);
         let iy = (by + (bh - chrome_h) / 2.0).round();
         // right cluster: regex toggle / prev / next / close buttons, with the
@@ -5350,17 +5465,20 @@ impl Renderer {
         let prev_r = (next_r.0 - btn - bgap, byy, btn, btn);
         let rx_r = (prev_r.0 - btn - bgap - t(tokens::SPACE_XS), byy, btn, btn);
         self.find_btns = Some((rx_r, prev_r, next_r, close_r));
-        let chip_r = t(tokens::RADIUS_CHIP + 2.0);
+        let chip_r = t(tokens::RADIUS_ROW);
         if regex_on {
-            Self::push_shape(out, rx_r, [chip_r, 0.0, 0.0], PAPER, 0.9);
+            Self::push_gel(out, rx_r, chip_r, crate::instrument::AQUA_PRESSED.map(Rgb::from_triple), 1.0);
+            Self::push_ring(out, rx_r, chip_r, hair, Rgb::from_triple(crate::instrument::AQUA_EDGE), 1.0);
         }
         let rx_text = ".*";
         let rw = self.text_w(FontId::Small, rx_text, small_track);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, if regex_on { INK_1 } else { QUIET }, 1.0, small_track);
+        let rx_ink = if regex_on { Rgb::from_triple(crate::instrument::PICKED_TEXT) } else { QUIET };
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, rx_ink, 1.0, small_track);
         let icon = t(tokens::ICON - 1.0);
-        Self::draw_icon(&mut self.atlas, out, Icon::ChevronUp, prev_r, icon, hair, MUTE, 1.0);
-        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, next_r, icon, hair, MUTE, 1.0);
-        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(tokens::ICON_SMALL), hair, MUTE, 1.0);
+        let glyph = crate::color::apply_min_contrast(MUTE, INK_1, tokens::ICON_CONTRAST);
+        Self::draw_icon(&mut self.atlas, out, Icon::ChevronUp, prev_r, icon, hair, glyph, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, next_r, icon, hair, glyph, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Close, close_r, t(tokens::ICON_SMALL), hair, glyph, 1.0);
         let info = if bad {
             "bad pattern".to_string()
         } else if count == 0 {
@@ -5376,18 +5494,25 @@ impl Renderer {
         };
         let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Small, &info, small_track) };
         let right_edge = rx_r.0 - t(tokens::SPACE_S);
+        // the query sits in an inset search well spanning the bar up to the buttons
+        let inset = t(tokens::SPACE_XS);
+        let well = (bx + inset, by + inset, right_edge + t(tokens::SPACE_XS) - bx - inset, bh - inset * 2.0);
+        let ink = self.push_well(out, well, (well.3 / 2.0).round(), false);
+        let well_bg = if self.light() { Rgb::new(255, 255, 255) } else { Rgb::from_triple(crate::instrument::WELL) };
+        let well_quiet = self.quiet(well_bg);
         let search = t(tokens::ICON + 1.0);
-        Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, search, bh), search, hair, MUTE, 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Search, (bx + pad, by, search, bh), search, hair, well_quiet, 1.0);
         let qx = bx + pad + search + t(tokens::SPACE_S);
         // elide the head of an overlong query so the tail being typed stays
         // visible and never collides with the counter or the buttons
         let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
         let avail = (right_edge - iw - t(tokens::SPACE_M)) - qx;
         let shown = truncate_head(&query, (avail / cw).floor().max(2.0) as usize);
-        let qend = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &shown, if bad { self.palette.ansi_color(1) } else { TEXT_2 }, 1.0, track);
-        Self::push_round(out, qend + t(tokens::SPACE_3XS), iy + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), PAPER, 1.0);
+        let danger = crate::color::apply_min_contrast(Rgb::from_triple(crate::instrument::DANGER), well_bg, tokens::TEXT_CONTRAST);
+        let qend = Self::draw_text(&mut self.atlas, out, FontId::Chrome, qx, iy, &shown, if bad { danger } else { ink }, 1.0, track);
+        Self::push_round(out, qend + t(tokens::SPACE_3XS), iy + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), ink, 1.0);
         if !info.is_empty() {
-            let c = if bad { self.palette.ansi_color(1) } else { QUIET };
+            let c = if bad { danger } else { well_quiet };
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, right_edge - iw, (by + (bh - small_h) / 2.0).round(), &info, c, 1.0, small_track);
         }
     }
@@ -5436,8 +5561,8 @@ impl Renderer {
         let Some(cv) = self.confirm_view.as_ref() else {
             return;
         };
-        let (prompt, hint) = (cv.prompt.clone(), cv.hint.clone());
-        self.dialog(out, track, &prompt, None, &hint);
+        let (prompt, buttons) = (cv.prompt.clone(), cv.buttons);
+        self.dialog(out, track, &prompt, None, buttons);
     }
 
     /// the tab-rename field: a centered box with the editable name + a caret
@@ -5446,48 +5571,75 @@ impl Renderer {
             return;
         };
         let buf = rv.buf.clone();
-        self.dialog(out, track, "Rename tab", Some(&buf), "enter rename  \u{b7}  esc cancel");
+        self.dialog(out, track, "Rename tab", Some(&buf), ("rename", "cancel"));
     }
 
     /// a small centered dialog: a title line, an optional text field with a
-    /// caret, and a key hint, sized to its content
-    fn dialog(&mut self, out: &mut Vec<Instance>, track: f32, title: &str, field: Option<&str>, hint: &str) {
+    /// caret, and a cancel + default gel button pair, sized to its content.
+    /// enter and esc answer it too
+    fn dialog(&mut self, out: &mut Vec<Instance>, track: f32, title: &str, field: Option<&str>, buttons: (&str, &str)) {
         let s = self.scale;
         let t = |pt| tokens::px(pt, s);
+        let hair = s.max(1.0);
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let small_h = self.atlas.metrics(FontId::Small).cell_h;
-        let small_track = self.track_for(FontId::Small);
+        let label_h = self.atlas.metrics(FontId::Label).cell_h;
         let pad = t(tokens::SPACE_XL);
         let field_h = chrome_h + t(tokens::SPACE_M);
         let gap = t(tokens::SPACE_M);
+        let btn_h = t(tokens::BUTTON_H);
+        let btn_w = |r: &Self, l: &str| (r.text_w(FontId::Label, l, 0.0) + t(tokens::SPACE_L) * 2.0).max(t(tokens::BUTTON_MIN_W)).round();
+        let (yes, no) = buttons;
+        let (yes_w, no_w) = (btn_w(self, yes), btn_w(self, no));
         let content_w = self
-            .text_w(FontId::Chrome, title, track)
-            .max(self.text_w(FontId::Small, hint, small_track))
+            .text_w(FontId::Label, title, 0.0)
+            .max(yes_w + no_w + t(tokens::SPACE_S))
             .max(field.map_or(0.0, |f| self.text_w(FontId::Chrome, f, track) + t(tokens::SPACE_L) * 2.0));
         let bw = (content_w + pad * 2.0).clamp(t(tokens::DIALOG_MIN_W), t(tokens::DIALOG_MAX_W).min(w - t(tokens::SPACE_2XL) * 2.0)).round();
-        let bh = (pad * 2.0 + chrome_h + gap + small_h + field.map_or(0.0, |_| field_h + gap)).round();
+        let bh = (pad * 2.0 + label_h + gap * 2.0 + btn_h + field.map_or(0.0, |_| field_h + gap)).round();
         let bx = ((w - bw) / 2.0).round();
         let by = ((h - bh) / 2.0).round().max(self.title_bar_h + t(tokens::SPACE_M));
         Self::push_rect(out, 0.0, 0.0, w, h, self.palette.ink0, 0.35);
         self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_OVERLAY));
         let mut y = by + pad;
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, bx + pad, y, title, self.palette.paper, 1.0, track);
-        y += chrome_h + gap;
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, bx + pad, y, title, self.palette.paper, 1.0, 0.0);
+        y += label_h + gap;
         if let Some(text) = field {
             let fr = (bx + pad, y, bw - pad * 2.0, field_h);
-            Self::push_shape(out, fr, [t(tokens::RADIUS_ROW), 0.0, 0.0], self.palette.ink0, 0.8);
-            Self::push_ring(out, fr, t(tokens::RADIUS_ROW), s.max(1.0), self.palette.rule2, 1.0);
+            let ink = self.push_well(out, fr, t(tokens::RADIUS_FIELD), true);
             let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
             let shown = truncate_head(text, ((fr.2 - t(tokens::SPACE_L) * 2.0) / cw).floor().max(2.0) as usize);
             let ty = (y + (field_h - chrome_h) / 2.0).round();
-            let end = Self::draw_text(&mut self.atlas, out, FontId::Chrome, fr.0 + t(tokens::SPACE_M), ty, &shown, self.palette.text2, 1.0, track);
-            Self::push_round(out, end + t(tokens::SPACE_3XS), ty + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), self.palette.paper, 1.0);
+            let end = Self::draw_text(&mut self.atlas, out, FontId::Chrome, fr.0 + t(tokens::SPACE_M), ty, &shown, ink, 1.0, track);
+            Self::push_round(out, end + t(tokens::SPACE_3XS), ty + t(tokens::SPACE_3XS), t(tokens::SPACE_2XS), chrome_h - t(tokens::SPACE_2XS), t(tokens::SPACE_3XS), ink, 1.0);
             y += field_h + gap;
         }
-        let quiet = self.quiet(self.palette.ink1);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, bx + pad, y, hint, quiet, 1.0, small_track);
+        y += gap;
+        let yes_r = (bx + bw - pad - yes_w, y, yes_w, btn_h);
+        let no_r = (yes_r.0 - t(tokens::SPACE_S) - no_w, y, no_w, btn_h);
+        for (r, label, default) in [(no_r, no, false), (yes_r, yes, true)] {
+            Self::push_button(out, r, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
+            let lx = (r.0 + (r.2 - self.text_w(FontId::Label, label, 0.0)) / 2.0).round();
+            let ly = (r.1 + (r.3 - label_h) / 2.0).round();
+            Self::engrave(&mut self.atlas, out, FontId::Label, lx, ly, label, hair, 0.0);
+            let ink = Rgb::from_triple(if default { crate::instrument::PICKED_TEXT } else { crate::instrument::GEL_TEXT });
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ly, label, ink, 1.0, 0.0);
+        }
+        self.dialog_btns = Some((no_r, yes_r));
+    }
+
+    /// dialog button under a point: Some(true) for the default, Some(false)
+    /// for cancel
+    pub fn dialog_btn_at(&self, x: f32, y: f32) -> Option<bool> {
+        let (no, yes) = self.dialog_btns?;
+        if in_rect(x, y, yes) {
+            Some(true)
+        } else if in_rect(x, y, no) {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// plugins marketplace overlay: a centered panel listing installed + catalog
@@ -5533,18 +5685,16 @@ impl Renderer {
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-        let char_w = self.text_w(FontId::Chrome, "M", track).max(1.0);
 
         // full-window page (its own screen under the tab strip), not a popup
         let top = self.title_bar_h;
         let bottom = (h - self.status_bar_h).max(top + 1.0);
         Self::push_rect(out, 0.0, top, w, bottom - top, INK_1, 1.0);
         let t = |pt| tokens::px(pt, s);
-        let card_r = t(tokens::RADIUS_ROW + 4.0);
+        let card_r = t(tokens::RADIUS_OVERLAY);
         let chip_r = t(tokens::RADIUS_CHIP);
         let small_h = self.atlas.metrics(FontId::Small).cell_h;
         let small_track = self.track_for(FontId::Small);
-        let key_track = self.key_track();
 
         // centered content column
         let col_w = t(tokens::MARKET_W).min(w - t(tokens::SPACE_2XL) * 3.0);
@@ -5554,7 +5704,7 @@ impl Renderer {
 
         // ---- header band: title + counts + close, subtitle, rule ----
         let title_y = (top + t(tokens::SPACE_2XL)).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, title_y, "Plugins", PAPER, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, col_x, title_y, "Plugins", PAPER, 1.0, 0.0);
         let close_sz = (chrome_h + t(tokens::SPACE_S)).round();
         let close_r = (col_x + col_w - close_sz, (title_y + (chrome_h - close_sz) / 2.0).round(), close_sz, close_sz);
         Self::push_shape(out, close_r, [chip_r, 0.0, 0.0], INK_3, 0.6);
@@ -5564,7 +5714,7 @@ impl Renderer {
         let count_w = self.text_w(FontId::Small, &count, small_track);
         let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, close_r.0 - t(tokens::SPACE_L) - count_w, (title_y + (chrome_h - small_h) / 2.0).round(), &count, QUIET, 1.0, small_track);
         let sub_y = (title_y + chrome_h + t(tokens::SPACE_S)).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, sub_y, "Browse and manage plugins. Each runs as its own sandboxed process.", QUIET, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, col_x, sub_y, "Browse and manage plugins. Each runs as its own sandboxed process.", QUIET, 1.0, 0.0);
         let rule_y = (sub_y + chrome_h + t(tokens::SPACE_L)).round();
         Self::push_rect(out, col_x, rule_y, col_w, hair, RULE_2, 1.0);
 
@@ -5589,11 +5739,11 @@ impl Renderer {
                 ("No plugins in the catalog yet.", "")
             };
             let my = ((body_top + body_bottom) / 2.0 - chrome_h).round();
-            let mw = self.text_w(FontId::Chrome, msg, track);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + (col_w - mw) / 2.0, my, msg, TEXT_2, 1.0, track);
+            let mw = self.text_w(FontId::Label, msg, 0.0);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, col_x + (col_w - mw) / 2.0, my, msg, TEXT_2, 1.0, 0.0);
             if !hint.is_empty() {
-                let hw = self.text_w(FontId::Chrome, hint, track);
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x + (col_w - hw) / 2.0, my + line, hint, QUIET, 1.0, track);
+                let hw = self.text_w(FontId::Label, hint, 0.0);
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, col_x + (col_w - hw) / 2.0, my + line, hint, QUIET, 1.0, 0.0);
             }
         }
 
@@ -5612,7 +5762,11 @@ impl Renderer {
                 Self::push_shadow(out, card, card_r, t(tokens::SPACE_M), t(tokens::SPACE_XS), INK_0, 0.3);
             }
             Self::push_shape(out, card, [card_r, 0.0, 0.0], if sel { INK_3 } else { INK_0 }, if sel { 1.0 } else { 0.35 });
-            Self::push_ring(out, card, card_r, hair, if sel { MUTE } else { RULE_2 }, 1.0);
+            if sel {
+                Self::push_ring(out, card, card_r, hair * 2.0, Rgb::from_triple(crate::instrument::AQUA), 1.0);
+            } else {
+                Self::push_ring(out, card, card_r, hair, RULE_2, 1.0);
+            }
             let inner = col_x + pad;
             // line 1: name + version (left), action chip (right)
             let l1 = (ry + t(tokens::SPACE_L)).round();
@@ -5621,48 +5775,42 @@ impl Renderer {
             let nw = self.text_w(FontId::Chrome, &r.name, track);
             let ver = format!("v{}", r.version);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner + nw + t(tokens::SPACE_S), l1, &ver, QUIET, 1.0, track);
-            let (chip, chip_fill, chip_fg, chip_border) = if !r.installed {
-                ("INSTALL", true, INK_0, PAPER)
+            // install is the card's default action, so it takes the aqua gel;
+            // enabled carries a check so the state never rests on color alone
+            use crate::instrument as i;
+            let (chip, default, chip_fg) = if !r.installed {
+                ("Install", true, Rgb::from_triple(i::PICKED_TEXT))
             } else if r.enabled {
-                ("ENABLED", false, PAPER, PAPER)
+                ("Enabled", false, Rgb::from_triple(i::GEL_TEXT))
             } else {
-                ("DISABLED", false, MUTE, RULE_2)
+                ("Disabled", false, Rgb::from_triple(i::GEL_TEXT))
             };
+            let label_h = self.atlas.metrics(FontId::Label).cell_h;
             let mark = if r.installed && r.enabled { t(tokens::ICON - 1.0) + t(tokens::SPACE_XS) } else { 0.0 };
-            let cw_chip = self.text_w(FontId::Small, chip, key_track) + mark;
-            let chip_w = cw_chip + t(tokens::SPACE_L) + t(tokens::SPACE_XS);
+            let cw_chip = self.text_w(FontId::Label, chip, 0.0) + mark;
+            let chip_w = (cw_chip + t(tokens::SPACE_L) * 2.0).max(t(tokens::BUTTON_MIN_W)).round();
             let chip_x = col_x + col_w - pad - chip_w;
-            let chip_h = small_h + t(tokens::SPACE_S);
+            let chip_h = t(tokens::BUTTON_H);
             let chip_y = (l1 + (chrome_h - chip_h) / 2.0).round();
             let chip_rect = (chip_x, chip_y, chip_w, chip_h);
             self.market_hits.push((chip_rect, MarketHit::Chip(idx)));
-            if chip_fill {
-                Self::push_shape(out, chip_rect, [chip_r, 0.0, 0.0], PAPER, 1.0);
-            } else {
-                Self::push_ring(out, chip_rect, chip_r, hair, chip_border, 1.0);
-            }
-            let cx = chip_x + (chip_w - cw_chip) / 2.0;
+            Self::push_button(out, chip_rect, t(tokens::RADIUS_BUTTON), hair, default, false, 1.0);
+            let cx = (chip_x + (chip_w - cw_chip) / 2.0).round();
             if mark > 0.0 {
                 Self::draw_icon(&mut self.atlas, out, Icon::Check, (cx, chip_y, t(tokens::ICON - 1.0), chip_h), t(tokens::ICON - 1.0), hair, chip_fg, 1.0);
             }
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx + mark, (chip_y + (chip_h - small_h) / 2.0).round(), chip, chip_fg, 1.0, key_track);
+            let ly = (chip_y + (chip_h - label_h) / 2.0).round();
+            Self::engrave(&mut self.atlas, out, FontId::Label, cx + mark, ly, chip, hair, 0.0);
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, cx + mark, ly, chip, chip_fg, 1.0, 0.0);
             // line 2: description (truncated to the card width)
             let l2 = (l1 + line).round();
-            let dmax = ((col_w - 2.0 * pad) / char_w).floor() as usize;
-            let desc = if r.desc.is_empty() {
-                "no description".to_string()
-            } else if r.desc.chars().count() > dmax {
-                let mut t: String = r.desc.chars().take(dmax.saturating_sub(1)).collect();
-                t.push('\u{2026}');
-                t
-            } else {
-                r.desc.clone()
-            };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, inner, l2, &desc, QUIET, 1.0, track);
+            let desc = if r.desc.is_empty() { "no description".to_string() } else { self.fit_tail(FontId::Label, &r.desc, col_w - 2.0 * pad, 0.0) };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, inner, l2, &desc, QUIET, 1.0, 0.0);
             // line 3: permission badges, or a note when there are none
             let l3 = (l2 + line).round();
             if r.perms.is_empty() {
-                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, inner, (l3 + (chrome_h - small_h) / 2.0).round(), "no special permissions", QUIET, 1.0, small_track);
+                let note_h = self.atlas.metrics(FontId::LabelSmall).cell_h;
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::LabelSmall, inner, (l3 + (chrome_h - note_h) / 2.0).round(), "no special permissions", QUIET, 1.0, 0.0);
             } else {
                 let mut px = inner;
                 let ph = small_h + t(tokens::SPACE_XS);
@@ -5684,10 +5832,10 @@ impl Renderer {
         // ---- footer: status (left) + key hints (right) ----
         Self::push_rect(out, col_x, body_bottom + t(tokens::SPACE_S), col_w, hair, RULE_2, 1.0);
         let fy = (body_bottom + t(tokens::SPACE_S) + (foot_h - chrome_h) / 2.0).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, col_x, fy, &status, QUIET, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, col_x, fy, &status, QUIET, 1.0, 0.0);
         let hints = "\u{2191}\u{2193} select  \u{b7}  enter install/toggle  \u{b7}  r remove  \u{b7}  esc close";
         let hints_w = self.text_w(FontId::Small, hints, small_track);
-        let status_w = self.text_w(FontId::Chrome, &status, track);
+        let status_w = self.text_w(FontId::Label, &status, 0.0);
         if hints_w + status_w + t(tokens::SPACE_XL) < col_w {
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, col_x + col_w - hints_w, (fy + (chrome_h - small_h) / 2.0).round(), hints, QUIET, 1.0, small_track);
         }
@@ -5704,41 +5852,51 @@ impl Renderer {
         let hair = self.scale.max(1.0);
         let ry = (y + chrome_h / 2.0).round();
         let rx = x + tw + tokens::px(tokens::SPACE_M, self.scale);
+        // an etched rule: the groove, then light catching its lower lip
         Self::push_rect(out, rx, ry, (x + w - rx).max(0.0), hair, self.palette.rule, 1.0);
+        Self::push_rect(out, rx, ry + hair, (x + w - rx).max(0.0), hair, Rgb::new(255, 255, 255), if self.light() { 0.5 } else { 0.04 });
     }
 
-    /// a setting's name: small caps in the Small face, centered on its row
+    /// a setting's name in the label face, centered on its row
     fn setting_label(&mut self, out: &mut Vec<Instance>, x: f32, row_y: f32, bh: f32, text: &str) {
-        let small_h = self.atlas.metrics(FontId::Small).cell_h;
-        let key_track = self.key_track();
-        let quiet = self.quiet(self.palette.ink1);
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, x, (row_y + (bh - small_h) / 2.0).round(), text, quiet, 1.0, key_track);
+        let label_h = self.atlas.metrics(FontId::Label).cell_h;
+        let ink = self.palette.text2;
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, x, (row_y + (bh - label_h) / 2.0).round(), text, ink, 1.0, 0.0);
+    }
+
+    /// a hover lift over a gel: the brightness bump of the suite's buttons
+    fn gel_hover(out: &mut Vec<Instance>, rect: Rect, r: f32, he: f32) {
+        if he > 0.0 {
+            Self::push_shape(out, rect, [r, 0.0, 0.0], Rgb::new(255, 255, 255), 0.08 * he);
+        }
     }
 
     /// a rounded field that cycles its value on click, with a chevron
     fn cycle_btn(&mut self, out: &mut Vec<Instance>, rect: (f32, f32, f32, f32), text: &str, hot: Hot, track: f32) {
         let t = |pt| tokens::px(pt, self.scale);
-        let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let (bx, by, bw, bh) = rect;
+        let hair = self.scale.max(1.0);
         let he = self.hover_a(hot);
-        let r = t(tokens::RADIUS_ROW);
-        Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink0, 0.6);
-        if he > 0.0 {
-            Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink3, he);
-        }
-        Self::push_ring(out, rect, r, self.scale.max(1.0), self.palette.rule2.lerp(self.palette.mute, he * 0.5), 1.0);
-        // cycling fields carry a chevron; a plain action button (browse) doesn't
-        let icon = if hot == Hot::OpenPlugins { 0.0 } else { t(tokens::ICON - 2.0) };
+        // cycling fields are popup gels with a chevron and a mono value; a plain
+        // action button (browse) is a pill with a label
+        let action = hot == Hot::OpenPlugins;
+        let r = t(if action { tokens::RADIUS_BUTTON } else { tokens::RADIUS_FIELD });
+        Self::push_button(out, rect, r, hair, false, false, 1.0);
+        Self::gel_hover(out, rect, r, he);
+        let (font, ftrack) = if action { (FontId::Label, 0.0) } else { (FontId::Chrome, track) };
+        let icon = if action { 0.0 } else { t(tokens::ICON - 2.0) };
         let room = bw - t(tokens::SPACE_M) * 2.0 - icon - t(tokens::SPACE_XS);
-        let cw = self.atlas.metrics(FontId::Chrome).cell_w + track;
-        let shown = truncate_tail(text, (room / cw).floor().max(2.0) as usize);
-        let tx = if icon > 0.0 { bx + t(tokens::SPACE_M) } else { (bx + (bw - self.text_w(FontId::Chrome, &shown, track)) / 2.0).round() };
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, tx, (by + (bh - chrome_h) / 2.0).round(), &shown, self.palette.text2, 1.0, track);
-        if icon == 0.0 {
+        let shown = self.fit_tail(font, text, room, ftrack);
+        let tx = if action { (bx + (bw - self.text_w(font, &shown, ftrack)) / 2.0).round() } else { bx + t(tokens::SPACE_M) };
+        let ty = (by + (bh - self.atlas.metrics(font).cell_h) / 2.0).round();
+        let ink = Rgb::from_triple(crate::instrument::GEL_TEXT);
+        Self::engrave(&mut self.atlas, out, font, tx, ty, &shown, hair, ftrack);
+        let _ = Self::draw_text(&mut self.atlas, out, font, tx, ty, &shown, ink, 1.0, ftrack);
+        if action {
             return;
         }
         let ix = bx + bw - t(tokens::SPACE_M) - icon;
-        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, (ix, by, icon, bh), icon, self.scale.max(1.0), self.palette.mute.lerp(self.palette.text2, he), 1.0);
+        Self::draw_icon(&mut self.atlas, out, Icon::Chevron, (ix, by, icon, bh), icon, hair, ink, 1.0);
     }
 
     /// an on/off switch at the leading edge of its row rect
@@ -5751,14 +5909,19 @@ impl Renderer {
         let knob = sh - t(tokens::SPACE_XS);
         let kx = if on { track_r.0 + sw - knob - t(tokens::SPACE_2XS) } else { track_r.0 + t(tokens::SPACE_2XS) };
         let ky = track_r.1 + t(tokens::SPACE_2XS);
+        let hair = self.scale.max(1.0);
+        // on is a lit aqua gel; off sinks into a well. the knob is a pearl
+        // either way, so state reads from position and color together
         if on {
-            Self::push_shape(out, track_r, [sh / 2.0, 0.0, 0.0], self.palette.paper, 0.9 + 0.1 * he);
-            Self::push_round(out, kx, ky, knob, knob, knob / 2.0, self.palette.ink0, 1.0);
+            Self::push_button(out, track_r, sh / 2.0, hair, true, false, 1.0);
         } else {
-            Self::push_shape(out, track_r, [sh / 2.0, 0.0, 0.0], self.palette.ink3, 1.0);
-            Self::push_ring(out, track_r, sh / 2.0, self.scale.max(1.0), self.palette.rule2.lerp(self.palette.mute, he), 1.0);
-            Self::push_round(out, kx, ky, knob, knob, knob / 2.0, self.palette.mute.lerp(self.palette.text2, he), 1.0);
+            let _ = self.push_well(out, track_r, sh / 2.0, false);
         }
+        Self::gel_hover(out, track_r, sh / 2.0, he);
+        let pearl = (kx, ky, knob, knob);
+        Self::push_shadow(out, pearl, knob / 2.0, hair, hair, Rgb::new(0, 0, 0), 0.5);
+        Self::push_grad(out, pearl, knob / 2.0, (0.0, 0.0), Rgb::new(255, 255, 255), 1.0, Rgb::new(0xc8, 0xc8, 0xc8), 1.0);
+        Self::push_ring(out, pearl, knob / 2.0, hair, Rgb::new(0, 0, 0), 0.35);
     }
 
     /// a theme chip: name on top + a live swatch strip of that theme's palette,
@@ -5844,7 +6007,7 @@ impl Renderer {
             Self::push_shape(out, rect, [r, 0.0, 0.0], self.palette.ink3, if active { 1.0 } else { he });
         }
         if active {
-            Self::push_ring(out, rect, r, hair * 1.5, self.palette.paper, 1.0);
+            Self::push_ring(out, rect, r, hair * 2.0, Rgb::from_triple(crate::instrument::AQUA), 1.0);
         } else {
             Self::push_ring(out, rect, r, hair, self.palette.rule2, 1.0);
         }
@@ -5863,31 +6026,23 @@ impl Renderer {
         val_w: f32,
         track: f32,
     ) {
-        let INK_0 = self.palette.ink0;
-        let RULE_2 = self.palette.rule2;
-        let TEXT_2 = self.palette.text2;
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
-
-        let r = tokens::px(tokens::RADIUS_ROW, self.scale);
+        let r = tokens::px(tokens::RADIUS_FIELD, self.scale);
         let hair = self.scale.max(1.0);
-        // one rounded well holding [−] value [+]; each button lights on hover
+        // [−] and [+] gels bracketing the value's inset well
         let (dx, dy, dw, dh) = dec;
-        let well = (dx, dy, inc.0 + inc.2 - dx, dh);
-        Self::push_shape(out, well, [r, 0.0, 0.0], INK_0, 0.6);
-        Self::push_ring(out, well, r, hair, RULE_2, 1.0);
+        let gap = tokens::px(tokens::SPACE_2XS, self.scale);
+        let well = (dx + dw + gap, dy, (val_w - gap * 2.0).max(0.0), dh);
+        let ink = self.push_well(out, well, r, false);
+        let glyph = Rgb::from_triple(crate::instrument::GEL_TEXT);
         for (rect, icon, hot) in [(dec, Icon::Minimize, hot_dec), (inc, Icon::Plus, hot_inc)] {
-            let he = self.hover_a(hot);
-            if he > 0.0 {
-                let inset = tokens::px(tokens::SPACE_2XS, self.scale);
-                let lit = (rect.0 + inset, rect.1 + inset, rect.2 - inset * 2.0, rect.3 - inset * 2.0);
-                Self::push_shape(out, lit, [r - inset, 0.0, 0.0], self.palette.ink3, he);
-            }
+            Self::push_button(out, rect, r, hair, false, false, 1.0);
+            Self::gel_hover(out, rect, r, self.hover_a(hot));
             let size = tokens::px(tokens::ICON - 2.0, self.scale);
-            Self::draw_icon(&mut self.atlas, out, icon, rect, size, hair, self.palette.mute.lerp(TEXT_2, 0.4 + 0.6 * he), 1.0);
+            Self::draw_icon(&mut self.atlas, out, icon, rect, size, hair, glyph, 1.0);
         }
-        // value centered between the buttons
         let vx = (dx + dw + (val_w - self.text_w(FontId::Chrome, val, track)) / 2.0).round();
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, vx, (dy + (dh - chrome_h) / 2.0).round(), val, TEXT_2, 1.0, track);
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, vx, (dy + (dh - chrome_h) / 2.0).round(), val, ink, 1.0, track);
     }
 
     /// a status-bar "KEY value" pair: tracked small-caps key, then its value

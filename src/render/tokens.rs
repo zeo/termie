@@ -11,9 +11,13 @@ pub const SPACE_L: f32 = 16.0;
 pub const SPACE_XL: f32 = 24.0;
 pub const SPACE_2XL: f32 = 32.0;
 
-pub const RADIUS_OVERLAY: f32 = 12.0;
-pub const RADIUS_ROW: f32 = 6.0;
-pub const RADIUS_CHIP: f32 = 4.0;
+/// panels, menus, sheets and cards
+pub const RADIUS_OVERLAY: f32 = 6.0;
+pub const RADIUS_ROW: f32 = 4.0;
+pub const RADIUS_CHIP: f32 = 3.0;
+/// gel buttons read as pills at control height
+pub const RADIUS_BUTTON: f32 = 11.0;
+pub const RADIUS_FIELD: f32 = 5.0;
 
 pub const TITLE_BAR: f32 = 38.0;
 pub const STATUS_BAR: f32 = 24.0;
@@ -34,6 +38,9 @@ pub const TAB_RAIL: f32 = 2.0;
 pub const TAB_DIVIDER: f32 = 16.0;
 
 pub const CONTROL_H: f32 = 28.0;
+/// gel buttons, at the 24pt hit-target floor
+pub const BUTTON_H: f32 = 24.0;
+pub const BUTTON_MIN_W: f32 = 72.0;
 pub const SWITCH_W: f32 = 32.0;
 pub const SWITCH_H: f32 = 18.0;
 pub const FIND_W: f32 = 560.0;
@@ -59,6 +66,8 @@ pub const MENU_W: f32 = 196.0;
 /// floor for chrome text against its surface: wcag aa 4.5:1, asked a touch
 /// high so 8-bit rounding never lands under it
 pub const TEXT_CONTRAST: f32 = 4.6;
+/// floor for icons and other non-text marks against their surface: wcag 1.4.11
+pub const ICON_CONTRAST: f32 = 3.0;
 
 /// unfocused panes fade toward their background by this much
 pub const PANE_DIM: f32 = 0.28;
