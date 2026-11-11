@@ -12899,6 +12899,7 @@ pub(crate) fn timing(label: &str) {
 }
 
 fn main() -> Result<()> {
+    win::restrict_dll_search();
     // dev-only headless screen dumper; never compiled into release
     #[cfg(debug_assertions)]
     if termview::maybe_run() {

@@ -32,6 +32,23 @@ pub fn suppress_child_error_dialogs() {
 #[cfg(not(windows))]
 pub fn suppress_child_error_dialogs() {}
 
+/// drop the current folder and PATH from the dll search: conpty.dll (portable-pty)
+/// and dxcompiler.dll (wgpu) are loaded by bare name, so a copy planted in the
+/// folder termie starts in would otherwise load whenever the app folder has none
+#[cfg(windows)]
+pub fn restrict_dll_search() {
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restrict_dll_search() {}
+
 /// app / taskbar / alt-tab icon as RGBA: the ">_<" mark, decoded from the 1024
 /// master (assets/icon.png) into a 128x128 raw RGBA blob at build time so we
 /// stay free of any image-decoding dependency at runtime
@@ -2470,5 +2487,51 @@ mod tests {
         assert!(parse_kwin_drag_snapshot("7\n0,0,0,0,100").is_none());
         assert!(parse_kwin_drag_snapshot("7\n0,NaN,0,100,100").is_none());
         assert!(parse_kwin_drag_snapshot("7\n0,0,0,100,100,extra").is_none());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::restrict_dll_search;
+
+    const PLANTED: &str = "termie-planted.dll";
+
+    fn load_error(name: &str) -> u32 {
+        unsafe extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        assert!(module.is_null(), "the planted file is not a real dll");
+        unsafe { GetLastError() }
+    }
+
+    // runs in the child spawned by the test below, whose current folder holds the plant
+    #[test]
+    #[ignore = "helper for a_dll_planted_in_the_current_folder_is_not_loaded"]
+    fn dll_search_probe() {
+        if !std::path::Path::new(PLANTED).exists() {
+            return;
+        }
+        let before = load_error(PLANTED);
+        restrict_dll_search();
+        println!("before={before} after={}", load_error(PLANTED));
+    }
+
+    #[test]
+    fn a_dll_planted_in_the_current_folder_is_not_loaded() {
+        let dir = std::env::temp_dir().join(format!("termie-dll-plant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PLANTED), b"not a dll").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "win::windows_tests::dll_search_probe", "--ignored", "--nocapture"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        // 193 = ERROR_BAD_EXE_FORMAT, the plant was found; 126 = ERROR_MOD_NOT_FOUND
+        assert!(out.contains("before=193 after=126"), "probe output: {out}");
     }
 }
