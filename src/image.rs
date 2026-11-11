@@ -364,13 +364,16 @@ fn decode(format: u32, w: u32, h: u32, data: &[u8]) -> Option<Image> {
 /// decode a PNG into RGBA8 using the `png` crate; width/height come from the PNG
 /// header. EXPAND|STRIP_16 normalizes paletted / low-bit / 16-bit down to 8-bit,
 /// leaving grayscale / grayscale-alpha / rgb / rgba, which we widen to RGBA8. the
-/// decoded-size guard rejects a decompression bomb before allocating
+/// decoded-size guard rejects a decompression bomb before allocating; it checks
+/// the widened RGBA size, since a 1-bit grayscale frame grows 32x on the way
 pub(crate) fn decode_png(data: &[u8]) -> Option<Image> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
+    let header = reader.info();
+    let rgba_bytes = (header.width as usize).checked_mul(header.height as usize)?.checked_mul(4)?;
     let sz = reader.output_buffer_size()?;
-    if sz == 0 || sz > MAX_IMAGE_BYTES {
+    if sz == 0 || sz > MAX_IMAGE_BYTES || rgba_bytes > MAX_IMAGE_BYTES {
         return None;
     }
     let mut buf = vec![0u8; sz];
@@ -473,6 +476,21 @@ mod tests {
         let img = s.get(id).unwrap();
         assert_eq!((img.width, img.height), (2, 1));
         assert_eq!(img.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn a_grayscale_png_cannot_widen_past_the_decoded_budget() {
+        // 1-bit gray decodes to 16.8 MiB, under the cap, but widens to 67 MiB of RGBA
+        let (w, h) = (4097, 4096);
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, w, h);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::One);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&vec![0; w.div_ceil(8) as usize * h as usize]).unwrap();
+        }
+        assert!(decode_png(&bytes).is_none());
     }
 
     #[test]
