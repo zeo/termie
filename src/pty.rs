@@ -175,7 +175,8 @@ fn isolate_in_user_scope(cmd: &mut CommandBuilder) -> Option<UserScope> {
 #[cfg(windows)]
 const PWSH_PROMPT_HOOK: &str = r#"$global:__termie_prompt = $function:prompt; function prompt { $ok=$?; $code=if($ok){0}elseif($global:LASTEXITCODE){$global:LASTEXITCODE}else{1}; $p=$PWD.ProviderPath; [char]27+']133;D;'+$code+[char]27+'\'+[char]27+']133;A'+[char]27+'\'+[char]27+']7;file:///'+($p -replace '\\','/')+[char]27+'\'+(& $global:__termie_prompt)+[char]27+']133;B'+[char]27+'\' }"#;
 
-// cmd expands $e to ESC and %PROMPT% before it installs the new prompt
+// cmd expands $e to ESC and %PROMPT% before it installs the new prompt; it
+// must hold no blank, or the arg gets quoted and the trailing backslash doubled
 const CMD_PROMPT_HOOK: &str = r#"$e]133;D$e\$e]133;A$e\$e]9;9;$P$e\%PROMPT%$e]133;B$e\"#;
 
 /// the pwsh hook, with the OSC-7 uri shaped per OS: windows paths need the
@@ -467,7 +468,8 @@ impl Pty {
                     "cmd" => {
                         prompt_markers_trusted = true;
                         c.arg("/K");
-                        c.arg(format!("prompt {CMD_PROMPT_HOOK}"));
+                        c.arg("prompt");
+                        c.arg(CMD_PROMPT_HOOK);
                     }
                     "wsl" => {
                         // launch a specific distro when one is configured (else the
@@ -1237,6 +1239,11 @@ mod tests {
     use std::io::Result as IoResult;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn the_cmd_prompt_hook_reaches_cmd_unquoted() {
+        assert!(!CMD_PROMPT_HOOK.contains([' ', '\t', '"']), "a quoted hook ends in a doubled backslash");
+    }
 
     #[derive(Debug)]
     struct TrackingChild(Arc<AtomicBool>);
