@@ -3721,6 +3721,22 @@ fn paint_after_output(pending: &mut Option<Instant>, in_sync: bool) -> bool {
     }
 }
 
+/// shortest gap between two bell flashes, well under the three-a-second
+/// photosensitivity ceiling
+const BELL_GAP: Duration = Duration::from_secs(1);
+
+/// take a pane's pending bell; true when it should reach the user. a BEL flood
+/// restarts the border flash at most once per `BELL_GAP` so it can't strobe
+fn take_bell(bell: &mut bool, flash: &mut Option<Instant>, enabled: bool, now: Instant) -> bool {
+    if !std::mem::take(bell) || !enabled {
+        return false;
+    }
+    if flash.is_none_or(|t| now.saturating_duration_since(t) >= BELL_GAP) {
+        *flash = Some(now);
+    }
+    true
+}
+
 fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Vec<Tab>) -> PaneWindow {
     PaneWindow {
         window,
@@ -11563,9 +11579,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if !p.term.color_queries.is_empty() {
                                 color_reqs = std::mem::take(&mut p.term.color_queries);
                             }
-                            if p.term.bell {
-                                p.term.bell = false;
-                                p.flash = Some(Instant::now());
+                            if take_bell(&mut p.term.bell, &mut p.flash, self.persisted.bell, Instant::now()) {
                                 rang = true;
                                 rang_tab = Some(ti);
                             }
@@ -11635,9 +11649,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if !p.term.color_queries.is_empty() {
                                 sat_color = std::mem::take(&mut p.term.color_queries);
                             }
-                            if p.term.bell {
-                                p.term.bell = false;
-                                p.flash = Some(Instant::now());
+                            if take_bell(&mut p.term.bell, &mut p.flash, self.persisted.bell, Instant::now()) {
                                 sat_rang = true;
                                 sat_rang_tab = Some(ti);
                             }
@@ -12789,6 +12801,26 @@ mod tests {
         let bytes = b"\xef\xbb\xbftheme=nord\nbookmark=C:\\caf\xe9\nosc52=true\n";
         let text = read_text(std::io::Cursor::new(bytes), 1024).unwrap();
         assert_eq!(text, "theme=nord\nbookmark=C:\\caf\u{fffd}\nosc52=true\n");
+    }
+
+    #[test]
+    fn a_bell_flood_flashes_at_most_once_per_gap_and_off_silences_it() {
+        let start = Instant::now();
+        let mut flash = None;
+        let mut bell = true;
+        assert!(take_bell(&mut bell, &mut flash, true, start));
+        assert_eq!((bell, flash), (false, Some(start)));
+        bell = true;
+        assert!(take_bell(&mut bell, &mut flash, true, start + Duration::from_millis(100)));
+        assert_eq!(flash, Some(start), "a bell inside the gap keeps the running flash");
+        bell = true;
+        assert!(take_bell(&mut bell, &mut flash, true, start + BELL_GAP));
+        assert_eq!(flash, Some(start + BELL_GAP));
+        bell = true;
+        let mut quiet = None;
+        assert!(!take_bell(&mut bell, &mut quiet, false, start));
+        assert_eq!((bell, quiet), (false, None));
+        assert!(!take_bell(&mut bell, &mut quiet, true, start), "no pending bell");
     }
 
     #[test]

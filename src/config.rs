@@ -82,6 +82,9 @@ pub struct Persisted {
     pub latency_hud: bool,
     /// daily update check against GitHub releases; `update_check=false` opts out
     pub update_check: bool,
+    /// a BEL flashes the pane border, dots a background tab and flashes the
+    /// taskbar; `bell=off` drops all three
+    pub bell: bool,
     /// value of $TERM_PROGRAM for child processes. default "termie". set to a
     /// known host name (e.g. ghostty) only for apps that refuse the kitty
     /// keyboard protocol unless the name is on their allowlist
@@ -134,6 +137,7 @@ impl Default for Persisted {
             inline_paint: true,
             latency_hud: false,
             update_check: true,
+            bell: true,
             term_program: String::from("termie"),
             bookmarks: Vec::new(),
             unreadable: false,
@@ -242,6 +246,9 @@ pub fn render(p: &Persisted) -> String {
     }
     if !p.update_check {
         let _ = writeln!(s, "update_check=false");
+    }
+    if !p.bell {
+        let _ = writeln!(s, "bell=off");
     }
     s
 }
@@ -394,6 +401,7 @@ pub fn parse(text: &str) -> Persisted {
             "inline_paint" => set_bool(&mut p.inline_paint, k, v),
             "latency_hud" => set_bool(&mut p.latency_hud, k, v),
             "update_check" => set_bool(&mut p.update_check, k, v),
+            "bell" => set_bool(&mut p.bell, k, v),
             "term_program" => {
                 // empty falls back to the default at spawn time
                 if !v.is_empty() {
@@ -705,13 +713,14 @@ mod tests {
             font=Cascadia Code\nfont_weight=600\nmin_contrast=4.5\nbackground_image=C:\\bg.png\n\
             background_image_opacity=0.25\nligatures=false\nwsl_distro=Arch\nplugin_sandbox=off\nosc52=true\n\
             acrylic=true\nprofile.dev=pwsh.exe -NoLogo\nprofile.dev.cwd=C:\\repo\ntheme.cmd=koi\n\
-            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\n";
+            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\n";
         let first = render(&parse(text));
         assert_eq!(render(&parse(&first)), first);
         let p = parse(&first);
         assert_eq!((p.font_size, p.padding), (10.5, 3.5));
         assert_eq!(p.cursor, grid::CursorShape::Underline);
-        assert!(p.theme_auto && !p.restore_on_launch && !p.plugin_sandbox && !p.update_check);
+        assert!(p.theme_auto && !p.restore_on_launch && !p.plugin_sandbox && !p.update_check && !p.bell);
+        assert!(parse("").bell);
         assert_eq!(p.profiles[0].cwd.as_deref(), Some("C:\\repo"));
         assert_eq!(p.font.as_deref(), Some("Cascadia Code"));
     }
