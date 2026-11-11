@@ -11,7 +11,7 @@ use crate::grid::{Grid, Line};
 use crate::term::Terminal;
 
 const ROOT: NodeId = NodeId(1);
-const TERMINAL: NodeId = NodeId(2);
+pub const TERMINAL: NodeId = NodeId(2);
 const TITLE_BAR: NodeId = NodeId(3);
 const TAB_LIST: NodeId = NodeId(4);
 const TAB_PANEL: NodeId = NodeId(5);
@@ -65,7 +65,7 @@ pub enum Target {
 }
 
 impl Target {
-    fn node_id(self) -> NodeId {
+    pub fn node_id(self) -> NodeId {
         match self {
             Self::Tab(id) => NodeId(TAB_BASE | id),
             Self::NewTab => NodeId(10),

@@ -76,6 +76,10 @@ pub fn capture(
             r.set_tab_status(vec![0, 3, 0]);
             r.set_notice(Some("deploy: waiting for approval in web-ui".into()));
         }
+        "focus" => {
+            // keyboard focus on the title bar after a lone alt tap
+            r.set_chrome_focus(Some(Hot::Tab(0)));
+        }
         "error" => {
             // a failure that stays on the status bar until dismissed
             r.set_error("couldn't start the requested shell".into());
@@ -312,9 +316,9 @@ mod tests {
     use crate::color::ThemeId;
 
     /// every chrome surface worth guarding, each rendered in every theme
-    const SCENES: [&str; 16] = [
+    const SCENES: [&str; 17] = [
         "split", "attention", "hover", "palette", "menu", "find", "confirm", "rename", "market",
-        "settings", "settings2", "panemode", "notice", "error", "welcome-hints", "readme",
+        "settings", "settings2", "panemode", "notice", "error", "focus", "welcome-hints", "readme",
     ];
     const W: u32 = 1100;
     const H: u32 = 680;

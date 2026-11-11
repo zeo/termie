@@ -1,0 +1,22 @@
+200 key ctrl+t
+500 assert tabs 2
+100 key alt
+100 key right
+100 key enter
+800 assert tabs 3
+100 key alt
+100 key escape
+100 key enter
+300 assert tabs 3
+100 key alt
+100 key home
+100 key shift+tab
+100 key shift+tab
+100 key shift+tab
+100 key alt
+100 key enter
+300 assert tabs 3
+100 key alt
+100 key ctrl+t
+800 assert tabs 4
+100 exit

@@ -954,6 +954,8 @@ pub struct Renderer {
     notice: Option<String>,
     notice_error: bool,
     notice_hit: Option<(f32, f32, f32, f32)>,
+    /// the title-bar target with keyboard focus, drawn with the focus ring
+    chrome_focus: Option<Hot>,
     link_preview: Option<LinkPreview>,
     /// a newer release's version: draws a clickable UPDATE chip on the status
     /// bar until installed. its hit rect is rebuilt each paint
@@ -1680,6 +1682,7 @@ impl Renderer {
             update_hit: None,
             notice_error: false,
             notice_hit: None,
+            chrome_focus: None,
             status_size: (usize::MAX, usize::MAX, String::new()),
             status_cmd: (u64::MAX, String::new()),
             plugins_installed: Vec::new(),
@@ -2324,6 +2327,25 @@ impl Renderer {
         if !self.notice_error {
             self.notice = None;
         }
+    }
+
+    pub fn set_chrome_focus(&mut self, focus: Option<Hot>) {
+        self.chrome_focus = focus;
+    }
+
+    /// the title-bar targets in keyboard order, left to right
+    pub fn chrome_focus_order(&self) -> Vec<Hot> {
+        self.chrome_targets().into_iter().map(|(hot, _)| hot).collect()
+    }
+
+    fn chrome_targets(&self) -> Vec<(Hot, Rect)> {
+        let chrome = self.a11y_chrome_layout();
+        let mut targets: Vec<(Hot, Rect)> = chrome.tabs.into_iter().map(|(i, r)| (Hot::Tab(i), r)).collect();
+        targets.push((Hot::NewTab, chrome.new_tab));
+        targets.push((Hot::NewTabMenu, chrome.new_tab_menu));
+        targets.extend(chrome.controls);
+        targets.retain(|(_, r)| r.2 > 0.0 && r.3 > 0.0);
+        targets
     }
 
     pub fn notice_at(&self, x: f32, y: f32) -> bool {
@@ -4571,6 +4593,12 @@ impl Renderer {
             };
             let size = icon;
             Self::draw_icon(&mut self.atlas, &mut out, glyph, (x0, 0.0, x1 - x0, tbh - hair * 2.0), size, stroke, color, 1.0);
+        }
+
+        if let Some((_, r)) = self.chrome_focus.and_then(|f| self.chrome_targets().into_iter().find(|(h, _)| *h == f)) {
+            let ring = tokens::px(2.0, self.scale).round().max(2.0);
+            let inset = (r.0 + ring, r.1 + ring, r.2 - ring * 2.0, r.3 - ring * 2.0);
+            Self::push_ring(&mut out, inset, t(tokens::RADIUS_FIELD), ring, Rgb::from_triple(crate::instrument::FOCUS), 1.0);
         }
 
         // ---- status bar: a shallow brushed band under the content ----

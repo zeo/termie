@@ -2387,7 +2387,9 @@ fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
         at += Duration::from_millis(ms);
         match verb {
             "key" => {
-                if let Some((mods, key)) = parse_combo(arg) {
+                // a lone alt is a modifier to parse_combo, but a key here
+                let lone_alt = arg.eq_ignore_ascii_case("alt").then(|| (ModifiersState::empty(), Key::Named(NamedKey::Alt)));
+                if let Some((mods, key)) = lone_alt.or_else(|| parse_combo(arg)) {
                     out.push((at, DriveStep::Key(mods, key)));
                 }
             }
@@ -3718,6 +3720,11 @@ struct PaneWindow {
     announce: a11y::Announcer,
     /// the user typed into the focused pane since the announcer last looked
     typed: bool,
+    /// the title-bar target holding keyboard focus (entered with a lone alt
+    /// tap); None while keys go to the terminal
+    chrome_focus: Option<Hot>,
+    /// alt is down and no other key or click has come since it went down
+    alt_tap: bool,
 }
 
 /// pane id, terminal revision, scroll offset, grid origin and cell size bits,
@@ -3785,6 +3792,8 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         a11y_screen: None,
         announce: a11y::Announcer::default(),
         typed: false,
+        chrome_focus: None,
+        alt_tap: false,
     }
 }
 
@@ -6562,7 +6571,7 @@ impl App {
             };
             Some(control(target, label.to_string(), bounds, toggled, false))
         }));
-        a11y::build_tree(
+        let mut update = a11y::build_tree(
             screen.as_ref(),
             &output,
             "termie",
@@ -6572,7 +6581,29 @@ impl App {
             tabs,
             controls,
             panels,
-        )
+        );
+        if let Some(target) = self.pw.chrome_focus.and_then(|hot| self.a11y_target(hot))
+            && update.focus == a11y::TERMINAL
+        {
+            update.focus = target.node_id();
+        }
+        update
+    }
+
+    fn a11y_target(&self, hot: Hot) -> Option<a11y::Target> {
+        Some(match hot {
+            Hot::Tab(index) => a11y::Target::Tab(self.pw.tabs.get(index)?.a11y_id as u64),
+            Hot::NewTab => a11y::Target::NewTab,
+            Hot::NewTabMenu => a11y::Target::NewTabMenu,
+            Hot::SplitV => a11y::Target::SplitVertical,
+            Hot::SplitH => a11y::Target::SplitHorizontal,
+            Hot::PaneMode => a11y::Target::PaneMode,
+            Hot::Gear => a11y::Target::Settings,
+            Hot::Minimize => a11y::Target::Minimize,
+            Hot::Maximize => a11y::Target::Maximize,
+            Hot::Close => a11y::Target::Close,
+            _ => return None,
+        })
     }
 
     fn run_a11y_action(&mut self, request: accesskit::ActionRequest, event_loop: &ActiveEventLoop) {
@@ -9417,7 +9448,10 @@ impl App {
     fn inject_key(&mut self, mods: ModifiersState, logical: &Key, text: Option<&str>, event_loop: &ActiveEventLoop) {
         let saved = self.mods;
         self.mods = mods;
-        if !self.handle_shortcut(logical, text, ElementState::Pressed, event_loop)
+        if *logical == Key::Named(NamedKey::Alt) {
+            self.handle_shortcut(logical, None, ElementState::Pressed, event_loop);
+            self.handle_shortcut(logical, None, ElementState::Released, event_loop);
+        } else if !self.handle_shortcut(logical, text, ElementState::Pressed, event_loop)
             && let Some(id) = self.active_focused_id()
         {
             let (app_cursor, kbd) = self
@@ -9500,7 +9534,7 @@ impl App {
                     } else {
                         let error = format!("--drive: pointer-window {index} is unavailable");
                         log::error!("{error}");
-                        self.drive_error = Some(error);
+                        self.drive_error.get_or_insert(error);
                     }
                 }
                 DriveStep::PointerTab(window, tab) => {
@@ -9534,7 +9568,7 @@ impl App {
                     } else {
                         let error = format!("--drive: tab {tab} in window {window} is unavailable");
                         log::error!("{error}");
-                        self.drive_error = Some(error);
+                        self.drive_error.get_or_insert(error);
                     }
                 }
                 DriveStep::Mouse(state) => {
@@ -9551,7 +9585,7 @@ impl App {
                             self.drive_window
                         );
                         log::error!("{error}");
-                        self.drive_error = Some(error);
+                        self.drive_error.get_or_insert(error);
                     }
                 }
                 DriveStep::Assert(metric, expected) => {
@@ -9599,7 +9633,7 @@ impl App {
                             "--drive: {metric:?} assertion failed (expected {expected}, got {actual})"
                         );
                         log::error!("{error}");
-                        self.drive_error = Some(error);
+                        self.drive_error.get_or_insert(error);
                     }
                 }
                 DriveStep::Exit => event_loop.exit(),
@@ -9861,6 +9895,9 @@ impl App {
             WindowEvent::Focused(f) => {
                 if f {
                     self.read_motion_prefs();
+                } else {
+                    self.pw.alt_tap = false;
+                    self.set_chrome_focus(None);
                 }
                 if f && let Some(window) = self.pw.window.as_ref() {
                     win::clear_attention(window);
@@ -10621,6 +10658,10 @@ impl App {
     /// left/right/middle button press+release: context menu, tab close, selection,
     /// click-to-focus, divider/pane drag, link open, widget click, title-bar buttons
     fn on_mouse_input(&mut self, state: ElementState, button: MouseButton, event_loop: &ActiveEventLoop) {
+        if state == ElementState::Pressed {
+            self.pw.alt_tap = false;
+            self.set_chrome_focus(None);
+        }
         if button == MouseButton::Left
             && state == ElementState::Pressed
             && let Some(accept) = self.pw.renderer.as_ref().and_then(|r| r.dialog_btn_at(self.pw.cursor.x as f32, self.pw.cursor.y as f32))
@@ -11158,6 +11199,60 @@ impl App {
         self.redraw();
     }
 
+    /// an overlay or mode that takes the keyboard from the terminal
+    fn overlay_open(&self) -> bool {
+        self.market.is_some()
+            || self.find_is_open_here()
+            || self.palette.is_some()
+            || self.font_pick.is_some()
+            || self.pw.settings_open
+            || self.pw.pane_mode
+            || self.mark.is_some()
+    }
+
+    fn set_chrome_focus(&mut self, focus: Option<Hot>) {
+        if self.pw.chrome_focus == focus {
+            return;
+        }
+        self.pw.chrome_focus = focus;
+        if let Some(r) = self.pw.renderer.as_mut() {
+            r.set_chrome_focus(focus);
+        }
+        self.redraw();
+        self.update_a11y();
+    }
+
+    /// a key while the title bar holds focus: arrows and tab move along the
+    /// tabs and buttons, enter or space presses the focused one, esc hands
+    /// the keys back; typing hands them back too so a stray alt tap costs nothing
+    fn chrome_key(&mut self, hot: Hot, logical: &Key, text: Option<&str>, event_loop: &ActiveEventLoop) -> bool {
+        let order = self.pw.renderer.as_ref().map(|r| r.chrome_focus_order()).unwrap_or_default();
+        let at = order.iter().position(|h| *h == hot);
+        let step = |by: isize| {
+            let n = order.len() as isize;
+            at.map_or(order.first(), |i| order.get((i as isize + by).rem_euclid(n.max(1)) as usize)).copied()
+        };
+        let back = self.mods.shift_key();
+        match logical {
+            Key::Named(NamedKey::Escape) => self.set_chrome_focus(None),
+            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp) => self.set_chrome_focus(step(-1)),
+            Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown) => self.set_chrome_focus(step(1)),
+            Key::Named(NamedKey::Tab) => self.set_chrome_focus(step(if back { -1 } else { 1 })),
+            Key::Named(NamedKey::Home) => self.set_chrome_focus(order.first().copied()),
+            Key::Named(NamedKey::End) => self.set_chrome_focus(order.last().copied()),
+            Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                self.set_chrome_focus(None);
+                self.button_action(event_loop, hot);
+            }
+            _ if text.is_some_and(|t| !t.is_empty() && !t.chars().any(char::is_control)) => {
+                self.set_chrome_focus(None);
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn dismiss_notice(&mut self) {
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_notice(None);
@@ -11252,6 +11347,27 @@ impl App {
     // takes the key event's fields rather than winit's KeyEvent (which can't
     // be constructed) so synthetic --drive keys walk the identical path
     fn handle_shortcut(&mut self, logical: &Key, text: Option<&str>, state: ElementState, event_loop: &ActiveEventLoop) -> bool {
+        // a lone alt tap moves keyboard focus to the title bar the way it
+        // reaches a windows menu bar; the release still reaches the program
+        if *logical == Key::Named(NamedKey::Alt) {
+            match state {
+                ElementState::Pressed => {
+                    self.pw.alt_tap = !self.mods.control_key() && !self.mods.shift_key() && !self.mods.super_key();
+                }
+                ElementState::Released => {
+                    if std::mem::take(&mut self.pw.alt_tap) {
+                        let focus = match self.pw.chrome_focus {
+                            None if !self.overlay_open() && self.pw.pane_menu.is_none() => Some(Hot::Tab(self.pw.active_tab)),
+                            _ => None,
+                        };
+                        self.set_chrome_focus(focus);
+                    }
+                    return false;
+                }
+            }
+        } else if state == ElementState::Pressed {
+            self.pw.alt_tap = false;
+        }
         if state != ElementState::Pressed {
             return false;
         }
@@ -11312,17 +11428,16 @@ impl App {
             self.redraw();
             return true;
         }
+        // a ctrl or alt chord hands the keys back and runs as usual
+        if let Some(hot) = self.pw.chrome_focus {
+            if !self.mods.control_key() && !self.mods.alt_key() {
+                return self.chrome_key(hot, logical, text, event_loop);
+            }
+            self.set_chrome_focus(None);
+        }
         // user keybindings take precedence over the built-in shortcuts, but
         // never over an open overlay or pane mode
-        if !self.keybindings.is_empty()
-            && self.market.is_none()
-            && !self.find_is_open_here()
-            && self.palette.is_none()
-            && self.font_pick.is_none()
-            && !self.pw.settings_open
-            && !self.pw.pane_mode
-            && self.mark.is_none()
-        {
+        if !self.keybindings.is_empty() && !self.overlay_open() {
             let mods = self.mods;
             let act = self
                 .keybindings
@@ -11339,13 +11454,7 @@ impl App {
         // way windows terminal does; with no selection it falls through so the
         // shell still receives the interrupt. ctrl+shift+c stays the unconditional
         // copy chord
-        if self.market.is_none()
-            && !self.find_is_open_here()
-            && self.palette.is_none()
-            && self.font_pick.is_none()
-            && !self.pw.settings_open
-            && !self.pw.pane_mode
-            && self.mark.is_none()
+        if !self.overlay_open()
             && self.mods.control_key()
             && !self.mods.shift_key()
             && !self.mods.alt_key()
@@ -12185,6 +12294,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 if f {
                     self.read_motion_prefs();
+                } else {
+                    self.pw.alt_tap = false;
+                    self.set_chrome_focus(None);
                 }
                 if f && let Some(window) = self.pw.window.as_ref() {
                     win::clear_attention(window);
@@ -13167,7 +13279,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 6);
+        assert_eq!(paths.len(), 7);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);
