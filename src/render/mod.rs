@@ -4422,7 +4422,7 @@ impl Renderer {
                 }
                 if pv.focused {
                     let m = atlas.metrics(FontId::Content);
-                    for (row, col, _, label) in hints.unwrap_or(&[]) {
+                    for (row, col, _, label) in hints.unwrap_or(&[]).iter().filter(|h| !h.3.is_empty()) {
                         let (x, y) = (info.0 + *col as f32 * m.cell_w, info.1 + *row as f32 * m.cell_h);
                         Self::push_rect(&mut out, x, y, label.len() as f32 * m.cell_w, m.cell_h, pal.paper, 1.0);
                         let _ = Self::draw_text(atlas, &mut out, FontId::Content, x, y, label, pal.bg, 1.0, 0.0);

@@ -307,7 +307,16 @@ pub fn capture(
     {
         let spans = t.grid.hint_spans();
         let labels = crate::hint_labels(spans.len());
-        r.set_hints(Some(spans.into_iter().rev().zip(labels).map(|((row, a, b, _), label)| (row, a, b, label)).collect()));
+        r.set_hints(Some(
+            spans
+                .into_iter()
+                .rev()
+                .zip(labels)
+                .flat_map(|((pieces, _), label)| {
+                    pieces.into_iter().enumerate().map(move |(i, (r, a, b))| (r, a, b, if i == 0 { label.clone() } else { String::new() }))
+                })
+                .collect(),
+        ));
     }
 
     let panes: Vec<PaneView> = terms

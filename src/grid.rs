@@ -342,6 +342,9 @@ pub struct CommandBlock {
 
 /// terminal cell width of a char: 0 (combining/zero-width), 1 (normal), or 2
 /// (East-Asian wide / fullwidth / emoji). a compact built-in table (no deps)
+/// a hint's (viewport row, col_start, col_end exclusive) pieces and its text
+pub type HintSpan = (Vec<(usize, usize, usize)>, String);
+
 fn is_hint(t: &str) -> bool {
     let url = (t.starts_with("https://") || t.starts_with("http://")) && t.len() >= 10;
     let (host, port) = t.split_once(':').unwrap_or((t, "0"));
@@ -562,39 +565,53 @@ impl Grid {
         Some((col_start, col_end, url))
     }
 
-    /// every url, path, git hash and ipv4 address on screen, as (viewport row,
-    /// col_start, col_end exclusive, text), top to bottom
-    pub fn hint_spans(&self) -> Vec<(usize, usize, usize, String)> {
+    /// every url, path, git hash and ipv4 address on screen, top to bottom, as
+    /// its text and the (viewport row, col_start, col_end exclusive) pieces it
+    /// covers: one per row it soft-wraps across
+    pub fn hint_spans(&self) -> Vec<HintSpan> {
         let delim = |c: char| c.is_whitespace() || "\"'`<>()[]{}|".contains(c);
         let mut out = Vec::new();
-        for row in 0..self.rows {
-            let cells: Vec<(usize, char)> =
-                self.line_at(row).iter().enumerate().filter(|(_, c)| c.c != '\0').map(|(i, c)| (i, c.c)).collect();
+        let mut row = 0;
+        while row < self.rows {
+            let mut cells: Vec<(usize, usize, char)> = Vec::new();
+            loop {
+                let line = self.line_at(row);
+                cells.extend(line.iter().enumerate().filter(|(_, c)| c.c != '\0').map(|(i, c)| (row, i, c.c)));
+                row += 1;
+                if !line.wrapped || row == self.rows {
+                    break;
+                }
+            }
             let mut i = 0;
             while i < cells.len() {
-                if delim(cells[i].1) {
+                if delim(cells[i].2) {
                     i += 1;
                     continue;
                 }
                 let start = i;
-                while i < cells.len() && !delim(cells[i].1) {
+                while i < cells.len() && !delim(cells[i].2) {
                     i += 1;
                 }
                 let mut run = &cells[start..i];
-                while let [rest @ .., (_, c)] = run
+                while let [rest @ .., (_, _, c)] = run
                     && ".,;:!?$#>".contains(*c)
                 {
                     run = rest;
                 }
-                let text: String = run.iter().map(|c| c.1).collect();
+                let text: String = run.iter().map(|c| c.2).collect();
                 // a url glued to a prefix (href=https://...) starts at its scheme
                 let skip = ["https://", "http://"].iter().filter_map(|s| text.find(s)).min().unwrap_or(0);
                 let run = &run[text[..skip].chars().count()..];
                 let text = &text[skip..];
-                if let (Some(&(c0, _)), Some(&(last, lc))) = (run.first(), run.last())
-                    && is_hint(text)
-                {
-                    out.push((row, c0, last + char_width(lc), text.to_string()));
+                if !run.is_empty() && is_hint(text) {
+                    let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+                    for &(r, c, ch) in run {
+                        match pieces.last_mut() {
+                            Some(piece) if piece.0 == r => piece.2 = c + char_width(ch),
+                            _ => pieces.push((r, c, c + char_width(ch))),
+                        }
+                    }
+                    out.push((pieces, text.to_string()));
                 }
             }
         }
@@ -2677,17 +2694,27 @@ mod tests {
         assert_eq!(
             g.hint_spans(),
             [
-                (0, 5, 19, "https://a.io/x".to_string()),
-                (0, 25, 39, "src/main.rs:12".to_string()),
-                (0, 41, 48, "1a2b3c4".to_string()),
+                (vec![(0, 5, 19)], "https://a.io/x".to_string()),
+                (vec![(0, 25, 39)], "src/main.rs:12".to_string()),
+                (vec![(0, 41, 48)], "1a2b3c4".to_string()),
             ]
         );
         let mut g = Grid::new(2, 40);
         for c in "\u{4e2d}x 10.0.0.1:22 href=http://b.co/q".chars() {
             g.put_char(c);
         }
-        let spans: Vec<_> = g.hint_spans().into_iter().map(|(_, a, b, t)| (a, b, t)).collect();
-        assert_eq!(spans, [(4, 15, "10.0.0.1:22".to_string()), (21, 34, "http://b.co/q".to_string())]);
+        assert_eq!(
+            g.hint_spans(),
+            [
+                (vec![(0, 4, 15)], "10.0.0.1:22".to_string()),
+                (vec![(0, 21, 34)], "http://b.co/q".to_string())
+            ]
+        );
+        let mut g = Grid::new(3, 10);
+        for c in "cat /usr/share/doc/x.txt".chars() {
+            g.put_char(c);
+        }
+        assert_eq!(g.hint_spans(), [(vec![(0, 4, 10), (1, 0, 10), (2, 0, 4)], "/usr/share/doc/x.txt".to_string())]);
     }
 
     #[test]

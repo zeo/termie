@@ -515,17 +515,16 @@ struct Sel {
     reflow_gen: u32,
 }
 
-/// keyboard mark mode: the selection cursor cell (viewport-relative — it moves
-/// with the keys and rides the view at the edges) and, once shift-extending,
-/// the content-anchored point it grows from
-/// keyboard hints: each on-screen match as (absolute line, col_start, col_end,
-/// text, label) and the label letters typed so far
+/// keyboard hints: each on-screen match and the label letters typed so far
 struct HintState {
     pane: usize,
     reflow_gen: u32,
-    items: Vec<(u64, usize, usize, String, String)>,
+    items: Vec<HintItem>,
     typed: String,
 }
+
+/// (absolute line, col_start, col_end) pieces, text, label
+type HintItem = (Vec<(u64, usize, usize)>, String, String);
 
 /// `n` hint labels, home row first; one letter each while they fit, else two
 /// so no label is a prefix of another
@@ -539,6 +538,9 @@ fn hint_labels(n: usize) -> Vec<String> {
     }
 }
 
+/// keyboard mark mode: the selection cursor cell (viewport-relative — it moves
+/// with the keys and rides the view at the edges) and, once shift-extending,
+/// the content-anchored point it grows from
 #[derive(Clone, Copy)]
 struct MarkState {
     cur: (usize, usize),
@@ -9882,7 +9884,12 @@ impl App {
             return;
         };
         let Some((spans, reflow_gen)) = self.focused_grid().map(|g| {
-            let spans: Vec<_> = g.hint_spans().into_iter().rev().map(|(r, a, b, t)| (g.viewport_to_abs(r), a, b, t)).collect();
+            let spans: Vec<_> = g
+                .hint_spans()
+                .into_iter()
+                .rev()
+                .map(|(pieces, text)| (pieces.into_iter().map(|(r, a, b)| (g.viewport_to_abs(r), a, b)).collect(), text))
+                .collect();
             (spans, g.reflow_gen)
         }) else {
             return;
@@ -9895,26 +9902,25 @@ impl App {
             self.set_mark_mode(false);
         }
         let labels = hint_labels(spans.len());
-        let items: Vec<_> = spans
-            .into_iter()
-            .zip(labels)
-            .map(|((line, a, b, text), label)| (line, a, b, text, label))
-            .collect();
+        let items: Vec<_> = spans.into_iter().zip(labels).map(|((pieces, text), label)| (pieces, text, label)).collect();
         let n = items.len();
         self.hints = Some(HintState { pane, reflow_gen, items, typed: String::new() });
         self.show_notice(&format!("{n} hints: type a label to copy, shift and the label to type it, esc cancels"));
     }
 
-    /// on-screen hints still matching what was typed, as viewport spans with
-    /// the label letters left to type
+    /// on-screen pieces of the hints still matching what was typed, as viewport
+    /// spans; a hint's first piece carries the label letters left to type
     fn build_hint_view(&self) -> Option<Vec<(usize, usize, usize, String)>> {
         let h = self.hints.as_ref().filter(|h| Some(h.pane) == self.active_focused_id())?;
         let g = self.focused_grid().filter(|g| g.reflow_gen == h.reflow_gen)?;
         Some(
             h.items
                 .iter()
-                .filter_map(|(line, a, b, _, label)| {
-                    Some((g.abs_to_viewport(*line)?, *a, *b, label.strip_prefix(h.typed.as_str())?.to_string()))
+                .filter_map(|(pieces, _, label)| Some((pieces, label.strip_prefix(h.typed.as_str())?)))
+                .flat_map(|(pieces, left)| {
+                    pieces.iter().enumerate().filter_map(move |(i, &(line, a, b))| {
+                        Some((g.abs_to_viewport(line)?, a, b, if i == 0 { left.to_string() } else { String::new() }))
+                    })
                 })
                 .collect(),
         )
@@ -9943,10 +9949,10 @@ impl App {
             return;
         };
         h.typed.push(ch.to_ascii_lowercase());
-        let mut left = h.items.iter().filter(|i| i.4.starts_with(h.typed.as_str()));
+        let mut left = h.items.iter().filter(|i| i.2.starts_with(h.typed.as_str()));
         let outcome = match (left.next(), left.next()) {
             (None, _) => Some(None),
-            (Some(one), None) if one.4 == h.typed => Some(Some((h.pane, one.3.clone()))),
+            (Some(one), None) if one.2 == h.typed => Some(Some((h.pane, one.1.clone()))),
             _ => None,
         };
         let Some(picked) = outcome else {
