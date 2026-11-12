@@ -71,7 +71,7 @@ Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list
 
 ## shells
 
-Windows auto-detects `pwsh` → `powershell` → `cmd`, with WSL selectable. Linux auto-detects `bash` → `zsh` → `fish` → `pwsh`. PowerShell launches `-NoLogo -NoProfile` unless profile loading is enabled. Bash, zsh, fish, PowerShell, and CMD emit prompt, command-start, command-finished, exit-status, and current-directory marks where the shell exposes them. These marks drive prompt navigation, status badges, scrollbar marks, tab labels, and "new tab here".
+Windows auto-detects `pwsh` → `powershell` → `cmd`, with WSL selectable. Every installed WSL distro and every literal `Host` alias in `~/.ssh/config` also shows up as its own profile (`wsl: Ubuntu`, `ssh: prod`). Linux auto-detects `bash` → `zsh` → `fish` → `pwsh`. PowerShell launches `-NoLogo -NoProfile` unless profile loading is enabled. Bash, zsh, fish, PowerShell, and CMD emit prompt, command-start, command-finished, exit-status, and current-directory marks where the shell exposes them. These marks drive prompt navigation, status badges, scrollbar marks, tab labels, and "new tab here".
 
 Any other shell works as a custom profile — add `profile.<name>=<command line>` to `config` (quote paths with spaces):
 

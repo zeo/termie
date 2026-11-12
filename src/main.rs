@@ -786,26 +786,60 @@ fn all_palette_actions() -> &'static [(&'static str, PaletteAction)] {
     })
 }
 
-/// fold the installed wsl distros into the profile list as synthetic
-/// "wsl: <name>" entries (wsl.exe -d <name>), one per distro. every distro gets
-/// its named entry (like windows terminal) so it's findable even when it's the
-/// default; a name a user profile already defines is left untouched
-fn with_wsl_profiles(mut profiles: Vec<pty::Profile>, distros: Vec<String>) -> Vec<pty::Profile> {
-    for distro in distros {
+/// fold synthetic entries (wsl distros, ssh hosts) into the profile list. every
+/// distro gets its named entry (like windows terminal) so it's findable even
+/// when it's the default; a name a user profile already defines is left untouched
+fn with_synthetic_profiles(
+    mut profiles: Vec<pty::Profile>,
+    entries: impl IntoIterator<Item = (String, Vec<String>)>,
+) -> Vec<pty::Profile> {
+    for (name, argv) in entries {
         if profiles.len() >= MAX_CUSTOM_PROFILES {
             break;
         }
-        let name = format!("wsl: {distro}");
         if !profiles.iter().any(|p| p.name == name) {
-            profiles.push(pty::Profile {
-                name,
-                argv: vec!["wsl.exe".to_string(), "-d".to_string(), distro],
-                cwd: None,
-                env: Vec::new(),
-            });
+            profiles.push(pty::Profile { name, argv, cwd: None, env: Vec::new() });
         }
     }
     profiles
+}
+
+fn wsl_profile(distro: String) -> (String, Vec<String>) {
+    (format!("wsl: {distro}"), vec!["wsl.exe".to_string(), "-d".to_string(), distro])
+}
+
+/// every literal alias on a `Host` line of an ssh_config, as an `ssh: <alias>`
+/// profile. patterns (`*`, `?`, `!`) name no single host, and an alias that
+/// starts with `-` would reach ssh as an option
+fn ssh_profiles(config: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in config.lines() {
+        let line = line.trim();
+        let Some((key, rest)) = line.split_once(|c: char| c.is_whitespace() || c == '=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for alias in rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=').split_whitespace() {
+            let alias = alias.trim_matches('"');
+            if alias.is_empty() || alias.starts_with('-') || alias.contains(['*', '?', '!', '#']) {
+                continue;
+            }
+            let name = format!("ssh: {alias}");
+            if !out.iter().any(|(n, _)| *n == name) {
+                out.push((name, vec!["ssh".to_string(), alias.to_string()]));
+            }
+        }
+    }
+    out
+}
+
+fn ssh_config_profiles() -> Vec<(String, Vec<String>)> {
+    home_dir()
+        .and_then(|home| read_text_file(&Path::new(&home).join(".ssh").join("config"), MAX_STARTUP_TEXT_BYTES))
+        .map(|text| ssh_profiles(&text))
+        .unwrap_or_default()
 }
 
 const MAX_CUSTOM_PROFILES: usize = 128;
@@ -4317,11 +4351,13 @@ impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let p = config::load();
         // install profiles before anything derives from them (palette entries,
-        // shell labels in a restored session). each installed wsl distro joins
-        // the config profiles as a synthetic "wsl: <name>" so it appears in the
-        // palette, jump list, and '+' dropdown; the global wsl_distro still sets
-        // the default distro for the plain wsl shell
-        pty::set_profiles(with_wsl_profiles(p.profiles.clone(), win::wsl_distros()));
+        // shell labels in a restored session). each installed wsl distro and
+        // each ~/.ssh/config host joins the config profiles as a synthetic
+        // "wsl: <name>" / "ssh: <host>" so it appears in the palette, jump list,
+        // and '+' dropdown; the global wsl_distro still sets the default distro
+        // for the plain wsl shell
+        let synthetic = win::wsl_distros().into_iter().map(wsl_profile).chain(ssh_config_profiles());
+        pty::set_profiles(with_synthetic_profiles(p.profiles.clone(), synthetic));
         let cli = parse_args(std::env::args().skip(1));
         let (keybindings, send_inputs, kb_ignored) = load_keybindings();
         #[cfg(target_os = "linux")]
@@ -14254,9 +14290,9 @@ mod tests {
     #[test]
     fn wsl_distros_become_synthetic_profiles() {
         let base = vec![prof("nu", &["nu.exe"])];
-        let merged = with_wsl_profiles(
+        let merged = with_synthetic_profiles(
             base,
-            vec!["Ubuntu".to_string(), "Arch".to_string(), "Ubuntu 22.04 LTS".to_string()],
+            ["Ubuntu", "Arch", "Ubuntu 22.04 LTS"].map(|d| wsl_profile(d.to_string())),
         );
         // config profiles keep their slot; every distro appends unconditionally
         // as wsl.exe -d <name>, and a name with spaces round-trips as one argv
@@ -14271,9 +14307,24 @@ mod tests {
     }
 
     #[test]
+    fn ssh_config_hosts_become_profiles() {
+        let config = "# work\nHost prod staging\n  HostName 10.0.0.1\nhost=box\nHost *.internal !bad -oProxyCommand=x\nMatch host foo\nHost \"quoted\" prod\nHostName nothost\n";
+        let names: Vec<_> = ssh_profiles(config).into_iter().map(|(n, argv)| (n, argv.join(" "))).collect();
+        assert_eq!(
+            names,
+            [
+                ("ssh: prod".to_string(), "ssh prod".to_string()),
+                ("ssh: staging".to_string(), "ssh staging".to_string()),
+                ("ssh: box".to_string(), "ssh box".to_string()),
+                ("ssh: quoted".to_string(), "ssh quoted".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn wsl_synthetic_profile_yields_to_a_user_profile_of_the_same_name() {
         let base = vec![prof("wsl: Ubuntu", &["custom.exe"])];
-        let merged = with_wsl_profiles(base, vec!["Ubuntu".to_string()]);
+        let merged = with_synthetic_profiles(base, [wsl_profile("Ubuntu".to_string())]);
         // the user's own definition wins; no duplicate synthetic entry is added
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].argv, ["custom.exe"]);
@@ -14284,7 +14335,7 @@ mod tests {
         let base = (0..MAX_CUSTOM_PROFILES - 1)
             .map(|i| prof(&format!("profile-{i}"), &["shell"]))
             .collect();
-        let merged = with_wsl_profiles(base, vec!["Ubuntu".to_string(), "Arch".to_string()]);
+        let merged = with_synthetic_profiles(base, ["Ubuntu", "Arch"].map(|d| wsl_profile(d.to_string())));
         assert_eq!(merged.len(), MAX_CUSTOM_PROFILES);
         assert_eq!(merged.last().map(|profile| profile.name.as_str()), Some("wsl: Ubuntu"));
     }
