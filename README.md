@@ -8,11 +8,11 @@ A fast, lightweight GPU terminal multiplexer for Windows and Linux — tabs, spl
 - plugins: registry at [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins)
 - license: MIT OR Apache-2.0
 
-> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core. The global Quake hotkey is Windows-only.
+> Early but daily-usable. Windows and Linux (X11 and Wayland) run the same rendering, emulation, and plugin core.
 
 ## features
 
-GPU-rendered (wgpu glyph-atlas), a ~8.8 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps the default shell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
+GPU-rendered (wgpu glyph-atlas), a ~9.3 MB binary, and a lean dependency tree. A pre-warmed shell pool keeps the default shell ready, so new tabs and splits feel instant and the window appears before any shell finishes spawning.
 
 Tabs and recursive split panes: split vertically or horizontally, drag tabs to reorder them, dock live panes on any side of another pane, move panes between Termie windows, tear tabs or panes into their own window, and broadcast input to every pane in a tab. A pane can swap places with its neighbour, restart its shell in the same folder, or go read-only so stray keys and clicks never reach it. Splits and "new tab here" open in the focused pane's directory; pick a per-tab shell from the command palette: `pwsh` / `cmd` / `wsl` on Windows, `bash` / `zsh` / `fish` on Linux, plus any custom profile. When a background tab's command finishes, its tab rail draws in green or red and settles into a dot; a bell in a background tab dots that tab, and a bell while the window is unfocused asks for attention (a taskbar flash on Windows, the window-manager's urgency hint on Linux), so a finished agent or build finds you first. The status bar follows the focused pane: its directory, a live timer while a command runs, then the exit status and how long it took. Right-click the pinned launcher for a new window, a built-in shell, or any custom profile on either OS (`termie --shell bash` from a script does the same everywhere).
 
@@ -24,7 +24,7 @@ Real terminal emulation: a [vte](https://github.com/alacritty/vte)-based parser,
 
 Inline images via the kitty graphics protocol (raw RGB / RGBA / PNG, cursor flow like kitty's, z-index stacking, scoped deletes, unicode placeholders so images survive tmux and scrollback) and sixel — `img2sixel`, `chafa`, `lsix`, and anything else that probes DA1 finds both — plus full-color emoji, all packed into a dedicated RGBA atlas beside the glyph cache. On Windows, installs ship a current ConPTY host (`conpty.dll` + `OpenConsole.exe`, MIT, from microsoft/terminal) beside the exe, because the ConPTY built into Windows strips sixel before a terminal ever sees it; on Linux the kernel pty passes every byte through untouched, so nothing extra is needed. IME composition, a screen-reader path via AccessKit, and session restore: every window comes back with its tabs and splits, and after a clean exit each pane's last 5,000 lines come back too (`restore_contents=false` keeps only the layout). The layout also survives a crash.
 
-Termie can be the **default terminal**: run "default terminal" from the palette once. On Windows 11, console apps launched from the run box, the start menu, or a double-clicked script open in a Termie window instead of the legacy console host. On KDE Plasma and Linux desktops that use `xdg-terminal-exec`, terminal launchers and `Terminal=true` desktop apps open in Termie. The same palette action turns it back off, restores the previous choice, and uninstalling removes Termie's selection.
+Termie can be the **default terminal**: run "default terminal" from the palette once. On Windows 11, console apps launched from the run box, the start menu, or a double-clicked script open in a Termie window instead of the legacy console host. On KDE Plasma and Linux desktops that use `xdg-terminal-exec`, terminal launchers and `Terminal=true` desktop apps open in Termie. The same palette action turns it back off and restores the previous choice; on Windows, run it before uninstalling, because the installer leaves that setting alone. The Linux archive's `uninstall.sh` restores it for you.
 
 "New admin window" opens the focused directory with an elevated shell. Windows uses its UAC relaunch; Linux keeps the graphical process in the desktop session and elevates only the new PTY through Polkit, with `sudo` as the fallback.
 
@@ -32,11 +32,15 @@ A command palette (`Ctrl+P`) for fuzzy access to every action, each listed with 
 
 ![the command palette](palette.gif)
 
+With shell integration, every command becomes a block: `copy command output`, `select command output`, `copy command`, and `rerun command` in the palette act on the command in view, and `add mark` / `clear marks` set your own scrollbar marks. Find (`Ctrl+Shift+F`) switches to regular expressions on its `.*` button or `Alt+R`, and to matching case on `Aa` or `Alt+C`.
+
+Accessibility comes first in the chrome. Screen readers see the tabs, title-bar buttons, menus, dialogs, the palette, find, and settings through AccessKit, and read the terminal as text with a caret and a polite announcement of new output. A lone `Alt` tap moves keyboard focus to the title bar with a visible ring: arrows or `Tab` move, `Enter` presses, `Esc` hands the keys back. Menus and the settings panel (`Ctrl+,`) work from the keyboard alone, including rebinding a shortcut by pressing the new chord. Chrome text follows the system text size, and `ui_scale` (0.75 to 2) scales it further without touching the terminal font. Windows high contrast redraws the chrome in system colors. Done and failed marks carry a check or a bang as well as a color, tab close and the new-tab chevron are 24 points wide, and reduced motion turns animations into fades and holds the cursor steady.
+
 A plugin system: plugins run as separate processes over a small JSON protocol, render widgets in a side dock (text or drawn graphics), talk over an in-process bus, and run inside an OS sandbox by default: a Windows AppContainer or a Linux [bubblewrap](https://github.com/containers/bubblewrap) jail. An in-app marketplace browses and installs them.
 
 ## install
 
-**Windows.** Download `termie-<version>-setup.exe` from the [latest release](https://github.com/zeo/termie/releases/latest) and run it — a small native installer in termie's own style, not a wizard. It installs per-user (no admin prompt), and the options are right on its one page: `PATH`, Start-menu and desktop shortcuts, and the "Open in termie" right-click entry. It shows up in Add/Remove Programs, replaces any older install (including the previous MSI, after asking), and uninstalls cleanly. The build is unsigned, so SmartScreen may warn first: **More info → Run anyway**.
+**Windows.** Download `termie-<version>-setup.exe` from the [latest release](https://github.com/zeo/termie/releases/latest) and run it. It is the small installer shared by the rot apps: it downloads the termie package, checks it against the release's minisign key, and installs it. `termie-<version>-offline-setup.exe` carries the package inside for machines without a connection. A per-user install lands in `%LOCALAPPDATA%\Programs\termie` with no admin prompt, adds a Start-menu shortcut, registers `termie` with the Run box, puts "Open in Termie" on folder right-click menus, and shows up in Add/Remove Programs for a clean uninstall. It does not touch `PATH` or remove an old MSI install; uninstall that from Add/Remove Programs first. The installer and binaries carry an Authenticode signature from the project's own certificate rather than a public authority, so SmartScreen may still warn: **More info → Run anyway**.
 
 termie checks for a newer release once a day and shows a small `UPDATE` chip on the status bar when one exists. Clicking it (or running "update termie" from the palette) checks the release asset against its GitHub sha256 digest and the project's minisign signature (key `RWQRQ/2x8ye761U+afRxVwfgmAO6Z8kWzoLiBuZ6Lrlm1KLuokQ/PA/8`), installs the new version, and relaunches with your session restored; nothing downloads without that confirmation. Linux archive installs update in place. Package-manager and source builds keep their owner and open the release page. Turn the check off entirely with `update_check=false` in `config`.
 
@@ -59,6 +63,7 @@ termie checks for a newer release once a day and shows a small `UPDATE` chip on 
 | `Ctrl+Shift+A` | select all text in the focused pane |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste (also `Ctrl+Insert` / `Shift+Insert`) |
 | `Ctrl+Shift+F` | find in scrollback |
+| `Ctrl+,` | settings |
 | `Ctrl+Shift+B` | broadcast input to every pane |
 | `Ctrl+Alt+A` | jump to the next pane that failed, rang, or finished |
 | `Ctrl+Shift+W` | close pane |
@@ -68,7 +73,7 @@ termie checks for a newer release once a day and shows a small `UPDATE` chip on 
 | `F11` | fullscreen |
 | `Ctrl`+wheel | font zoom |
 
-Every binding is rebindable (or unbindable) in `keybindings.conf`; the full list is in the command palette.
+Every binding is rebindable (or unbindable) in `keybindings.conf` or from the settings panel, where you pick a shortcut and press the new chord; the full list is in the command palette.
 
 ## shells
 
