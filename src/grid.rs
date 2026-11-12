@@ -279,11 +279,22 @@ fn default_tab_stops(cols: usize) -> Vec<bool> {
 
 /// an OSC 133 prompt mark: the absolute line of the prompt start plus the
 /// command's exit code once its `D` arrives (None while running, or when the
-/// shell omits the code)
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// shell omits the code). `input` is where the typed command begins (`B`) and
+/// `output` the first line the command printed to (`C`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PromptMark {
     pub line: u64,
     pub exit: Option<i32>,
+    pub input: Option<(u64, usize)>,
+    pub output: Option<u64>,
+}
+
+/// one command in history: its prompt mark plus where the next prompt begins
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CommandBlock {
+    pub mark: PromptMark,
+    /// absolute line of the following prompt, or None for the newest block
+    pub end: Option<u64>,
 }
 
 /// terminal cell width of a char: 0 (combining/zero-width), 1 (normal), or 2
@@ -1009,15 +1020,20 @@ impl Grid {
         let mut physical: Vec<Line> = Vec::with_capacity(self.scrollback.len() + self.lines.len());
         physical.extend(self.scrollback.drain(..));
         physical.append(&mut self.lines);
-        // translate each retained prompt into its row in the old physical grid
-        // reflow turns that row into a logical-line offset, then back into a
-        // physical row at the new width
-        let prompt_rows: Vec<(usize, Option<i32>)> = self
-            .prompts
-            .iter()
-            .filter_map(|m| m.line.checked_sub(prompt_base).map(|row| (row, m.exit)))
-            .filter_map(|(row, exit)| (row < physical.len() as u64).then_some((row as usize, exit)))
-            .collect();
+        // translate each retained prompt's start, input and output points into
+        // rows of the old physical grid; reflow turns each into a logical-line
+        // offset, then back into a row and column at the new width
+        let marks = std::mem::take(&mut self.prompts);
+        let mut prompt_rows: Vec<(usize, usize, usize, u8)> = Vec::with_capacity(marks.len() * 3);
+        for (idx, m) in marks.iter().enumerate() {
+            let points = [Some((m.line, 0)), m.input, m.output.map(|l| (l, 0))];
+            for (kind, (line, col)) in points.into_iter().enumerate().filter_map(|(k, p)| Some((k as u8, p?))) {
+                if let Some(row) = line.checked_sub(prompt_base).filter(|&row| row < physical.len() as u64) {
+                    prompt_rows.push((row as usize, col, idx, kind));
+                }
+            }
+        }
+        prompt_rows.sort_by_key(|&(row, col, ..)| (row, col));
         // image placements ride the same translation, so a width change keeps
         // kitty graphics anchored to their content instead of dropping them
         let mut placement_rows: Vec<(usize, Placement)> = self
@@ -1043,7 +1059,7 @@ impl Grid {
         // join physical lines into logical lines across soft-wraps; record the
         // cursor's logical line index + character offset within it
         let mut logical: Vec<Vec<Cell>> = Vec::new();
-        let mut prompt_offsets: Vec<(usize, usize, Option<i32>)> = Vec::with_capacity(prompt_rows.len());
+        let mut prompt_offsets: Vec<(usize, usize, usize, u8)> = Vec::with_capacity(prompt_rows.len());
         let mut placement_offsets: Vec<(usize, usize, Placement)> =
             Vec::with_capacity(placement_rows.len());
         let mut next_prompt = 0usize;
@@ -1054,11 +1070,11 @@ impl Grid {
             let li = logical.len();
             let mut cells: Vec<Cell> = Vec::new();
             loop {
-                while let Some(&(row, exit)) = prompt_rows.get(next_prompt) {
+                while let Some(&(row, col, idx, kind)) = prompt_rows.get(next_prompt) {
                     if row != i {
                         break;
                     }
-                    prompt_offsets.push((li, cells.len(), exit));
+                    prompt_offsets.push((li, cells.len() + col, idx, kind));
                     next_prompt += 1;
                 }
                 while let Some(&(row, pl)) = placement_rows.get(next_pl) {
@@ -1095,7 +1111,7 @@ impl Grid {
         // re-split each logical line at the new width
         let mut np: Vec<Line> = Vec::new();
         let mut new_cur_abs = 0usize;
-        let mut new_prompts = Vec::with_capacity(prompt_offsets.len());
+        let mut new_prompts: Vec<Option<PromptMark>> = vec![None; marks.len()];
         let mut new_placements: Vec<Placement> = Vec::with_capacity(placement_offsets.len());
         let mut next_prompt = 0usize;
         let mut next_pl = 0usize;
@@ -1113,15 +1129,26 @@ impl Grid {
                     j = end;
                 }
             }
-            while let Some(&(prompt_li, offset, exit)) = prompt_offsets.get(next_prompt) {
+            while let Some(&(prompt_li, offset, idx, kind)) = prompt_offsets.get(next_prompt) {
                 if prompt_li != li {
                     break;
                 }
                 let segments = np.len() - start;
-                new_prompts.push(PromptMark {
-                    line: (start + (offset / new_cols).min(segments - 1)) as u64,
-                    exit,
-                });
+                let line = (start + (offset / new_cols).min(segments - 1)) as u64;
+                let col = (offset % new_cols).min(new_cols - 1);
+                match kind {
+                    0 => new_prompts[idx] = Some(PromptMark { line, exit: marks[idx].exit, ..Default::default() }),
+                    1 => {
+                        if let Some(m) = new_prompts[idx].as_mut() {
+                            m.input = Some((line, col));
+                        }
+                    }
+                    _ => {
+                        if let Some(m) = new_prompts[idx].as_mut() {
+                            m.output = Some(line);
+                        }
+                    }
+                }
                 next_prompt += 1;
             }
             while let Some(&(pl_li, offset, pl)) = placement_offsets.get(next_pl) {
@@ -1165,10 +1192,14 @@ impl Grid {
             evicted += 1;
         }
         self.prompts.clear();
-        for m in new_prompts
-            .into_iter()
-            .filter_map(|m| m.line.checked_sub(evicted).map(|line| PromptMark { line, ..m }))
-        {
+        for m in new_prompts.into_iter().flatten().filter_map(|m| {
+            Some(PromptMark {
+                line: m.line.checked_sub(evicted)?,
+                input: m.input.and_then(|(l, c)| Some((l.checked_sub(evicted)?, c))),
+                output: m.output.and_then(|l| l.checked_sub(evicted)),
+                ..m
+            })
+        }) {
             if self.prompts.last().map(|p| p.line) != Some(m.line) {
                 self.prompts.push(m);
             }
@@ -1223,7 +1254,97 @@ impl Grid {
         while self.prompts.last().is_some_and(|m| m.line >= abs) {
             self.prompts.pop();
         }
-        self.prompts.push(PromptMark { line: abs, exit: None });
+        self.prompts.push(PromptMark { line: abs, ..Default::default() });
+    }
+
+    /// the typed command starts here (OSC 133 ;B)
+    pub fn mark_input(&mut self) {
+        let at = (self.total_scrolled + self.cursor.row as u64, self.cursor.col);
+        if let Some(m) = self.prompts.last_mut().filter(|m| m.line <= at.0) {
+            m.input = Some(at);
+        }
+    }
+
+    /// the command's output starts on the cursor's line (OSC 133 ;C)
+    pub fn mark_output(&mut self) {
+        let at = self.total_scrolled + self.cursor.row as u64;
+        let col = self.cursor.col;
+        if let Some(m) = self.prompts.last_mut().filter(|m| m.line <= at) {
+            m.output = Some(at);
+            // a shell that sends B together with C (fish) never said where the
+            // typed command began; the prompt text must not pass for it
+            if m.input == Some((at, col)) {
+                m.input = None;
+            }
+        }
+    }
+
+    /// a hand-placed mark on the cursor's line, for jumping back to later
+    pub fn add_mark(&mut self) {
+        let abs = self.total_scrolled + self.cursor.row as u64;
+        let at = self.prompts.partition_point(|m| m.line < abs);
+        if self.prompts.get(at).map(|m| m.line) != Some(abs) {
+            self.prompts.insert(at, PromptMark { line: abs, ..Default::default() });
+        }
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.prompts.clear();
+    }
+
+    /// command blocks oldest first, each ending where the next prompt starts
+    pub fn command_blocks(&self) -> impl DoubleEndedIterator<Item = CommandBlock> + '_ {
+        self.prompts
+            .iter()
+            .enumerate()
+            .map(|(i, &mark)| CommandBlock { mark, end: self.prompts.get(i + 1).map(|m| m.line) })
+    }
+
+    /// the block a reader is looking at: the one holding the viewport's middle
+    /// row while scrolled back, else the newest block that ran a command
+    pub fn focused_block(&self) -> Option<CommandBlock> {
+        if self.view_offset > 0 {
+            let mid = self.viewport_to_abs(self.rows / 2);
+            return self.command_blocks().rev().find(|b| b.mark.line <= mid);
+        }
+        self.command_blocks().rev().find(|b| self.output_start(b).is_some())
+    }
+
+    /// first line of a block's output: where the shell said (C), or for
+    /// shells that only mark the prompt (pwsh, cmd) the line after the typed
+    /// command once the next prompt shows it finished
+    fn output_start(&self, b: &CommandBlock) -> Option<u64> {
+        if let Some(line) = b.mark.output {
+            return Some(line);
+        }
+        b.end?;
+        let mut line = b.mark.input?.0;
+        while self.line_at_abs(line).is_some_and(|l| l.wrapped) {
+            line += 1;
+        }
+        Some(line + 1)
+    }
+
+    /// the command line a block ran; empty when the shell never marked where
+    /// the typed command begins
+    pub fn command_text(&self, b: &CommandBlock) -> String {
+        let (Some(start), Some(out)) = (b.mark.input, self.output_start(b)) else {
+            return String::new();
+        };
+        let last = out.saturating_sub(1).max(start.0);
+        self.selected_text(start, (last, self.cols), false).trim().to_string()
+    }
+
+    /// inclusive span of a block's output, None when it printed nothing yet
+    pub fn output_span(&self, b: &CommandBlock) -> Option<((u64, usize), (u64, usize))> {
+        let from = self.output_start(b)?;
+        let live_end = self.abs_base() + self.total_lines().saturating_sub(1) as u64;
+        let to = b.end.map_or(live_end, |e| e.saturating_sub(1)).min(live_end);
+        // skip blank rows the shell left before the next prompt
+        let to = (from..=to).rev().find(|&l| {
+            self.line_at_abs(l).is_some_and(|line| line.iter().any(|c| c.cluster != 0 || !matches!(c.c, ' ' | '\0')))
+        })?;
+        Some(((from, 0), (to, self.cols)))
     }
 
     /// stamp the newest prompt mark with its command's exit code (OSC 133 ;D)

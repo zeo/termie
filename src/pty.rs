@@ -203,9 +203,12 @@ const FISH_PROMPT_HOOK: &str = r#"function __termie_preexec --on-event fish_pree
 const BASH_RC: &str = r#"# termie's bash integration: source the user's own rc, then add lifecycle marks
 [ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
 __termie_prompt() { local s=$?; printf '\033]133;D;%d\033\\\033]133;A\033\\\033]7;file://%s\033\\' "$s" "$PWD"; }
+# the typed command starts where the prompt ends; this runs last so a theme
+# that rebuilds PS1 every prompt still gets the mark
+__termie_input() { [[ $PS1 == *'133;B'* ]] || PS1+=$'\[\033]133;B\007\]'; }
 # bel avoids escaping a leading command substitution in an existing PS0
-PS0=$'\033]133;B\007\033]133;C\007'"${PS0-}"
-PROMPT_COMMAND="__termie_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS0=$'\033]133;C\007'"${PS0-}"
+PROMPT_COMMAND="__termie_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"$'\n'"__termie_input"
 "#;
 
 #[cfg(unix)]
@@ -214,10 +217,14 @@ ZDOTDIR="${TERMIE_USER_ZDOTDIR:-$HOME}"
 unset TERMIE_USER_ZDOTDIR
 [ -r "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
 autoload -Uz add-zsh-hook
-__termie_preexec() { printf '\033]133;B\033\\\033]133;C\033\\'; }
+# the typed command starts where the prompt ends; preexec keeps this hook last
+# so a theme that rebuilds PS1 every prompt still gets the mark
+__termie_input() { [[ $PS1 == *'133;B'* ]] || PS1+=$'%{\e]133;B\a%}'; }
+__termie_preexec() { printf '\033]133;C\033\\'; precmd_functions=(${precmd_functions:#__termie_input} __termie_input); }
 __termie_precmd() { local s=$?; printf '\033]133;D;%d\033\\\033]133;A\033\\\033]7;file://%s\033\\' "$s" "$PWD"; }
 add-zsh-hook preexec __termie_preexec
 add-zsh-hook precmd __termie_precmd
+add-zsh-hook precmd __termie_input
 "#;
 
 /// write the bash/zsh integration files once per process and hand back their
@@ -1615,10 +1622,10 @@ mod live_tests_unix {
             out.windows(b"\x1b]7;file://".len()).any(|w| w == b"\x1b]7;file://"),
             "no OSC 7 cwd report"
         );
-        let command_marks: [&[u8]; 2] = if shell == ShellKind::Bash {
-            [b"\x1b]133;B\x07", b"\x1b]133;C\x07"]
-        } else {
-            [b"\x1b]133;B\x1b\\", b"\x1b]133;C\x1b\\"]
+        let command_marks: [&[u8]; 2] = match shell {
+            ShellKind::Bash => [b"\x1b]133;B\x07", b"\x1b]133;C\x07"],
+            ShellKind::Zsh => [b"\x1b]133;B\x07", b"\x1b]133;C\x1b\\"],
+            _ => [b"\x1b]133;B\x1b\\", b"\x1b]133;C\x1b\\"],
         };
         for mark in command_marks.into_iter().chain([done.as_slice()]) {
             assert!(
@@ -1627,6 +1634,13 @@ mod live_tests_unix {
                 String::from_utf8_lossy(&out)
             );
         }
+        // the marks land where command blocks need them: fish never says where
+        // the typed command starts, the others hand back exactly what was typed
+        let mut term = crate::term::Terminal::new(24, 80);
+        vte::Parser::new().advance(&mut term, &out);
+        let block = term.grid.focused_block().expect("a finished command block");
+        let expected = if shell == ShellKind::Fish { "" } else { "false" };
+        assert_eq!(term.grid.command_text(&block), expected, "{:?}", String::from_utf8_lossy(&out));
     }
 
     #[test]

@@ -1381,8 +1381,16 @@ impl Perform for Terminal {
                             }
                             Some(Osc133::PromptStart)
                         }
-                        Some(b'B') => Some(Osc133::PromptEnd),
+                        Some(b'B') => {
+                            if !self.using_alt {
+                                self.grid.mark_input();
+                            }
+                            Some(Osc133::PromptEnd)
+                        }
                         Some(b'C') => {
+                            if !self.using_alt {
+                                self.grid.mark_output();
+                            }
                             self.cmd_running = true;
                             Some(Osc133::CommandStart)
                         }
@@ -2232,6 +2240,49 @@ mod tests {
         // a hard reset drops everything
         feed(&mut t, b"\x1bc");
         assert!(!t.colors.any());
+    }
+
+    #[test]
+    fn osc133_marks_command_blocks_that_survive_a_rewrap() {
+        let mut t = Terminal::new(8, 20);
+        feed(&mut t, b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hi there\r\n\x1b]133;C\x1b\\hi\r\nthere\r\n\r\n");
+        feed(&mut t, b"\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\");
+        let check = |t: &Terminal| {
+            let g = &t.grid;
+            let blocks: Vec<_> = g.command_blocks().collect();
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(g.command_text(&blocks[0]), "echo hi there");
+            let span = g.output_span(&blocks[0]).unwrap();
+            assert_eq!(g.selected_text(span.0, span.1, false), "hi\nthere");
+            // the newest prompt has not run anything, so the last command is in focus
+            assert_eq!(g.focused_block(), Some(blocks[0]));
+            assert_eq!(g.output_span(&blocks[1]), None);
+        };
+        check(&t);
+        t.resize(8, 9);
+        check(&t);
+        t.resize(8, 30);
+        check(&t);
+        // pwsh and cmd mark only the prompt: output starts after the typed line
+        let mut t = Terminal::new(8, 20);
+        feed(&mut t, b"\x1b]133;A\x1b\\PS> \x1b]133;B\x1b\\dir\r\nfile\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\PS> \x1b]133;B\x1b\\");
+        let b = t.grid.focused_block().unwrap();
+        assert_eq!(t.grid.command_text(&b), "dir");
+        let span = t.grid.output_span(&b).unwrap();
+        assert_eq!(t.grid.selected_text(span.0, span.1, false), "file");
+        // fish sends B with C after the line is typed: output is known, the
+        // command is not, and the prompt never passes for it
+        let mut t = Terminal::new(8, 20);
+        feed(&mut t, b"\x1b]133;A\x1b\\> ls\r\n\x1b]133;B\x1b\\\x1b]133;C\x1b\\a\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\> ");
+        let b = t.grid.focused_block().unwrap();
+        assert_eq!(t.grid.command_text(&b), "");
+        let span = t.grid.output_span(&b).unwrap();
+        assert_eq!(t.grid.selected_text(span.0, span.1, false), "a");
+        t.grid.clear_marks();
+        assert_eq!(t.grid.command_blocks().count(), 0);
+        t.grid.add_mark();
+        t.grid.add_mark();
+        assert_eq!(t.grid.command_blocks().count(), 1);
     }
 
     #[test]

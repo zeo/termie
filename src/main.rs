@@ -629,6 +629,17 @@ enum PaletteAction {
     /// recolor the active tab from the keyboard — the same swatch list the tab
     /// menu offers, indexed into TAB_COLOR_ITEMS (0 clears)
     SetTabColor(usize),
+    /// command blocks (OSC 133): the block in view while scrolled back, else
+    /// the newest command that ran
+    CopyCommandOutput,
+    SelectCommandOutput,
+    CopyCommand,
+    RerunCommand,
+    AddMark,
+    ClearMarks,
+    /// type an earlier command back at the prompt without running it; the
+    /// value is its prompt mark's absolute line
+    RecentCommand(u64),
 }
 
 const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
@@ -688,6 +699,12 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("scroll to top", PaletteAction::ScrollTop),
     ("scroll to bottom", PaletteAction::ScrollBottom),
     ("clear scrollback", PaletteAction::ClearScrollback),
+    ("copy command output", PaletteAction::CopyCommandOutput),
+    ("select command output", PaletteAction::SelectCommandOutput),
+    ("copy command", PaletteAction::CopyCommand),
+    ("rerun command", PaletteAction::RerunCommand),
+    ("add mark", PaletteAction::AddMark),
+    ("clear marks", PaletteAction::ClearMarks),
     ("dismiss notice", PaletteAction::DismissNotice),
     ("export scrollback", PaletteAction::ExportScrollback),
     ("update termie", PaletteAction::InstallUpdate),
@@ -5448,10 +5465,14 @@ impl App {
         }
     }
 
-    fn focused_grid(&self) -> Option<&crate::grid::Grid> {
+    fn focused_pane(&self) -> Option<&Pane> {
         let id = self.active_focused_id()?;
         let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
-        find_pane(root, id).map(|p| &p.term.grid)
+        find_pane(root, id)
+    }
+
+    fn focused_grid(&self) -> Option<&crate::grid::Grid> {
+        self.focused_pane().map(|p| &p.term.grid)
     }
 
     fn focused_grid_mut(&mut self) -> Option<&mut crate::grid::Grid> {
@@ -5524,6 +5545,7 @@ impl App {
                         PaletteAction::OpenBookmark(i),
                     )
                 }));
+                rows.extend(self.recent_commands().into_iter().map(|(line, cmd)| (format!("recent: {cmd}"), PaletteAction::RecentCommand(line))));
                 let query = query.trim();
                 if query.is_empty() {
                     return rows;
@@ -5987,6 +6009,21 @@ impl App {
         if !text.is_empty() {
             win::clipboard_set(&text);
         }
+    }
+
+    /// the focused pane's earlier commands, newest first and each only once,
+    /// keyed by the absolute line of their prompt
+    fn recent_commands(&self) -> Vec<(u64, String)> {
+        let Some(g) = self.focused_grid() else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        g.command_blocks()
+            .rev()
+            .map(|b| (b.mark.line, g.command_text(&b)))
+            .filter(|(_, c)| !c.is_empty() && !c.contains('\n') && seen.insert(c.clone()))
+            .take(20)
+            .collect()
     }
 
     fn select_all(&mut self) {
@@ -7205,6 +7242,68 @@ impl App {
                 self.redraw();
             }
             PaletteAction::DismissNotice => self.dismiss_notice(),
+            PaletteAction::CopyCommandOutput | PaletteAction::SelectCommandOutput => {
+                let found = self.focused_grid().and_then(|g| {
+                    let span = g.output_span(&g.focused_block()?)?;
+                    Some((span, g.selected_text(span.0, span.1, false), g.reflow_gen))
+                });
+                match (found, self.active_focused_id()) {
+                    (Some(((start, end), text, reflow_gen)), Some(pane)) => {
+                        if a == PaletteAction::CopyCommandOutput {
+                            win::clipboard_set(&text);
+                            self.show_notice(&format!("copied {} lines of output", text.lines().count()));
+                        } else {
+                            self.selection = Some(Sel { pane, start, end, block: false, reflow_gen });
+                            if let Some(g) = self.focused_grid_mut() {
+                                g.scroll_to_abs(start.0);
+                            }
+                        }
+                    }
+                    _ => self.show_notice("no command output here; shell integration marks each command"),
+                }
+                self.redraw();
+            }
+            PaletteAction::CopyCommand => {
+                match self.focused_grid().and_then(|g| Some(g.command_text(&g.focused_block()?))).filter(|t| !t.is_empty()) {
+                    Some(cmd) => {
+                        win::clipboard_set(&cmd);
+                        self.show_notice("copied the command");
+                    }
+                    None => self.show_notice("no command here; shell integration marks each command"),
+                }
+            }
+            PaletteAction::RerunCommand => {
+                let pane = self.focused_pane();
+                let busy = pane.is_some_and(|p| p.term.cmd_running);
+                let cmd = pane
+                    .map(|p| &p.term.grid)
+                    .and_then(|g| g.command_blocks().rev().map(|b| g.command_text(&b)).find(|t| !t.is_empty()));
+                match (cmd, self.active_focused_id()) {
+                    _ if busy => self.show_notice("a command is still running"),
+                    (Some(cmd), Some(id)) => {
+                        self.send_paste_bytes(id, format!("{cmd}\r").as_bytes());
+                    }
+                    _ => self.show_notice("no earlier command; shell integration marks each command"),
+                }
+            }
+            PaletteAction::RecentCommand(line) => {
+                let cmd = self.recent_commands().into_iter().find(|(l, _)| *l == line).map(|(_, c)| c);
+                if let (Some(cmd), Some(id)) = (cmd, self.active_focused_id()) {
+                    self.send_paste_bytes(id, cmd.as_bytes());
+                }
+            }
+            PaletteAction::AddMark => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.add_mark();
+                }
+                self.redraw();
+            }
+            PaletteAction::ClearMarks => {
+                if let Some(g) = self.focused_grid_mut() {
+                    g.clear_marks();
+                }
+                self.redraw();
+            }
             PaletteAction::ClearScrollback => {
                 if let Some(g) = self.focused_grid_mut() {
                     g.clear_scrollback();
