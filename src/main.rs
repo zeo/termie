@@ -13,6 +13,7 @@ mod grid;
 mod input;
 mod instrument;
 mod instance;
+mod minisign;
 mod plugin;
 mod pty;
 mod regex;

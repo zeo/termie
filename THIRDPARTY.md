@@ -42,8 +42,11 @@ current ConPTY host instead of the older one built into Windows.
 
 ## Rust dependencies
 
-termie links a number of Rust crates (anyhow, bytemuck, cosmic-text, log, png,
-pollster, portable-pty, vte, wgpu, windows, winit, and their transitive
-dependencies), each under permissive licenses (MIT, Apache-2.0, and similar).
+termie links a number of Rust crates (anyhow, bytemuck, cosmic-text,
+ed25519-dalek, log, png, pollster, portable-pty, vte, wgpu, windows, winit, and
+their transitive dependencies), each under permissive licenses (MIT,
+Apache-2.0, BSD-3-Clause, and similar). ed25519-dalek, curve25519-dalek and
+subtle are Copyright (c) 2016-2024 Isis Agora Lovecruft and Henry de Valence,
+under BSD-3-Clause.
 Their full license texts can be regenerated from the dependency tree with
 `cargo about` or `cargo deny`.

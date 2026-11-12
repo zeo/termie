@@ -3,3 +3,5 @@
 tests/golden/*.txt text eol=lf
 packaging/linux/*.sh text eol=lf
 packaging/linux/*.desktop text eol=lf
+# signed release bytes; a line-ending rewrite would break the signature
+tests/minisign/* binary

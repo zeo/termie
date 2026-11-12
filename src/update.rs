@@ -43,6 +43,8 @@ pub struct Update {
     /// sha256 hex of the release asset, from the release api; the download is
     /// refused unless it hashes to exactly this
     pub digest: String,
+    /// the asset's `.minisig`, checked against the compiled-in release key
+    pub sig_url: String,
 }
 
 #[cfg(windows)]
@@ -144,6 +146,11 @@ fn parse_release(text: &str) -> Option<Update> {
     parse_triple(&version)?;
     let name = asset_name(&version)?;
     let assets = json.get("assets")?.as_array()?;
+    let sig_name = format!("{name}.minisig");
+    let sig_url = assets.iter().find_map(|a| {
+        let url = a.get_str("browser_download_url")?;
+        (a.get_str("name")? == sig_name && release_asset_url_is_safe(&version, &sig_name, url)).then(|| url.to_string())
+    })?;
     let (url, digest) = assets.iter().find_map(|a| {
         if a.get_str("name")? != name {
             return None;
@@ -158,7 +165,7 @@ fn parse_release(text: &str) -> Option<Update> {
         }
         Some((url.to_string(), digest.to_ascii_lowercase()))
     })?;
-    Some(Update { version, url, digest })
+    Some(Update { version, url, digest, sig_url })
 }
 
 /// strict x.y.z compare against the running build; pre-release tags and
@@ -261,7 +268,9 @@ fn download_to_prefix(u: &Update, prefix: Option<&std::path::Path>) -> Result<Pa
     #[cfg(not(target_os = "linux"))]
     let _ = prefix;
     let name = asset_name(&u.version).ok_or("updates aren't available for this platform")?;
-    if !release_asset_url_is_safe(&u.version, &name, &u.url) {
+    if !release_asset_url_is_safe(&u.version, &name, &u.url)
+        || !release_asset_url_is_safe(&u.version, &format!("{name}.minisig"), &u.sig_url)
+    {
         return Err("update URL does not match the release asset".into());
     }
     let dir = fresh_temp_dir()?;
@@ -278,6 +287,14 @@ fn download_to_prefix(u: &Update, prefix: Option<&std::path::Path>) -> Result<Pa
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
         verify_download(&out.stdout, &u.digest)?;
+        let mut command = update_curl();
+        configure_asset_download(&mut command, &u.sig_url);
+        let sig = bounded_output_with_deadline(&mut command, crate::minisign::MAX_SIGNATURE_BYTES, UPDATE_DOWNLOAD_TIMEOUT)
+            .map_err(|error| bounded_output_error(error, crate::minisign::MAX_SIGNATURE_BYTES))?;
+        if !sig.status.success() {
+            return Err("the release signature couldn't be downloaded".into());
+        }
+        crate::minisign::verify(crate::minisign::RELEASE_KEY, &String::from_utf8_lossy(&sig.stdout), &out.stdout)?;
         std::fs::write(&path, &out.stdout).map_err(|e| e.to_string())
     })();
     if let Err(e) = fetched {
@@ -583,12 +600,15 @@ mod tests {
         let name = asset_name("9.9.9").unwrap();
         let digest = "AB".repeat(32);
         let text = format!(
-            r#"{{"tag_name":"v9.9.9","assets":[{{"name":"{name}","browser_download_url":"https://github.com/zeo/termie/releases/download/v9.9.9/{name}","digest":"sha256:{digest}"}}]}}"#
+            r#"{{"tag_name":"v9.9.9","assets":[{{"name":"{name}","browser_download_url":"https://github.com/zeo/termie/releases/download/v9.9.9/{name}","digest":"sha256:{digest}"}},{{"name":"{name}.minisig","browser_download_url":"https://github.com/zeo/termie/releases/download/v9.9.9/{name}.minisig"}}]}}"#
         );
         let update = parse_release(&text).unwrap();
         assert_eq!(update.version, "9.9.9");
         assert_eq!(update.digest, digest.to_ascii_lowercase());
         assert!(update.url.ends_with(&name));
+        assert_eq!(update.sig_url, format!("{}.minisig", update.url));
+        // an unsigned release is never offered
+        assert!(parse_release(&text.replace(".minisig\"", ".sig\"")).is_none());
         assert!(parse_release(&text.replace(&digest, "AB12")).is_none());
         assert!(parse_release(&text.replace("github.com/zeo", "example.com/zeo")).is_none());
     }
@@ -703,6 +723,7 @@ mod tests {
             version: "9.9.9".into(),
             url: String::new(),
             digest: String::new(),
+            sig_url: String::new(),
         };
         assert_eq!(
             install_linux_archive(&archive, &update, &work.join("prefix")),
@@ -745,6 +766,7 @@ mod tests {
             version: "9.9.9".into(),
             url: String::new(),
             digest: String::new(),
+            sig_url: String::new(),
         };
         let exe = install_linux_archive(&archive, &update, &prefix).unwrap();
         assert_eq!(std::fs::read(exe).unwrap(), payload);

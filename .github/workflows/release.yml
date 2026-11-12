@@ -110,12 +110,15 @@ jobs:
             & $signtool.FullName sign /sha1 $env:CERTIFICATE_THUMBPRINT /fd sha256 /tr $timestamp /td sha256 $file
             if ($LASTEXITCODE -ne 0) { throw "signing failed for $file" }
           }
+          # after authenticode, which rewrites the file; the in-app updater checks this
+          Invoke-RotPack sign "dist\termie-$ver-setup.exe" "dist\termie-$ver-setup.exe.minisig"
 
       - name: attach to the release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: |
             dist/termie-*-setup.exe
+            dist/termie-*-setup.exe.minisig
             dist/termie-*.rpack
             dist/termie-*.rpack.minisig
             dist/installer.json
@@ -204,6 +207,7 @@ jobs:
           package="dist/termie-$ver-linux-x86_64.rpack"
           "$pack" pack "$stage" "$package" --app termie --version "$ver"
           "$pack" sign "$package" "$package.minisig"
+          "$pack" sign "dist/termie-$ver-linux-x86_64.tar.gz" "dist/termie-$ver-linux-x86_64.tar.gz.minisig"
           curl --proto '=https' --tlsv1.2 --retry 5 --location --fail \
             -o dist/installer.json \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/installer.json"
@@ -218,6 +222,7 @@ jobs:
         with:
           files: |
             dist/termie-*-linux-x86_64.tar.gz
+            dist/termie-*-linux-x86_64.tar.gz.minisig
             dist/termie-*.rpack
             dist/termie-*.rpack.minisig
             dist/termie-*-setup
