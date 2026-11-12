@@ -130,6 +130,8 @@ pub enum Hot {
     OpenPlugins,
     /// toggle the enabled state of installed plugin at this index
     PluginToggle(usize),
+    /// rebind the settings keybinding row at this index
+    KeyBind(usize),
 }
 
 fn drag_hint_variants(hot: Option<Hot>) -> &'static [(&'static str, &'static str)] {
@@ -534,7 +536,9 @@ struct SettingsGeom {
     backend_y: f32,
     /// (name, enabled, toggle rect, row baseline) per installed plugin
     plugin_rows: Vec<(String, bool, Rect, f32)>,
-    keys_start_y: f32,
+    keys_hint_y: f32,
+    /// chord field per keybinding row
+    key_btns: Vec<Rect>,
     about_start_y: f32,
     // interactive rects (absolute, scroll-adjusted)
     font_dec: Rect,
@@ -1001,6 +1005,10 @@ pub struct Renderer {
     status_cmd: (u64, String),
     /// installed plugins (display name, enabled) for the settings PLUGINS panel
     plugins_installed: Vec<(String, bool)>,
+    /// the live keymap for the settings KEYBINDINGS rows: (action, chord)
+    key_rows: Vec<(String, String)>,
+    /// the row waiting for a new chord
+    key_capture: Option<usize>,
     palette_view: Option<PaletteView>,
     /// palette overlay hit geometry, refreshed each build: box, row pitch,
     /// shown item count, window offset (None while the palette is closed)
@@ -1728,6 +1736,8 @@ impl Renderer {
             status_size: (usize::MAX, usize::MAX, String::new()),
             status_cmd: (u64::MAX, String::new()),
             plugins_installed: Vec::new(),
+            key_rows: Vec::new(),
+            key_capture: None,
             palette_view: None,
             palette_geom: None,
             find_btns: None,
@@ -2099,6 +2109,12 @@ impl Renderer {
     /// the installed plugins (display name, enabled) shown in the settings panel
     pub fn set_plugins(&mut self, list: Vec<(String, bool)>) {
         self.plugins_installed = list;
+    }
+
+    /// the keymap rows (action, chord) and the one capturing a new chord
+    pub fn set_key_rows(&mut self, rows: Vec<(String, String)>, capture: Option<usize>) {
+        self.key_rows = rows;
+        self.key_capture = capture;
     }
 
     /// drive the slide-in panel: `open` = interactive, `p` = docked fraction (0..1)
@@ -2950,8 +2966,10 @@ impl Renderer {
         y += sec_gap;
         let sec_keys = y;
         y += hdr_adv;
+        let keys_hint_l = y;
+        y += key_row;
         let keys_start_l = y;
-        y += key_row * 6.0;
+        y += row * self.key_rows.len() as f32;
         y += sec_gap;
         let sec_about = y;
         y += hdr_adv;
@@ -3036,6 +3054,12 @@ impl Renderer {
         for (i, (_, _, rect, _)) in plugin_rows.iter().enumerate() {
             controls.push((Hot::PluginToggle(i), *rect));
         }
+        let key_btns: Vec<Rect> = (0..self.key_rows.len())
+            .map(|i| (val_x, ay(keys_start_l + i as f32 * row), (cluster * 1.6).round(), bh))
+            .collect();
+        for (i, rect) in key_btns.iter().enumerate() {
+            controls.push((Hot::KeyBind(i), *rect));
+        }
         for (i, id) in ThemeId::ALL.into_iter().enumerate() {
             controls.push((Hot::ThemeSet(id), theme_chips[i]));
         }
@@ -3080,7 +3104,8 @@ impl Renderer {
             close_y: ay(close_l),
             backend_y: ay(backend_l),
             plugin_rows,
-            keys_start_y: ay(keys_start_l),
+            keys_hint_y: ay(keys_hint_l),
+            key_btns,
             about_start_y: ay(about_start_l),
             font_dec,
             font_inc,
@@ -5227,39 +5252,24 @@ impl Renderer {
         self.cycle_btn(out, g.backend_btn, sv.backend_name, Hot::BackendCycle, track);
         // backend can't swap live; hint that it applies next launch
         let (bbx, _, bbw, _) = g.backend_btn;
-        let small_h = self.atlas.metrics(FontId::Small).cell_h;
-        let small_track = self.track_for(FontId::Small);
         let note_h = self.atlas.metrics(FontId::LabelSmall).cell_h;
         let _ = Self::draw_text(&mut self.atlas, out, FontId::LabelSmall, bbx + bbw + t(tokens::SPACE_M), (g.backend_y + (bh - note_h) / 2.0).round(), "applies on restart", QUIET, 1.0, 0.0);
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
 
-        // KEYBINDINGS (two sub-columns)
         self.section_label(out, cx, g.sec_keys_y, cw, "KEYBINDINGS");
-        let keys: [(&str, &str); 12] = [
-            ("Ctrl+T", "new tab"),
-            ("Ctrl+P", "palette"),
-            ("Ctrl+Shift+P", "pane mode"),
-            ("Ctrl+Shift+M", "mark mode"),
-            ("Ctrl+Shift+E", "split V"),
-            ("Ctrl+Shift+O", "split H"),
-            ("Ctrl+Shift+W", "close pane"),
-            ("Ctrl+Shift+C", "copy"),
-            ("Ctrl+Shift+V", "paste"),
-            ("Ctrl+Tab", "next tab"),
-            ("Ctrl+,", "settings"),
-            ("Esc", "close"),
-        ];
-        let key_row = t(tokens::SPACE_XL);
-        let sub2 = cx + cw / 2.0;
-        let desc_dx = t(tokens::SETTINGS_LABEL_W - tokens::SPACE_2XL - tokens::SPACE_M);
-        for (i, (k, d)) in keys.into_iter().enumerate() {
-            let (kx, ky) = if i < 6 {
-                (cx, g.keys_start_y + i as f32 * key_row)
-            } else {
-                (sub2, g.keys_start_y + (i - 6) as f32 * key_row)
-            };
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, kx, ky + (chrome_h - small_h) / 2.0, k, TEXT_2, 1.0, small_track);
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, kx + desc_dx, ky, d, QUIET, 1.0, 0.0);
+        let hint = if self.key_capture.is_some() {
+            "press the new chord; esc cancels, backspace unbinds"
+        } else {
+            "pick a chord to change it"
+        };
+        let _ = Self::draw_text(&mut self.atlas, out, FontId::LabelSmall, cx, g.keys_hint_y, hint, QUIET, 1.0, 0.0);
+        let rows = std::mem::take(&mut self.key_rows);
+        for (i, ((action, chord), rect)) in rows.iter().zip(g.key_btns.iter()).enumerate() {
+            self.setting_label(out, cx, rect.1, bh, action);
+            let shown = if self.key_capture == Some(i) { "press keys\u{2026}" } else { chord };
+            self.cycle_btn(out, *rect, shown, Hot::KeyBind(i), track);
         }
+        self.key_rows = rows;
 
         // ABOUT
         self.section_label(out, cx, g.sec_about_y, cw, "ABOUT");
@@ -5296,6 +5306,11 @@ impl Renderer {
             Hot::PluginToggle(i) => {
                 let (name, on) = self.plugins_installed.get(i).cloned().unwrap_or_default();
                 return (name, Some(on), None);
+            }
+            Hot::KeyBind(i) => {
+                let (action, chord) = self.key_rows.get(i).cloned().unwrap_or_default();
+                let value = if self.key_capture == Some(i) { "press the new chord".to_string() } else { chord };
+                return (format!("{action} shortcut"), None, Some(value));
             }
             Hot::FontDec => ("Smaller font", None, Some(font)),
             Hot::FontInc => ("Larger font", None, Some(font)),
@@ -6467,11 +6482,12 @@ impl Renderer {
         // cycling fields are popup gels with a chevron and a mono value; a plain
         // action button (browse) is a pill with a label
         let action = hot == Hot::OpenPlugins;
+        let chevron = !action && !matches!(hot, Hot::KeyBind(_));
         let r = t(if action { tokens::RADIUS_BUTTON } else { tokens::RADIUS_FIELD });
         Self::push_button(&self.skin, out, rect, r, hair, false, false, 1.0);
         Self::gel_hover(out, rect, r, he);
         let (font, ftrack) = if action { (FontId::Label, 0.0) } else { (FontId::Chrome, track) };
-        let icon = if action { 0.0 } else { t(tokens::ICON - 2.0) };
+        let icon = if chevron { t(tokens::ICON - 2.0) } else { 0.0 };
         let room = bw - t(tokens::SPACE_M) * 2.0 - icon - t(tokens::SPACE_XS);
         let shown = self.fit_tail(font, text, room, ftrack);
         let tx = if action { (bx + (bw - self.text_w(font, &shown, ftrack)) / 2.0).round() } else { bx + t(tokens::SPACE_M) };
@@ -6479,7 +6495,7 @@ impl Renderer {
         let ink = self.skin.gel_text;
         Self::engrave(&self.skin, &mut self.atlas, out, font, tx, ty, &shown, hair, ftrack);
         let _ = Self::draw_text(&mut self.atlas, out, font, tx, ty, &shown, ink, 1.0, ftrack);
-        if action {
+        if !chevron {
             return;
         }
         let ix = bx + bw - t(tokens::SPACE_M) - icon;

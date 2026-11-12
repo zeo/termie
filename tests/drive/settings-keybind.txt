@@ -1,0 +1,18 @@
+300 key ctrl+,
+300 assert settings 1
+100 key end
+100 key enter
+100 key ctrl+alt+y
+100 key escape
+300 assert settings 0
+100 key ctrl+,
+300 assert settings 0
+100 key ctrl+alt+y
+300 assert settings 1
+100 key end
+100 key enter
+100 key k
+100 key escape
+100 key escape
+300 assert settings 0
+100 exit

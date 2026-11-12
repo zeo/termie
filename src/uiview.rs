@@ -247,6 +247,14 @@ pub fn capture(
             r.set_plugins(vec![("tamagotchi".into(), true), ("relay".into(), false)]);
             r.scroll_settings(400.0);
         }
+        "settings-keys" => {
+            // the KEYBINDINGS rows with one waiting for a new chord
+            r.set_settings_panel(true, 1.0);
+            let rows = [("close pane", "Ctrl+Shift+W"), ("copy", "Ctrl+Shift+C"), ("find", "Ctrl+Shift+F"), ("new tab", "Ctrl+T"), ("paste", "Ctrl+Shift+V")];
+            r.set_key_rows(rows.iter().map(|(a, c)| (a.to_string(), c.to_string())).collect(), Some(3));
+            r.set_chrome_focus(Some(Hot::KeyBind(3)));
+            r.scroll_settings(4000.0);
+        }
         "preedit" => {
             // the composition is cjk; headless captures skip the lazy system
             // font scan the windowed app does, so tofu without this

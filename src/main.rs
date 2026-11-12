@@ -1578,6 +1578,74 @@ fn combo_label(mods: &ModifiersState, key: &Key) -> Option<String> {
     Some(s)
 }
 
+/// what a key press means to a settings keybinding row waiting for its chord
+#[derive(Debug, PartialEq)]
+enum Chord {
+    /// a lone modifier: keep waiting for the key
+    Wait,
+    Cancel,
+    Unbind,
+    Reject(&'static str),
+    Bind(String),
+}
+
+fn read_chord(mods: ModifiersState, key: &Key) -> Chord {
+    let bare = !mods.control_key() && !mods.alt_key() && !mods.super_key();
+    match key {
+        Key::Named(
+            NamedKey::Shift
+            | NamedKey::Control
+            | NamedKey::Alt
+            | NamedKey::AltGraph
+            | NamedKey::Super
+            | NamedKey::Meta
+            | NamedKey::Hyper
+            | NamedKey::CapsLock
+            | NamedKey::NumLock
+            | NamedKey::Fn,
+        ) => return Chord::Wait,
+        Key::Named(NamedKey::Escape) if mods.is_empty() => return Chord::Cancel,
+        Key::Named(NamedKey::Backspace | NamedKey::Delete) if mods.is_empty() => return Chord::Unbind,
+        _ => {}
+    }
+    let key = match key {
+        Key::Character(c) => Key::Character(c.to_lowercase().into()),
+        k => k.clone(),
+    };
+    let Some(label) = key_label(&key) else {
+        return Chord::Reject("that key can't be used in a shortcut");
+    };
+    let fkey = matches!(key, Key::Named(NamedKey::F23 | NamedKey::F24))
+        || (label.len() > 1 && label.starts_with('f') && label[1..].bytes().all(|b| b.is_ascii_digit()));
+    if bare && !fkey && (matches!(key, Key::Character(_)) || !mods.shift_key()) {
+        return Chord::Reject("add ctrl, alt or super so the key still types");
+    }
+    combo_label(&mods, &key).map_or(Chord::Reject("that key can't be used in a shortcut"), Chord::Bind)
+}
+
+/// keybindings.conf with `action` moved from the `old` combo to `new` (None
+/// unbinds it): lines for either combo go, comments stay, and a default on
+/// the old combo is switched off with `none`
+fn rebind_conf(text: &str, old: &str, new: Option<&str>, action: &str, old_default: bool) -> String {
+    let combos: Vec<(ModifiersState, Key)> = std::iter::once(old).chain(new).filter_map(parse_combo).collect();
+    let stale = |line: &str| {
+        let line = line.trim();
+        !line.starts_with('#')
+            && line
+                .split_once('=')
+                .and_then(|(c, _)| parse_combo(c.trim()))
+                .is_some_and(|(m, k)| combos.iter().any(|(cm, ck)| *cm == m && key_matches(&k, ck)))
+    };
+    let mut out: String = text.lines().filter(|l| !stale(l)).flat_map(|l| [l, "\n"]).collect();
+    if old_default {
+        out.push_str(&format!("{old} = none\n"));
+    }
+    if let Some(new) = new {
+        out.push_str(&format!("{new} = {action}\n"));
+    }
+    out
+}
+
 /// where the active-tab index lands after the tab at `from` is moved to `to`:
 /// the active tab itself follows the move, tabs between the two slots shift one
 fn active_after_move(active: usize, from: usize, to: usize) -> usize {
@@ -2644,6 +2712,8 @@ enum DriveMetric {
     Panes,
     WindowTabs(usize),
     WindowPanes(usize),
+    /// 1 while the settings panel is open
+    Settings,
 }
 
 /// a parsed `--drive` script: steps at cumulative offsets from the moment the
@@ -2725,6 +2795,7 @@ fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
                 let metric = match spec.next() {
                     Some("windows") => Some(DriveMetric::Windows),
                     Some("tabs") => Some(DriveMetric::Tabs),
+                    Some("settings") => Some(DriveMetric::Settings),
                     Some("panes") => Some(DriveMetric::Panes),
                     Some("window-tabs") => spec
                         .next()
@@ -4393,6 +4464,8 @@ struct App {
     keybindings: Vec<(ModifiersState, Key, PaletteAction)>,
     /// payloads of `send <text>` bindings; SendInput actions index here
     send_inputs: Vec<String>,
+    /// the settings keybinding row waiting for its new chord
+    key_capture: Option<usize>,
     /// keybindings.conf lines ignored at load; surfaced once as a status notice
     /// after the first frame (the renderer doesn't exist yet at load time)
     kb_ignored: usize,
@@ -4551,6 +4624,7 @@ impl App {
             mods: ModifiersState::empty(),
             keybindings,
             send_inputs,
+            key_capture: None,
             kb_ignored,
             last_window_bounds: None,
             shown: false,
@@ -6677,6 +6751,8 @@ impl App {
         let settings_p = self.settings_p();
         let pane_menu_view = self.pw.pane_menu.as_ref().map(|m| self.menu_view(m));
         let hud = if self.persisted.latency_hud { self.lat.hud() } else { None };
+        let key_rows: Option<Vec<(String, String)>> = settings_open
+            .then(|| self.key_rows().into_iter().map(|(combo, action)| (action, display_combo(&combo))).collect());
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_latency_hud(hud);
             r.set_status(status);
@@ -6702,6 +6778,9 @@ impl App {
                 ui_scale: self.persisted.ui_scale,
             });
             r.set_settings_panel(settings_open, settings_p);
+            if let Some(rows) = key_rows {
+                r.set_key_rows(rows, self.key_capture);
+            }
         }
         let title = self
             .pw.tabs
@@ -7567,6 +7646,7 @@ impl App {
     fn close_settings(&mut self) {
         if self.pw.settings_open {
             self.pw.settings_open = false;
+            self.key_capture = None;
             // keyboard focus inside the panel goes back to the gear that opened it
             if self.pw.chrome_focus.is_some() {
                 self.set_chrome_focus(Some(Hot::Gear));
@@ -9611,6 +9691,7 @@ impl App {
     }
 
     fn button_action(&mut self, event_loop: &ActiveEventLoop, hot: Hot) {
+        self.key_capture = None;
         match hot {
             Hot::Minimize => {
                 if let Some(w) = &self.pw.window {
@@ -9803,6 +9884,12 @@ impl App {
                     self.refresh_settings_plugins();
                     self.redraw();
                 }
+            }
+            Hot::KeyBind(i) => {
+                self.set_chrome_focus(Some(hot));
+                self.key_capture = Some(i);
+                self.redraw();
+                self.update_a11y();
             }
         }
         // persist whenever a setting changed
@@ -10728,6 +10815,7 @@ impl App {
                             .filter_map(|tab| tab.root.as_ref())
                             .map(pane_count)
                             .sum()),
+                        DriveMetric::Settings => Some(usize::from(self.pw.settings_open)),
                         DriveMetric::WindowTabs(index) => window(index).map(|pw| pw.tabs.len()),
                         DriveMetric::WindowPanes(index) => window(index).map(|pw| {
                             pw.tabs
@@ -12398,6 +12486,90 @@ impl App {
         true
     }
 
+    /// the bindings the settings panel lists, as (combo, action label) sorted by
+    /// action; `send` bindings stay in keybindings.conf
+    fn key_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> =
+            self.keybindings.iter().filter_map(|(m, k, a)| Some((combo_label(m, k)?, action_label(*a)?))).collect();
+        rows.sort_by(|x, y| x.1.cmp(&y.1).then_with(|| x.0.cmp(&y.0)));
+        rows
+    }
+
+    /// a key pressed while a settings keybinding row waits for its chord
+    fn capture_chord(&mut self, logical: &Key) {
+        let Some(i) = self.key_capture else {
+            return;
+        };
+        let Some((old, action)) = self.key_rows().get(i).cloned() else {
+            self.key_capture = None;
+            return;
+        };
+        let new = match read_chord(self.mods, logical) {
+            Chord::Wait => return,
+            Chord::Reject(why) => return self.show_notice(why),
+            Chord::Cancel => None,
+            Chord::Unbind => Some(None),
+            Chord::Bind(combo) => Some(Some(combo)),
+        };
+        self.key_capture = None;
+        if let Some(new) = &new
+            && new.as_deref() != Some(old.as_str())
+        {
+            self.rebind(&old, new.as_deref(), &action);
+        }
+        let rows = self.key_rows();
+        let at = new
+            .flatten()
+            .and_then(|combo| rows.iter().position(|(c, a)| *c == combo && *a == action))
+            .unwrap_or(i.min(rows.len().saturating_sub(1)));
+        self.set_chrome_focus((!rows.is_empty()).then_some(Hot::KeyBind(at)));
+        self.redraw();
+        self.update_a11y();
+    }
+
+    /// move `action` from the `old` chord to `new` (None unbinds it) in
+    /// keybindings.conf and apply the result now
+    fn rebind(&mut self, old: &str, new: Option<&str>, action: &str) {
+        let Some(dir) = app_dir() else {
+            return;
+        };
+        let path = dir.join("keybindings.conf");
+        let text = if path.exists() {
+            match read_text_file(&path, MAX_STARTUP_TEXT_BYTES) {
+                Some(text) => text,
+                None => return self.show_error("keybindings.conf can't be read, so the shortcut wasn't changed"),
+            }
+        } else {
+            keybindings_template()
+        };
+        let bound = |combo: &str, table: &[(ModifiersState, Key, PaletteAction)]| {
+            parse_combo(combo).and_then(|(m, k)| table.iter().find(|(bm, bk, _)| *bm == m && key_matches(bk, &k)).map(|(_, _, a)| *a))
+        };
+        let old_default = bound(old, &default_keybindings()).is_some();
+        let stolen = new
+            .and_then(|n| bound(n, &self.keybindings))
+            .map(|a| action_label(a).unwrap_or_else(|| "send".to_string()))
+            .filter(|a| a != action);
+        let text = rebind_conf(&text, old, new, action, old_default);
+        // drive scripts rebind in memory so a test run never edits the user's keymap
+        if self.drive.is_none()
+            && let Err(e) = ensure_user_dir(&dir).and_then(|()| write_atomic(&path, text.as_bytes()))
+        {
+            return self.show_error(&format!("couldn't save keybindings.conf: {e}"));
+        }
+        let mut keybindings = default_keybindings();
+        let mut sends = Vec::new();
+        apply_keybindings_conf(&text, &mut keybindings, &mut sends);
+        self.keybindings = keybindings;
+        self.send_inputs = sends;
+        let notice = match (new, stolen) {
+            (Some(n), Some(was)) => format!("{} now runs {action} instead of {was}", display_combo(n)),
+            (Some(n), None) => format!("{} now runs {action}", display_combo(n)),
+            (None, _) => format!("{} no longer runs {action}", display_combo(old)),
+        };
+        self.show_notice(&notice);
+    }
+
     fn dismiss_notice(&mut self) {
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_notice(None);
@@ -12492,6 +12664,12 @@ impl App {
     // takes the key event's fields rather than winit's KeyEvent (which can't
     // be constructed) so synthetic --drive keys walk the identical path
     fn handle_shortcut(&mut self, logical: &Key, text: Option<&str>, state: ElementState, event_loop: &ActiveEventLoop) -> bool {
+        if self.key_capture.is_some() && self.pw.settings_open {
+            if state == ElementState::Pressed {
+                self.capture_chord(logical);
+            }
+            return true;
+        }
         // a lone alt tap moves keyboard focus to the title bar the way it
         // reaches a windows menu bar; the release still reaches the program
         if *logical == Key::Named(NamedKey::Alt) {
@@ -14503,7 +14681,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 9);
+        assert_eq!(paths.len(), 10);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);
@@ -15131,6 +15309,48 @@ mod tests {
         assert!(t.contains("# ctrl+1 = select tab 1"));
         // nothing is active: every non-blank line is a comment
         assert!(t.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')));
+    }
+
+    #[test]
+    fn rebinding_rewrites_only_the_two_chords() {
+        let conf = "# my keys\nctrl+shift+t = new tab\nctrl+alt+g = send git status\\r\n\nctrl+k = copy\n";
+        let moved = rebind_conf(conf, "ctrl+t", Some("ctrl+k"), "new tab", true);
+        assert_eq!(moved, "# my keys\nctrl+shift+t = new tab\nctrl+alt+g = send git status\\r\n\nctrl+t = none\nctrl+k = new tab\n");
+        let mut table = default_keybindings();
+        let mut sends = Vec::new();
+        assert_eq!(apply_keybindings_conf(&moved, &mut table, &mut sends), 0);
+        let runs = |combo: &str| {
+            let (m, k) = parse_combo(combo).unwrap();
+            table.iter().find(|(bm, bk, _)| *bm == m && key_matches(bk, &k)).map(|(_, _, a)| *a)
+        };
+        assert_eq!(runs("ctrl+t"), None);
+        assert_eq!(runs("ctrl+k"), Some(PaletteAction::NewTab));
+        assert_eq!(runs("ctrl+shift+c"), Some(PaletteAction::Copy));
+        // a user-only chord goes without leaving a `none` behind
+        assert_eq!(rebind_conf(&moved, "ctrl+k", None, "new tab", false), "# my keys\nctrl+shift+t = new tab\nctrl+alt+g = send git status\\r\n\nctrl+t = none\n");
+        // the template stays a template apart from the one change
+        let fresh = rebind_conf(&keybindings_template(), "ctrl+,", Some("ctrl+alt+y"), "toggle settings", true);
+        assert!(fresh.starts_with("# termie keybindings\n"));
+        assert!(fresh.ends_with("ctrl+, = none\nctrl+alt+y = toggle settings\n"));
+    }
+
+    #[test]
+    fn chord_capture_wants_a_modifier_for_typing_keys() {
+        let ctrl = ModifiersState::CONTROL;
+        let none = ModifiersState::empty();
+        let chr = |s: &str| Key::Character(s.into());
+        assert_eq!(read_chord(ctrl | ModifiersState::SHIFT, &chr("T")), Chord::Bind("ctrl+shift+t".into()));
+        assert_eq!(read_chord(ctrl, &Key::Named(NamedKey::Control)), Chord::Wait);
+        assert_eq!(read_chord(none, &Key::Named(NamedKey::Escape)), Chord::Cancel);
+        assert_eq!(read_chord(none, &Key::Named(NamedKey::Backspace)), Chord::Unbind);
+        assert_eq!(read_chord(ctrl, &Key::Named(NamedKey::Delete)), Chord::Bind("ctrl+delete".into()));
+        assert_eq!(read_chord(none, &Key::Named(NamedKey::F5)), Chord::Bind("f5".into()));
+        assert_eq!(read_chord(none, &Key::Named(NamedKey::F24)), Chord::Bind("mouse5".into()));
+        assert_eq!(read_chord(ModifiersState::SHIFT, &Key::Named(NamedKey::PageUp)), Chord::Bind("shift+pageup".into()));
+        assert!(matches!(read_chord(none, &chr("k")), Chord::Reject(_)));
+        assert!(matches!(read_chord(ModifiersState::SHIFT, &chr("K")), Chord::Reject(_)));
+        assert!(matches!(read_chord(none, &Key::Named(NamedKey::ArrowUp)), Chord::Reject(_)));
+        assert!(matches!(read_chord(ctrl, &chr("+")), Chord::Reject(_)));
     }
 
     #[test]
