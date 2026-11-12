@@ -237,8 +237,8 @@ impl PaneMenuView {
     }
 }
 
-pub const PANE_MENU_ITEMS: [&str; 6] =
-    ["copy", "split vertical", "split horizontal", "pop out to window", "close pane", "paste"];
+pub const PANE_MENU_ITEMS: [&str; 8] =
+    ["copy", "split vertical", "split horizontal", "pop out to window", "close pane", "paste", "restart pane", "make read-only"];
 
 pub const TAB_MENU_ITEMS: [&str; 8] = [
     "rename",

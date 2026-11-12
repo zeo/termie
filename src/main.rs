@@ -256,6 +256,8 @@ struct Pane {
     /// code, duration), for the status-bar readout
     cmd_started: Option<Instant>,
     last_cmd: Option<(Option<i32>, Duration)>,
+    /// typed, pasted and mouse input is dropped (wt's read-only pane)
+    read_only: bool,
 }
 
 /// what a pane's shell is doing, for the corner badge + tab strip rollup —
@@ -315,6 +317,9 @@ impl Pane {
     }
 
     fn write_user_input(&mut self, bytes: &[u8]) -> bool {
+        if self.read_only {
+            return true;
+        }
         let submits_command = submits_shell_command(self.term.bracketed_paste, bytes);
         let was_prompt = submits_command && self.at_integrated_shell_prompt();
         let queued = self.pty.write(bytes);
@@ -603,6 +608,11 @@ enum PaletteAction {
     /// `send <text>`); the index points into App::send_inputs
     SendInput(usize),
     ToggleZoom,
+    /// respawn the focused pane's shell in its folder, dropping what ran there
+    RestartPane,
+    ToggleReadOnly,
+    /// trade places with the neighbouring pane in a direction (dx, dy)
+    SwapPane(i8, i8),
     ToggleFullscreen,
     RenameTab,
     /// prompt-jump passes through to the program when there are no OSC-133 marks
@@ -679,6 +689,12 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("always on top", PaletteAction::ToggleOnTop),
     ("choose font", PaletteAction::FontPicker),
     ("zoom pane", PaletteAction::ToggleZoom),
+    ("restart pane", PaletteAction::RestartPane),
+    ("toggle read-only pane", PaletteAction::ToggleReadOnly),
+    ("swap pane left", PaletteAction::SwapPane(-1, 0)),
+    ("swap pane right", PaletteAction::SwapPane(1, 0)),
+    ("swap pane up", PaletteAction::SwapPane(0, -1)),
+    ("swap pane down", PaletteAction::SwapPane(0, 1)),
     ("toggle fullscreen", PaletteAction::ToggleFullscreen),
     ("rename tab", PaletteAction::RenameTab),
     // one entry per TAB_COLOR_ITEMS row (a test keeps them in lockstep)
@@ -2117,6 +2133,31 @@ fn kill_all(node: &mut Node) {
     }
 }
 
+fn leaves_mut<'a>(node: &'a mut Node, out: &mut Vec<&'a mut Pane>) {
+    match node {
+        Node::Leaf(p) => out.push(p),
+        Node::Split { a, b, .. } => {
+            leaves_mut(a, out);
+            leaves_mut(b, out);
+        }
+    }
+}
+
+/// trade the places of two panes in a tree; false when either is missing
+fn swap_panes(root: &mut Node, a: usize, b: usize) -> bool {
+    let mut leaves = Vec::new();
+    leaves_mut(root, &mut leaves);
+    let (Some(i), Some(j)) = (leaves.iter().position(|p| p.id == a), leaves.iter().position(|p| p.id == b)) else {
+        return false;
+    };
+    if i == j {
+        return false;
+    }
+    let (lo, hi) = leaves.split_at_mut(i.max(j));
+    std::mem::swap(&mut *lo[i.min(j)], &mut *hi[0]);
+    true
+}
+
 fn each_pane_mut(node: &mut Node, f: &mut impl FnMut(&mut Pane)) {
     match node {
         Node::Leaf(p) => f(p),
@@ -3082,6 +3123,7 @@ fn build_pane(
         status: PaneStatus::Idle,
         cmd_started: None,
         last_cmd: None,
+        read_only: false,
     })
 }
 
@@ -4699,6 +4741,7 @@ impl App {
             status: PaneStatus::Idle,
             cmd_started: None,
             last_cmd: None,
+            read_only: false,
         };
         pane.resize(rows, cols);
         self.start_reader(&mut pane);
@@ -6133,6 +6176,10 @@ impl App {
 
     /// write already-encoded paste bytes to a pane by id
     fn send_paste_bytes(&mut self, pane: usize, bytes: &[u8]) {
+        if Some(pane) == self.active_focused_id() && self.focused_read_only() {
+            self.show_notice("pane is read-only");
+            return;
+        }
         let queued = if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
             && let Some(p) = find_pane_mut(root, pane)
@@ -6739,6 +6786,10 @@ impl App {
         let Some(id) = self.active_focused_id() else {
             return;
         };
+        if self.focused_read_only() && !self.broadcast {
+            self.show_notice("pane is read-only");
+            return;
+        }
         self.pw.typed = true;
         if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab)
             && let Some(root) = tab.root.as_mut()
@@ -6836,11 +6887,24 @@ impl App {
         match m.target {
             MenuTarget::Pane => {
                 let panes = self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()).map_or(0, pane_count);
-                view.items = render::PANE_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
-                view.hints = [Some(A::Copy), Some(A::SplitV), Some(A::SplitH), None, Some(A::CloseFocusedPane), Some(A::Paste)]
-                    .map(hint)
-                    .into();
-                view.disabled = vec![self.selection.is_none(), false, false, panes < 2, false, false];
+                let read_only = self.focused_read_only();
+                view.items = render::PANE_MENU_ITEMS
+                    .iter()
+                    .map(|s| if *s == "make read-only" && read_only { "allow input".to_string() } else { s.to_string() })
+                    .collect();
+                view.hints = [
+                    Some(A::Copy),
+                    Some(A::SplitV),
+                    Some(A::SplitH),
+                    None,
+                    Some(A::CloseFocusedPane),
+                    Some(A::Paste),
+                    Some(A::RestartPane),
+                    Some(A::ToggleReadOnly),
+                ]
+                .map(hint)
+                .into();
+                view.disabled = vec![self.selection.is_none(), false, false, panes < 2, false, read_only, false, false];
             }
             MenuTarget::Tab(t) => {
                 let cwd = self.tab_cwd(t);
@@ -7604,6 +7668,9 @@ impl App {
             PaletteAction::Paste => self.paste(),
             PaletteAction::CloseFocusedPane => self.close_focused_pane(event_loop),
             PaletteAction::ToggleZoom => self.toggle_zoom(),
+            PaletteAction::RestartPane => self.restart_focused_pane(),
+            PaletteAction::ToggleReadOnly => self.toggle_read_only(),
+            PaletteAction::SwapPane(dx, dy) => self.swap_focused_pane(dx.into(), dy.into()),
             PaletteAction::ToggleFullscreen => self.toggle_fullscreen(),
             PaletteAction::RenameTab => {
                 if let Some(tab) = self.pw.tabs.get(self.pw.active_tab) {
@@ -8870,6 +8937,68 @@ impl App {
         self.warm_pool();
     }
 
+    fn swap_focused_pane(&mut self, dx: i32, dy: i32) {
+        let (Some(cur), Some(other)) = (self.active_focused_id(), self.neighbor(dx, dy)) else {
+            self.show_notice("no pane on that side");
+            return;
+        };
+        if let Some(root) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut())
+            && swap_panes(root, cur, other)
+        {
+            self.relayout_all();
+            self.sync_tabs();
+            self.redraw();
+        }
+    }
+
+    fn restart_focused_pane(&mut self) {
+        let Some(id) = self.active_focused_id() else {
+            return;
+        };
+        let before = self.focus_identity();
+        let (cols, rows) = self.focused_grid().map(|g| (g.cols, g.rows)).unwrap_or_else(|| self.content_pane_size());
+        let (cwd, shell) = (self.focused_cwd(), self.focused_shell());
+        let pane = match self.spawn_pane(cols, rows, cwd, shell, None) {
+            Ok(pane) => pane,
+            Err(e) => {
+                self.show_error(&format!("restart failed: {e}"));
+                return;
+            }
+        };
+        let new_id = pane.id;
+        let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
+            return;
+        };
+        let Some(slot) = tab.root.as_mut().and_then(|root| find_pane_mut(root, id)) else {
+            return;
+        };
+        // dropping the old pane kills its shell; its exit event finds no pane
+        *slot = pane;
+        tab.focused = new_id;
+        if tab.zoom == Some(id) {
+            tab.zoom = Some(new_id);
+        }
+        self.relayout_all();
+        self.sync_tabs();
+        self.after_focus_context_change(before);
+    }
+
+    fn toggle_read_only(&mut self) {
+        let Some(id) = self.active_focused_id() else {
+            return;
+        };
+        let Some(p) = self.pw.tabs.get_mut(self.pw.active_tab).and_then(|t| t.root.as_mut()).and_then(|r| find_pane_mut(r, id)) else {
+            return;
+        };
+        p.read_only = !p.read_only;
+        let on = p.read_only;
+        self.show_notice(if on { "pane is read-only" } else { "pane takes input again" });
+    }
+
+    fn focused_read_only(&self) -> bool {
+        self.focused_pane().is_some_and(|p| p.read_only)
+    }
+
     fn close_focused_pane(&mut self, event_loop: &ActiveEventLoop) {
         let before = self.focus_identity();
         let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) else {
@@ -9723,7 +9852,8 @@ impl App {
 
     /// run a context-menu item. pane items index render::PANE_MENU_ITEMS
     /// (0 copy, 1 split vertical, 2 split horizontal, 3 pop out, 4 close pane,
-    /// 5 paste; copy no-ops with no selection); tab items index TAB_MENU_ITEMS
+    /// 5 paste, 6 restart, 7 read-only; copy no-ops with no selection); tab
+    /// items index TAB_MENU_ITEMS
     /// (0 rename, 1 duplicate, 2 bookmark, 3 color, 4 move left, 5 move right,
     /// 6 close, 7 close others)
     fn pane_menu_action(&mut self, target: MenuTarget, idx: usize, at: (f32, f32), event_loop: &ActiveEventLoop) {
@@ -9738,6 +9868,8 @@ impl App {
                 3 => self.pop_out_focused(event_loop),
                 4 => self.close_focused_pane(event_loop),
                 5 => self.paste(),
+                6 => self.restart_focused_pane(),
+                7 => self.toggle_read_only(),
                 _ => {}
             },
             MenuTarget::Tab(i) => match idx {
@@ -10437,6 +10569,9 @@ impl App {
         let Some(p) = find_pane_mut(root, id) else {
             return false;
         };
+        if p.read_only {
+            return true;
+        }
         if let Some(bytes) = p.term.encode_mouse(btn, pressed, motion, col, row, mmods) {
             p.pty.write(&bytes);
             self.last_mouse_report = Some(key);
@@ -11002,7 +11137,7 @@ impl App {
                             } else {
                                 b"\x1b[B"
                             };
-                            let n = alt_scroll_steps(step);
+                            let n = if p.read_only { 0 } else { alt_scroll_steps(step) };
                             let mut buf = Vec::with_capacity(seq.len() * n);
                             for _ in 0..n {
                                 buf.extend_from_slice(seq);
@@ -11668,14 +11803,10 @@ impl App {
     }
 
     /// move focus to the nearest pane in direction (dx, dy)
-    fn focus_dir(&mut self, dx: i32, dy: i32) {
-        let Some(cur) = self.active_focused_id() else {
-            return;
-        };
-        let Some((_, (cx0, cy0, cw, ch))) = self.pw.layout_cache.iter().find(|(id, _)| *id == cur)
-        else {
-            return;
-        };
+    /// the nearest pane whose centre lies in direction (dx, dy) of the focused one
+    fn neighbor(&self, dx: i32, dy: i32) -> Option<usize> {
+        let cur = self.active_focused_id()?;
+        let (_, (cx0, cy0, cw, ch)) = self.pw.layout_cache.iter().find(|(id, _)| *id == cur)?;
         let (cx, cy) = (cx0 + cw / 2.0, cy0 + ch / 2.0);
         let mut best: Option<(usize, f32)> = None;
         for (id, (x, y, w, h)) in &self.pw.layout_cache {
@@ -11695,7 +11826,11 @@ impl App {
                 best = Some((*id, dist));
             }
         }
-        if let Some((id, _)) = best {
+        best.map(|(id, _)| id)
+    }
+
+    fn focus_dir(&mut self, dx: i32, dy: i32) {
+        if let Some(id) = self.neighbor(dx, dy) {
             let before = self.focus_identity();
             if let Some(tab) = self.pw.tabs.get_mut(self.pw.active_tab) {
                 tab.focused = id;
@@ -14495,10 +14630,31 @@ mod tests {
             status: PaneStatus::Idle,
             cmd_started: None,
             last_cmd: None,
+            read_only: false,
         }
     }
     fn leaf(id: usize) -> Node {
         Node::Leaf(tp(id))
+    }
+
+    #[test]
+    fn swapping_panes_trades_their_places_only() {
+        let split = |a, b| Node::Split { dir: Dir::Vertical, ratio: 0.3, a: Box::new(a), b: Box::new(b) };
+        let mut root = split(leaf(1), split(leaf(2), leaf(3)));
+        let order = |n: &mut Node| {
+            let mut v = Vec::new();
+            leaves_mut(n, &mut v);
+            v.iter().map(|p| p.id).collect::<Vec<_>>()
+        };
+        assert!(swap_panes(&mut root, 1, 3));
+        assert_eq!(order(&mut root), [3, 2, 1]);
+        assert!(!swap_panes(&mut root, 2, 2));
+        assert!(!swap_panes(&mut root, 2, 9));
+        assert!(matches!(root, Node::Split { ratio, .. } if ratio == 0.3));
+        let mut p = tp(5);
+        p.read_only = true;
+        assert!(p.write_user_input(b"ls\r"));
+        assert!(!p.term.cmd_running);
     }
     fn split(dir: Dir, ratio: f32, a: Node, b: Node) -> Node {
         Node::Split { dir, ratio, a: Box::new(a), b: Box::new(b) }
