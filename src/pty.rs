@@ -376,6 +376,7 @@ pub struct Pty {
     writer_queue: Arc<InputQueue>,
     child: Box<dyn Child + Send + Sync>,
     prompt_markers_trusted: bool,
+    opens_with_blank_line: bool,
     #[cfg(unix)]
     process_group: Option<libc::pid_t>,
     #[cfg(target_os = "linux")]
@@ -439,6 +440,7 @@ impl Pty {
         // instead of a login shell, so none of the shell banner/prompt-hook
         // injection applies; otherwise launch the configured shell
         let mut prompt_markers_trusted = false;
+        let mut opens_with_blank_line = false;
         let mut cmd = match command.filter(|a| !a.is_empty()) {
             Some(argv) => {
                 let mut c = CommandBuilder::new(&argv[0]);
@@ -474,6 +476,8 @@ impl Pty {
                     }
                     "cmd" => {
                         prompt_markers_trusted = true;
+                        // cmd prints a blank line after the /K command, ahead of its first prompt
+                        opens_with_blank_line = true;
                         c.arg("/K");
                         c.arg("prompt");
                         c.arg(CMD_PROMPT_HOOK);
@@ -593,6 +597,7 @@ impl Pty {
             writer_queue,
             child,
             prompt_markers_trusted,
+            opens_with_blank_line,
             #[cfg(unix)]
             process_group,
             #[cfg(target_os = "linux")]
@@ -664,6 +669,10 @@ impl Pty {
             pixel_width: cell_w.saturating_mul(cols),
             pixel_height: cell_h.saturating_mul(rows),
         });
+    }
+
+    pub fn opens_with_blank_line(&self) -> bool {
+        self.opens_with_blank_line
     }
 
     pub fn shell_owns_foreground(&self) -> bool {
@@ -1002,6 +1011,7 @@ impl Pty {
             writer_queue,
             child: Box::new(handoff_pty::HandoffChild::new(client)),
             prompt_markers_trusted: false,
+            opens_with_blank_line: false,
             tree: None,
             reader: Some(Box::new(File::from(reader))),
         }
@@ -1150,6 +1160,7 @@ impl Pty {
             writer_queue,
             child: Box::new(null_pty::NullChild),
             prompt_markers_trusted: false,
+            opens_with_blank_line: false,
             #[cfg(unix)]
             process_group: None,
             #[cfg(target_os = "linux")]
@@ -1294,6 +1305,7 @@ mod tests {
             writer_queue: queue.clone(),
             child: Box::new(TrackingChild(killed.clone())),
             prompt_markers_trusted: false,
+            opens_with_blank_line: false,
             #[cfg(unix)]
             process_group: None,
             #[cfg(target_os = "linux")]

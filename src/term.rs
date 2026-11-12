@@ -179,6 +179,9 @@ pub struct Terminal {
     /// DECSDM (mode 80): set pins a sixel image to the top-left and leaves the
     /// cursor alone; reset (the default) scrolls it inline with the text
     sixel_display_mode: bool,
+    /// drop a line feed that arrives before anything is printed on an empty
+    /// screen: cmd emits one ahead of its first prompt
+    pub skip_opening_newline: bool,
 }
 
 impl Terminal {
@@ -220,6 +223,7 @@ impl Terminal {
             cell_px: (0, 0),
             dcs: None,
             sixel_display_mode: false,
+            skip_opening_newline: false,
         }
     }
 
@@ -863,6 +867,7 @@ fn dec_special_graphics(c: char) -> char {
 
 impl Perform for Terminal {
     fn print(&mut self, c: char) {
+        self.skip_opening_newline = false;
         let mapped = self.map_charset(c);
         self.grid.put_char(mapped);
         // REP repeats the glyph as presented, so store the post-charset glyph
@@ -875,6 +880,7 @@ impl Perform for Terminal {
             0x07 => self.bell = true,
             0x08 => self.grid.backspace(),
             0x09 => self.grid.tab(),
+            0x0a..=0x0c if std::mem::take(&mut self.skip_opening_newline) && self.grid.cursor.row == 0 && self.grid.cursor.col == 0 => {}
             0x0a..=0x0c => self.grid.linefeed(),
             0x0d => self.grid.carriage_return(),
             0x0e => self.gl = 1, // SO -> invoke g1
@@ -1476,6 +1482,25 @@ mod tests {
     fn feed(t: &mut Terminal, bytes: &[u8]) {
         let mut p = Parser::new();
         p.advance(t, bytes);
+    }
+
+    #[test]
+    fn opening_newline_is_dropped_only_before_any_output() {
+        let mut t = Terminal::new(4, 10);
+        t.skip_opening_newline = true;
+        feed(&mut t, b"\x1b]0;cmd\x07\r\n\x1b]133;A\x1b\\C:\\>");
+        assert_eq!(t.grid.cursor.row, 0);
+        feed(&mut t, b"\r\n");
+        assert_eq!(t.grid.cursor.row, 1);
+
+        let mut t = Terminal::new(4, 10);
+        feed(&mut t, b"\r\nC:\\>");
+        assert_eq!(t.grid.cursor.row, 1);
+
+        let mut t = Terminal::new(4, 10);
+        t.skip_opening_newline = true;
+        feed(&mut t, b"hi\r\n");
+        assert_eq!(t.grid.cursor.row, 1);
     }
 
     #[test]

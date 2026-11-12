@@ -2714,6 +2714,8 @@ enum DriveMetric {
     WindowPanes(usize),
     /// 1 while the settings panel is open
     Settings,
+    /// the focused pane's cursor row
+    CursorRow,
 }
 
 /// a parsed `--drive` script: steps at cumulative offsets from the moment the
@@ -2796,6 +2798,7 @@ fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
                     Some("windows") => Some(DriveMetric::Windows),
                     Some("tabs") => Some(DriveMetric::Tabs),
                     Some("settings") => Some(DriveMetric::Settings),
+                    Some("cursor-row") => Some(DriveMetric::CursorRow),
                     Some("panes") => Some(DriveMetric::Panes),
                     Some("window-tabs") => spec
                         .next()
@@ -3380,6 +3383,7 @@ fn build_pane(
         cell_h,
     )?;
     let mut term = Terminal::new(rows, cols);
+    term.skip_opening_newline = pty.opens_with_blank_line();
     term.set_scrollback_limit(scrollback);
     term.set_cell_px(cell_w, cell_h);
     Ok(Pane {
@@ -10819,6 +10823,7 @@ impl App {
                             .map(pane_count)
                             .sum()),
                         DriveMetric::Settings => Some(usize::from(self.pw.settings_open)),
+                        DriveMetric::CursorRow => self.focused_grid().map(|g| g.cursor.row),
                         DriveMetric::WindowTabs(index) => window(index).map(|pw| pw.tabs.len()),
                         DriveMetric::WindowPanes(index) => window(index).map(|pw| {
                             pw.tabs
@@ -14700,7 +14705,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 10);
+        assert_eq!(paths.len(), 11);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);
