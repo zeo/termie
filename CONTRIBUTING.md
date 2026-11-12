@@ -1,6 +1,6 @@
 # Contributing to termie
 
-termie is early but daily-usable, and Windows-first. Bug reports, clear repros, and focused pull requests are all welcome.
+termie runs on Windows and Linux. Bug reports, clear repros, and focused pull requests are all welcome.
 
 ## Building
 
@@ -9,12 +9,21 @@ You need the stable [Rust toolchain](https://rustup.rs/).
 ```powershell
 cargo build              # debug
 cargo test               # unit + golden tests
-cargo test -- --ignored  # live PTY integration tests (spawn a real shell; local only)
+cargo test -- --ignored  # live PTY integration tests (spawn a real shell)
 cargo clippy --all-targets
-cargo build --release    # optimized, ~7.6 MB
+cargo build --release    # optimized, ~9.3 MB
 ```
 
-The `--ignored` tests spawn a real shell through the pty and aren't run in CI (they're timing-sensitive); run them locally when changing the pty or terminal-response path.
+The `--ignored` tests spawn a real shell through the pty. CI runs them on Linux only, one thread at a time (`cargo test -- --ignored --test-threads=1`); run them locally when changing the pty or terminal-response path.
+
+Behavior that needs the whole app (tabs, panes, windows, the prompt) is covered by the drive scripts in `tests/drive/`, which CI runs on Windows after a debug build:
+
+```powershell
+$env:TERMIE_DRIVE_NOW=1; $env:TERMIE_DRIVE_SURFACELESS=1
+target\debug\termie.exe --shell cmd --drive tests\drive\first-prompt.txt
+```
+
+On a machine without a GPU adapter, the GPU and chrome snapshot tests pass without running and print a note saying so.
 
 Plugins live in their own repo — [`zeo/termie-plugins`](https://github.com/zeo/termie-plugins) — which is also where you add or change one (see its `CONTRIBUTING.md`).
 
@@ -46,8 +55,8 @@ A new terminal feature should land with a golden scenario or a unit test that lo
 
 ## Pull requests
 
-- Keep commits small and focused, with a clear summary line. The history uses short prefixes (`fix:`, `perf:`, `feat:`, `test:`, `polish:`) — follow suit.
-- Make sure `cargo test` and `cargo clippy --all-targets` pass. CI runs build + tests, clippy, and a `cargo-audit` scan on every push and pull request.
+- Keep commits small and focused. The summary line is lowercase and imperative, says what changed for the user, and has no type prefix or trailing period: `start cmd's first prompt on the top row`.
+- Make sure `cargo test` and `cargo clippy --all-targets` pass. CI runs the build, tests and clippy on Windows and Linux, the drive scripts, and a `cargo-audit` scan on every push and pull request, including ones from forks.
 - Say what changed and why, and link any issue the PR closes.
 
 ## License

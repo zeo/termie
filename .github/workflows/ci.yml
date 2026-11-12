@@ -30,7 +30,6 @@ jobs:
   # is intentionally not enforced (the project keeps its own non-rustfmt
   # style); clippy is the quality gate.
   build:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -69,9 +68,6 @@ jobs:
   # tests skip themselves when the runner has no adapter, so this passes on a
   # headless vm while still covering the platform layer, pty, and parser
   build-linux:
-    # keep fork PRs off the hosted runners so they cannot burn build minutes
-    # from this repository may schedule them
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -145,9 +141,6 @@ jobs:
 
   # security advisory scan of the dependency tree (RUSTSEC database)
   audit:
-    # keep fork PRs off the hosted runners so they cannot burn build minutes
-    # from this repository may schedule them
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
