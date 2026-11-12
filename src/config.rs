@@ -22,6 +22,8 @@ pub struct Persisted {
     pub right_click: RightClick,
     pub backend: render::BackendChoice,
     pub restore_on_launch: bool,
+    /// bring each pane's last lines back with the restored layout
+    pub restore_contents: bool,
     pub font_size: f32,
     pub padding: f32,
     pub cursor: grid::CursorShape,
@@ -112,6 +114,7 @@ impl Default for Persisted {
             right_click: RightClick::Menu,
             backend: render::BackendChoice::Auto,
             restore_on_launch: true,
+            restore_contents: true,
             font_size: CONTENT_PT,
             padding: 6.0,
             cursor: grid::CursorShape::Block,
@@ -181,6 +184,7 @@ pub fn render(p: &Persisted) -> String {
     let _ = writeln!(s, "right_click={}", p.right_click.label());
     let _ = writeln!(s, "backend={}", p.backend.label());
     let _ = writeln!(s, "restore_on_launch={}", p.restore_on_launch);
+    let _ = writeln!(s, "restore_contents={}", p.restore_contents);
     let _ = writeln!(s, "font_size={}", p.font_size);
     let _ = writeln!(s, "padding={}", p.padding);
     let _ = writeln!(s, "opacity={}", p.opacity);
@@ -315,6 +319,7 @@ pub fn parse(text: &str) -> Persisted {
             "right_click" => p.right_click = RightClick::from_label(v),
             "backend" => p.backend = render::BackendChoice::from_label(v),
             "restore_on_launch" => set_bool(&mut p.restore_on_launch, k, v),
+            "restore_contents" => set_bool(&mut p.restore_contents, k, v),
             "font_size" => {
                 if let Ok(n) = v.parse::<f32>()
                     && n.is_finite()
@@ -772,7 +777,8 @@ mod tests {
 
     #[test]
     fn every_switch_takes_the_same_spellings() {
-        let p = parse("restore_on_launch=off\ncopy_on_select=On\ncursor_blink=no\nupdate_check=0\nosc52=YES\n");
+        let p = parse("restore_on_launch=off\ncopy_on_select=On\ncursor_blink=no\nupdate_check=0\nosc52=YES\nrestore_contents=no\n");
+        assert!(!p.restore_contents);
         assert!(!p.restore_on_launch && p.copy_on_select && !p.cursor_blink && !p.update_check && p.osc52);
         // an unreadable value keeps the default instead of flipping it
         let p = parse("restore_on_launch=maybe\ninline_paint=sure\nbold_as_bright=\n");

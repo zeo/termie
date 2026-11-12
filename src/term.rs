@@ -350,46 +350,8 @@ impl Terminal {
     /// own parser and every modern probe accept. tmux and the truecolor
     /// detection scripts set a pen, query it back, and look for the echo
     fn sgr_report(&self) -> String {
-        use std::fmt::Write;
         let cur = &self.grid.cursor;
-        let a = &cur.attrs;
-        let mut s = String::from("0");
-        for (on, code) in [
-            (a.bold(), 1),
-            (a.dim(), 2),
-            (a.italic(), 3),
-            (a.blink(), 5),
-            (a.inverse(), 7),
-            (a.hidden(), 8),
-            (a.strike(), 9),
-            (a.overline(), 53),
-        ] {
-            if on {
-                let _ = write!(s, ";{code}");
-            }
-        }
-        match a.underline() {
-            UnderlineStyle::None => {}
-            UnderlineStyle::Single => s.push_str(";4"),
-            UnderlineStyle::Double => s.push_str(";4:2"),
-            UnderlineStyle::Curly => s.push_str(";4:3"),
-            UnderlineStyle::Dotted => s.push_str(";4:4"),
-            UnderlineStyle::Dashed => s.push_str(";4:5"),
-        }
-        let mut color = |base: u16, c: Color| {
-            let _ = match c {
-                Color::Indexed(n) if n < 8 && base < 58 => write!(s, ";{}", base - 8 + n as u16),
-                Color::Indexed(n) if n < 16 && base < 58 => write!(s, ";{}", base + 52 + (n - 8) as u16),
-                Color::Indexed(n) => write!(s, ";{base}:5:{n}"),
-                Color::Rgb(r, g, b) => write!(s, ";{base}:2:{r}:{g}:{b}"),
-                Color::Default | Color::DefaultBg => Ok(()),
-            };
-        };
-        color(38, cur.fg);
-        color(48, cur.bg);
-        color(58, a.ul);
-        s.push('m');
-        s
+        crate::grid::sgr_pen(cur.fg, cur.bg, &cur.attrs)
     }
 
     /// the DECSCUSR value for the current cursor: 1/2 block, 3/4 underline,
@@ -1550,6 +1512,26 @@ mod tests {
         t.set_scrollback_limit(20);
         feed(&mut t, b"\x1b[?1049l");
         assert_eq!(t.grid.scrollback_limit, 20);
+    }
+
+    #[test]
+    fn saved_history_replays_into_the_same_cells() {
+        let mut t = Terminal::new(3, 10);
+        t.set_scrollback_limit(100);
+        feed(&mut t, "\x1b[1;31mred\x1b[0m plain\r\n\x1b[48;2;1;2;3mbg\x1b[0m \x1b[8msecret\x1b[0m\r\nwraps past ten cols\r\n\u{4e2d}x\r\n".as_bytes());
+        let vt = t.grid.to_vt(5_000);
+        assert!(vt.starts_with("\x1b[0;1;31mred\x1b[0m plain\r\n"), "{vt:?}");
+        assert!(!vt.contains("secret"));
+        let mut back = Terminal::new(3, 10);
+        back.set_scrollback_limit(100);
+        feed(&mut back, vt.as_bytes());
+        assert_eq!(back.grid.to_vt(5_000), vt);
+        assert_eq!(back.grid.full_text(), t.grid.full_text().replace(" secret", ""));
+        assert_eq!(t.grid.to_vt(1), "\u{4e2d}x\r\n");
+        // a narrower pane rewraps the soft-wrapped line instead of cutting it
+        let mut narrow = Terminal::new(3, 6);
+        feed(&mut narrow, vt.as_bytes());
+        assert!(narrow.grid.full_text().contains("wraps past ten cols"));
     }
 
     #[test]

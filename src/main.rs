@@ -58,6 +58,9 @@ const POOL_TARGET: usize = 1;
 const MAX_WARM_FAILS: usize = 10;
 const ZOOM_PIXEL_STEP: f64 = 40.0;
 const MAX_STARTUP_TEXT_BYTES: usize = 1024 * 1024;
+/// history kept per pane across a restart, and the file size it may reach
+const MAX_RESTORED_LINES: usize = 5_000;
+const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_PLUGINS: usize = 128;
 const MAX_PENDING_PTY_OUTPUT_EVENTS: usize = 64;
@@ -2627,14 +2630,14 @@ fn parse_layout_verbs(args: &[String]) -> Vec<session::TabSnap> {
         let leaf = session::NodeSnap::Leaf { cwd, shell: shell.unwrap_or_default() };
         match verb {
             "new-tab" | "nt" => {
-                tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None });
+                tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None, buffers: Vec::new() });
             }
             "split-pane" | "sp" => match tabs.last_mut() {
                 Some(tab) => {
                     split_newest(&mut tab.root, vertical, leaf);
                     tab.focused_leaf += 1;
                 }
-                None => tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None }),
+                None => tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None, buffers: Vec::new() }),
             },
             _ => {}
         }
@@ -3928,24 +3931,127 @@ fn pane_window_counts<'a>(
         })
 }
 
-fn append_session_tabs(window: &PaneWindow, tabs: &mut Vec<session::TabSnap>) {
+/// a window's tabs for the session file; with `buffers` set each pane's history
+/// is written there too and named on its tab
+fn append_session_tabs(window: &PaneWindow, tabs: &mut Vec<session::TabSnap>, buffers: Option<&Path>) {
     if window.session_ephemeral {
         return;
     }
     for tab in &window.tabs {
-        let Some(root) = tab.root.as_ref() else {
+        let Some(node) = tab.root.as_ref() else {
             continue;
         };
         let mut leaf_ids = Vec::new();
-        let root = node_to_snap(root, &mut leaf_ids);
+        let root = node_to_snap(node, &mut leaf_ids);
         let focused_leaf = leaf_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
+        let mut names = Vec::new();
+        if let Some(dir) = buffers {
+            each_pane(node, &mut |p| names.push(save_buffer(dir, p).unwrap_or_default()));
+        }
         tabs.push(session::TabSnap {
             focused_leaf,
             root,
             title: tab.title.clone(),
             color: tab.color,
+            buffers: names,
         });
     }
+}
+
+/// write a pane's history for the next launch and return the file name. the
+/// alt screen belongs to a running program and is never saved
+fn save_buffer(dir: &Path, pane: &Pane) -> Option<String> {
+    if pane.term.using_alt {
+        return None;
+    }
+    let text = pane.term.grid.to_vt(MAX_RESTORED_LINES);
+    // every line starts from a reset pen, so cutting at a line break stays valid
+    let cut = text.len().saturating_sub(MAX_BUFFER_BYTES);
+    let text = match cut {
+        0 => &text[..],
+        _ => text[cut..].find('\n').map_or("", |i| &text[cut + i + 1..]),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let name = format!("{}.vt", pane.id);
+    std::fs::write(dir.join(&name), text).ok()?;
+    Some(name)
+}
+
+/// a saved buffer reduced to text, line breaks and sgr pens, so a tampered
+/// file can't make the terminal answer queries into the new shell
+fn restorable_vt(saved: &str) -> String {
+    let mut out = String::with_capacity(saved.len());
+    let mut chars = saved.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    let params: String = std::iter::from_fn(|| chars.next_if(|c| matches!(c, ' '..='?'))).collect();
+                    let sgr = params.chars().all(|c| c.is_ascii_digit() || matches!(c, ';' | ':'));
+                    if chars.next() == Some('m') && sgr {
+                        out.push_str("\x1b[");
+                        out.push_str(&params);
+                        out.push('m');
+                    }
+                }
+                // osc, dcs, apc, pm and sos strings run to bel or st
+                Some(']' | 'P' | '_' | '^' | 'X') => {
+                    while let Some(c) = chars.next() {
+                        if matches!(c, '\x07' | '\x1b') {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' | '\n' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// play a saved buffer into a fresh pane ahead of its shell's first output,
+/// with a dim line marking where the old session ends
+fn restore_buffer(pane: &mut Pane, saved: &str) {
+    let mut bytes = restorable_vt(saved);
+    if !bytes.is_empty() && !bytes.ends_with('\n') {
+        bytes.push_str("\r\n");
+    }
+    bytes.push_str("\x1b[0;2mrestored from the last session\x1b[0m\r\n");
+    // conpty paints its own screen from the top row, so the restored lines
+    // move up into history before the shell starts drawing
+    #[cfg(windows)]
+    {
+        bytes.push_str(&"\n".repeat(pane.term.grid.rows));
+        bytes.push_str("\x1b[H");
+    }
+    pane.parser.advance(&mut pane.term, bytes.as_bytes());
+}
+
+fn buffers_dir() -> Option<std::path::PathBuf> {
+    Some(state_dir()?.join("buffers"))
+}
+
+/// outer position + inner size of a window, None while minimized; `fallback`
+/// stands in where the platform can't report a position (wayland)
+fn window_bounds(w: &Window, fallback: Option<(i32, i32)>) -> Option<session::WindowBounds> {
+    let size = w.inner_size();
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let pos = w.outer_position().ok().map(|p| (p.x, p.y)).or(fallback).unwrap_or((0, 0));
+    Some(session::WindowBounds {
+        x: pos.0,
+        y: pos.1,
+        width: size.width,
+        height: size.height,
+        maximized: w.is_maximized(),
+    })
 }
 
 fn accumulated_zoom_steps(
@@ -4444,7 +4550,7 @@ impl App {
             && command.is_none()
             && first_cwd.is_none()
             && first_shell.is_none())
-        .then(|| restored.as_ref().and_then(|s| s.window.as_ref()))
+        .then(|| restored.as_ref().and_then(|s| s.windows.first()).and_then(|w| w.bounds.as_ref()))
         .flatten();
         // clamp the saved rect to a currently-visible monitor (so a window saved
         // on a now-disconnected display doesn't open off-screen); the size goes on
@@ -4470,15 +4576,12 @@ impl App {
             attrs = attrs.with_max_inner_size(PhysicalSize::new(max_width, max_height));
         }
         let attrs = match placement {
-            Some((_, _, w, h)) => attrs.with_inner_size(PhysicalSize::new(w, h)),
+            Some((x, y, w, h)) => attrs.with_inner_size(PhysicalSize::new(w, h)).with_position(PhysicalPosition::new(x, y)),
             None => attrs.with_inner_size(LogicalSize::new(1000.0, 640.0)),
         };
         // app id so wayland and x11 match every window to termie.desktop
         let attrs = platform_window_attrs(attrs);
         let window = Arc::new(event_loop.create_window(attrs)?);
-        if let Some((x, y, _, _)) = placement {
-            window.set_outer_position(PhysicalPosition::new(x, y));
-        }
         if restore_max {
             window.set_maximized(true);
         }
@@ -4604,6 +4707,7 @@ impl App {
         };
         #[cfg(not(windows))]
         let adopted = false;
+        let mut more_windows = None;
         if adopted {
             // tab one is the handed-off console session
         } else if !self.cli.tabs.is_empty() {
@@ -4611,7 +4715,7 @@ impl App {
             // the scripted window never overwrites the saved session
             self.session_ephemeral = true;
             let tabs = self.cli.tabs.clone();
-            self.restore_session(session::SessionFile { active_tab: 0, tabs, window: None });
+            self.restore_session(session::WindowSnap { active_tab: 0, tabs, bounds: None });
         } else if command.is_some() || first_cwd.is_some() || first_shell.is_some() {
             self.session_ephemeral = true;
             let (cols, rows) = self.content_pane_size();
@@ -4620,10 +4724,14 @@ impl App {
                 Err(e) => log::error!("failed to spawn the requested command: {e}"),
             }
         } else if let Some(sf) = restored {
-            // bare launch: rebuild the saved tab/split layout with fresh shells in
-            // the saved dirs. if nothing restores, the warm pool below installs a
-            // single shell as the fallback
-            self.restore_session(sf);
+            // bare launch: rebuild the saved windows with fresh shells in the
+            // saved dirs; this one takes the first, the rest open once it shows.
+            // if nothing restores, the warm pool below installs a single shell
+            let mut windows = sf.windows.into_iter();
+            if let Some(first) = windows.next() {
+                self.restore_session(first);
+            }
+            more_windows = Some(windows.collect::<Vec<_>>());
         }
         // start the first shells now — the pane size is final once settings are
         // applied, so the async pwsh spawn overlaps the first paint + reveal
@@ -4644,6 +4752,16 @@ impl App {
         timing("window shown");
         self.shown = true;
         window.request_redraw();
+        if let Some(windows) = more_windows {
+            for snap in windows {
+                self.open_restored_window(event_loop, snap);
+            }
+            window.focus_window();
+            // the saved histories are played back; the next clean exit writes fresh ones
+            if let Some(dir) = buffers_dir() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         // surface any keybindings.conf parse errors now that the status bar exists
         if self.kb_ignored > 0 {
             let noun = if self.kb_ignored == 1 { "line" } else { "lines" };
@@ -8467,11 +8585,13 @@ impl App {
     ) -> Result<PaneWindow> {
         let (rgba, width, height) = win::app_icon();
         let icon = winit::window::Icon::from_rgba(rgba, width, height).ok();
-        let attrs = satellite_window_attrs(icon);
-        let window = Arc::new(event_loop.create_window(attrs)?);
+        let mut attrs = satellite_window_attrs(icon);
+        // a position on the attributes reaches x11 as a size hint the wm honors at
+        // map time, where a move before the first map is ignored
         if let Some(point) = point {
-            window.set_outer_position(point);
+            attrs = attrs.with_position(point);
         }
+        let window = Arc::new(event_loop.create_window(attrs)?);
         constrain_window_to_monitor(&window);
         window.set_ime_allowed(true);
         #[cfg(windows)]
@@ -8567,11 +8687,7 @@ impl App {
                     app.install_first_tab(pane);
                 }
             } else {
-                app.restore_session(session::SessionFile {
-                    active_tab: 0,
-                    tabs: cli.tabs,
-                    window: None,
-                });
+                app.restore_session(session::WindowSnap { active_tab: 0, tabs: cli.tabs, bounds: None });
             }
             if let Some(renderer) = app.pw.renderer.as_mut() {
                 renderer.begin_reveal();
@@ -9465,56 +9581,65 @@ impl App {
         let _ = write_atomic(&path, config::render(&p).as_bytes());
     }
 
-    /// build a snapshot of every live tab and split tree for persistence
-    fn session_snapshot(&self) -> session::SessionFile {
+    /// build a snapshot of every live window, tab and split tree for
+    /// persistence, the main window first; `buffers` also saves pane histories
+    fn session_snapshot(&self, buffers: Option<&Path>) -> session::SessionFile {
         let main = self.main_pw();
-        let active_tab = main.active_tab;
-        let mut tabs = Vec::new();
-        append_session_tabs(main, &mut tabs);
-        match self.cur_sat {
-            None => {
-                for satellite in &self.satellites {
-                    append_session_tabs(satellite, &mut tabs);
-                }
-            }
-            Some(current) => {
-                for (index, satellite) in self.satellites.iter().enumerate() {
-                    if index == current {
-                        append_session_tabs(&self.pw, &mut tabs);
-                    } else {
-                        append_session_tabs(satellite, &mut tabs);
-                    }
-                }
-            }
-        }
-        // capture the window's outer position + inner size for next launch; a
-        // minimized window reports zero size, so fall back to the last good
-        // bounds instead of writing a session with no window key (which would
-        // silently reset placement after a quit-while-minimized)
-        let window = self.live_window_bounds().or_else(|| self.last_window_bounds.clone());
-        session::SessionFile { active_tab, tabs, window }
+        let satellites =
+            self.satellites.iter().enumerate().map(|(i, s)| if self.cur_sat == Some(i) { &self.pw } else { s });
+        let windows = std::iter::once(main)
+            .chain(satellites)
+            .filter_map(|pw| {
+                let mut tabs = Vec::new();
+                append_session_tabs(pw, &mut tabs, buffers);
+                // a minimized main window reports zero size, so it falls back to
+                // the last good bounds instead of resetting placement next launch
+                let bounds = if std::ptr::eq(pw, main) {
+                    self.live_window_bounds().or_else(|| self.last_window_bounds.clone())
+                } else {
+                    pw.window.as_deref().and_then(|w| window_bounds(w, None))
+                };
+                (!tabs.is_empty()).then_some(session::WindowSnap { active_tab: pw.active_tab, tabs, bounds })
+            })
+            .collect();
+        session::SessionFile { windows }
     }
 
     /// the main window's current bounds, or None while minimized/degenerate
     fn live_window_bounds(&self) -> Option<session::WindowBounds> {
-        let w = self.main_pw().window.as_ref()?;
-        let size = w.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return None;
+        window_bounds(self.main_pw().window.as_ref()?, self.last_window_bounds.as_ref().map(|p| (p.x, p.y)))
+    }
+
+    /// reopen a saved window beside the main one at its saved bounds
+    fn open_restored_window(&mut self, event_loop: &ActiveEventLoop, snap: session::WindowSnap) {
+        let monitors = monitor_rects(event_loop);
+        let placement = snap.bounds.as_ref().map(|b| clamp_window_bounds(&monitors, (b.x, b.y, b.width, b.height)));
+        let point = placement.map(|(x, y, _, _)| PhysicalPosition::new(x, y));
+        let Ok(pw) = self.create_satellite_window(event_loop, point) else {
+            return;
+        };
+        if let Some(window) = pw.window.as_ref() {
+            if let Some((_, _, w, h)) = placement {
+                let _ = window.request_inner_size(PhysicalSize::new(w, h));
+            }
+            if snap.bounds.as_ref().is_some_and(|b| b.maximized) {
+                window.set_maximized(true);
+            }
         }
-        let pos = w
-            .outer_position()
-            .ok()
-            .map(|p| (p.x, p.y))
-            .or_else(|| self.last_window_bounds.as_ref().map(|p| (p.x, p.y)))
-            .unwrap_or((0, 0));
-        Some(session::WindowBounds {
-            x: pos.0,
-            y: pos.1,
-            width: size.width,
-            height: size.height,
-            maximized: w.is_maximized(),
-        })
+        self.satellites.push(pw);
+        let slot = self.satellites.len() - 1;
+        self.with_window(slot, |app| {
+            app.restore_session(snap);
+            if let Some(renderer) = app.pw.renderer.as_mut() {
+                renderer.begin_reveal();
+            }
+            app.paint();
+        });
+        if self.satellites[slot].tabs.is_empty() {
+            self.satellites.remove(slot);
+        } else if let Some(window) = self.satellites[slot].window.as_ref() {
+            window.set_visible(true);
+        }
     }
 
     /// mark the layout changed and (re)arm the debounced session write so a burst
@@ -9538,12 +9663,8 @@ impl App {
     /// write the session atomically (temp + rename) so a reader never sees a
     /// half-written file; never clobber a good session with an empty one, nor
     /// with an ad-hoc folder/command window that shouldn't persist
-    fn write_session(&self) {
+    fn write_session(&self, with_buffers: bool) {
         if self.session_ephemeral {
-            return;
-        }
-        let snap = self.session_snapshot();
-        if snap.tabs.is_empty() {
             return;
         }
         let Some(path) = session_path() else {
@@ -9551,6 +9672,19 @@ impl App {
         };
         if let Some(dir) = path.parent() {
             let _ = ensure_user_dir(dir);
+        }
+        // histories are written on a clean exit only, never from an elevated
+        // window, and the old set goes first so none outlives its session
+        let buffers = buffers_dir().filter(|_| with_buffers);
+        if let Some(dir) = buffers.as_deref() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let buffers = buffers.filter(|dir| {
+            self.persisted.restore_contents && !self.elevated() && ensure_user_dir(dir).is_ok()
+        });
+        let snap = self.session_snapshot(buffers.as_deref());
+        if snap.windows.is_empty() {
+            return;
         }
         let text = snap.to_json_string();
         let _ = write_atomic(&path, text.as_bytes());
@@ -9561,7 +9695,7 @@ impl App {
     fn flush_session_now(&mut self) {
         self.session_dirty = false;
         self.session_flush_at = None;
-        self.write_session();
+        self.write_session(true);
     }
 
     /// rebuild a saved pane tree by spawning fresh shells; pushes each leaf's new
@@ -9589,16 +9723,26 @@ impl App {
         }
     }
 
-    /// restore tabs from a saved session by spawning fresh shells in the saved
-    /// directories. leaves self.pw.tabs empty on total failure so the caller falls
-    /// back to a single shell
-    fn restore_session(&mut self, sf: session::SessionFile) {
+    /// restore a saved window's tabs by spawning fresh shells in the saved
+    /// directories, playing back each pane's saved history. leaves
+    /// self.pw.tabs empty on total failure so the caller falls back to a single shell
+    fn restore_session(&mut self, sf: session::WindowSnap) {
         let (cols, rows) = self.content_pane_size();
+        let buffers = buffers_dir().filter(|_| self.persisted.restore_contents);
         for tab in &sf.tabs {
             let mut leaf_ids = Vec::new();
-            let Some(root) = self.rebuild_node(&tab.root, cols, rows, &mut leaf_ids) else {
+            let Some(mut root) = self.rebuild_node(&tab.root, cols, rows, &mut leaf_ids) else {
                 continue;
             };
+            if let Some(dir) = buffers.as_deref() {
+                let mut panes = Vec::new();
+                leaves_mut(&mut root, &mut panes);
+                for (pane, name) in panes.into_iter().zip(&tab.buffers).filter(|(_, n)| !n.is_empty()) {
+                    if let Some(saved) = read_text_file(&dir.join(name), MAX_BUFFER_BYTES) {
+                        restore_buffer(pane, &saved);
+                    }
+                }
+            }
             let focused = leaf_ids
                 .get(tab.focused_leaf)
                 .copied()
@@ -13072,7 +13216,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.session_flush_at = None;
             if self.session_dirty {
                 self.session_dirty = false;
-                self.write_session();
+                self.write_session(false);
             }
         }
         if let Some(t) = self.find_refresh_at
@@ -14638,6 +14782,12 @@ mod tests {
     }
 
     #[test]
+    fn restored_buffers_keep_only_text_and_pens() {
+        let saved = "\x1b[0;1;38:2:1:2:3mok\x1b[0m\r\n\x1b]52;c;ZWNobyBoaQ==\x07\x1b[6n\x1b[2J\x1bc\x1b[?1049h\x07\u{9b}6n\ttab\x1b]0;t\x1b\\end\r\n";
+        assert_eq!(restorable_vt(saved), "\x1b[0;1;38:2:1:2:3mok\x1b[0m\r\n6ntabend\r\n");
+    }
+
+    #[test]
     fn swapping_panes_trades_their_places_only() {
         let split = |a, b| Node::Split { dir: Dir::Vertical, ratio: 0.3, a: Box::new(a), b: Box::new(b) };
         let mut root = split(leaf(1), split(leaf(2), leaf(3)));
@@ -14682,17 +14832,37 @@ mod tests {
         let mut forwarded = pane_window(None, None, vec![tab_from_pane(tp(2))]);
         forwarded.tabs[0].title = Some("forwarded".to_string());
         forwarded.session_ephemeral = true;
-        let mut tear_off = pane_window(None, None, vec![tab_from_pane(tp(3))]);
+        let mut pane = tp(3);
+        pane.parser.advance(&mut pane.term, b"[32mgreen[0m history
+");
+        let mut tear_off = pane_window(None, None, vec![tab_from_pane(pane)]);
         tear_off.tabs[0].title = Some("tear off".to_string());
+        if let Some(Node::Leaf(p)) = main.tabs[0].root.as_mut() {
+            p.parser.advance(&mut p.term, b"vim[?1049hscreen");
+        }
 
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let dir = std::env::temp_dir().join(format!("termie-buffers-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
         let mut tabs = Vec::new();
         for window in [&main, &forwarded, &tear_off] {
-            append_session_tabs(window, &mut tabs);
+            append_session_tabs(window, &mut tabs, Some(&dir));
         }
         assert_eq!(
             tabs.iter().map(|tab| tab.title.as_deref()).collect::<Vec<_>>(),
             vec![Some("main"), Some("tear off")]
         );
+        // the alt screen is skipped, the plain pane's history is saved by pane id
+        assert_eq!(tabs[0].buffers, [""]);
+        assert_eq!(tabs[1].buffers, ["3.vt"]);
+        let saved = std::fs::read_to_string(dir.join("3.vt")).expect("buffer written");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut fresh = tp(4);
+        restore_buffer(&mut fresh, &format!("{saved}[6n[c"));
+        let text = fresh.term.grid.full_text();
+        assert!(text.contains("green history
+restored from the last session"), "{text:?}");
+        assert!(!fresh.term.cmd_running && fresh.term.responses.is_empty());
     }
 
     #[test]

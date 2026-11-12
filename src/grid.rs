@@ -16,6 +16,49 @@ pub struct SearchMatches {
     pub budget_exhausted: bool,
 }
 
+/// an sgr pen as the parameters and final byte of a CSI ("0;1;38:2:255:0:0m"),
+/// with colon subparams for extended color and underline style
+pub fn sgr_pen(fg: Color, bg: Color, a: &Attrs) -> String {
+    use std::fmt::Write;
+    let mut s = String::from("0");
+    for (on, code) in [
+        (a.bold(), 1),
+        (a.dim(), 2),
+        (a.italic(), 3),
+        (a.blink(), 5),
+        (a.inverse(), 7),
+        (a.hidden(), 8),
+        (a.strike(), 9),
+        (a.overline(), 53),
+    ] {
+        if on {
+            let _ = write!(s, ";{code}");
+        }
+    }
+    match a.underline() {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => s.push_str(";4"),
+        UnderlineStyle::Double => s.push_str(";4:2"),
+        UnderlineStyle::Curly => s.push_str(";4:3"),
+        UnderlineStyle::Dotted => s.push_str(";4:4"),
+        UnderlineStyle::Dashed => s.push_str(";4:5"),
+    }
+    let mut color = |base: u16, c: Color| {
+        let _ = match c {
+            Color::Indexed(n) if n < 8 && base < 58 => write!(s, ";{}", base - 8 + n as u16),
+            Color::Indexed(n) if n < 16 && base < 58 => write!(s, ";{}", base + 52 + (n - 8) as u16),
+            Color::Indexed(n) => write!(s, ";{base}:5:{n}"),
+            Color::Rgb(r, g, b) => write!(s, ";{base}:2:{r}:{g}:{b}"),
+            Color::Default | Color::DefaultBg => Ok(()),
+        };
+    };
+    color(38, fg);
+    color(48, bg);
+    color(58, a.ul);
+    s.push('m');
+    s
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchHit {
     pub start: (u64, usize),
@@ -916,6 +959,49 @@ impl Grid {
     /// all of history plus the live screen as plain text: soft-wrapped runs
     /// join into one logical line (same rule as copy), hard lines keep their
     /// breaks, trailing blank screen rows are dropped
+    /// the newest `max_lines` lines of history and screen as text with sgr
+    /// pens, for session restore. soft wraps stay unbroken so a pane of another
+    /// width rewraps them, hidden text is blanked and blank screen rows below
+    /// the last written one are dropped
+    pub fn to_vt(&self, max_lines: usize) -> String {
+        let blank = |c: &Cell| {
+            (matches!(c.c, ' ' | '\0') || c.attrs.hidden()) && c.bg == Color::DefaultBg && !c.attrs.inverse()
+        };
+        let used = (0..self.total_lines())
+            .rev()
+            .find(|&i| !self.line_at_global(i).iter().all(blank))
+            .map_or(0, |i| i + 1);
+        let reset = sgr_pen(Color::Default, Color::DefaultBg, &Attrs::default());
+        let mut out = String::new();
+        for i in used.saturating_sub(max_lines)..used {
+            let line = self.line_at_global(i);
+            let end = if line.wrapped { line.len() } else { line.iter().rposition(|c| !blank(c)).map_or(0, |e| e + 1) };
+            let mut pen = reset.clone();
+            for cell in line[..end].iter().filter(|c| c.c != '\0') {
+                let mut attrs = cell.attrs;
+                attrs.set_hidden(false);
+                let next = sgr_pen(cell.fg, cell.bg, &attrs);
+                if next != pen {
+                    out.push_str("\x1b[");
+                    out.push_str(&next);
+                    pen = next;
+                }
+                match cell.cluster {
+                    _ if cell.attrs.hidden() => out.push(' '),
+                    0 => out.push(cell.c),
+                    id => out.push_str(self.cluster_str(id)),
+                }
+            }
+            if pen != reset {
+                out.push_str("\x1b[0m");
+            }
+            if !line.wrapped {
+                out.push_str("\r\n");
+            }
+        }
+        out
+    }
+
     pub fn full_text(&self) -> String {
         self.full_span().map_or_else(String::new, |(start, end)| self.selected_text(start, end, false))
     }
