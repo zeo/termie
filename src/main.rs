@@ -2407,6 +2407,16 @@ struct CliArgs {
     kitty_demo: bool,
     /// the Linux GUI stays user-owned while its first child shell is elevated
     admin_shell: bool,
+    /// wt `focus-tab -t N`: the layout tab that starts focused
+    active_tab: usize,
+    /// wt `-M` / `-F`: open maximized or borderless fullscreen
+    maximized: bool,
+    fullscreen: bool,
+    /// wt `--pos x,y`; either half may be left out
+    pos: (Option<i32>, Option<i32>),
+    /// wt `-w 0` / `-w last`: a forwarded launch opens its tabs in the most
+    /// recently focused window instead of a new one
+    join_last: bool,
 }
 
 impl CliArgs {
@@ -2419,51 +2429,136 @@ impl CliArgs {
     }
 }
 
-/// parse `termie [--cwd DIR | -d DIR | --cwd=DIR] [--shell NAME] [-- COMMAND...]`,
-/// or wt-style layout verbs when the first argument is one:
-/// `termie new-tab [-d DIR] [--shell NAME] ; split-pane [-H|-V] [-d DIR] ...`.
+/// tab flags only the wt-style form takes; one anywhere switches to it
+const WT_TAB_FLAGS: [&str; 6] =
+    ["-p", "--profile", "--title", "--tabColor", "--startingDirectory", "--suppressApplicationTitle"];
+
+/// a flag and its inline `=value`, for long flags and `-d=`
+fn split_flag(a: &str) -> (&str, Option<&str>) {
+    match a.split_once('=') {
+        Some((flag, value)) if flag.starts_with("--") || flag == "-d" => (flag, Some(value)),
+        _ => (a, None),
+    }
+}
+
+/// consume a launch-wide option at args[*i]: wt's `-M`, `-F`, `--pos x,y`,
+/// `-w 0`, or `--drive`, `--kitty-demo`, `--admin-shell`
+fn take_launch_option(out: &mut CliArgs, args: &[String], i: &mut usize) -> bool {
+    let (flag, inline) = split_flag(&args[*i]);
+    match flag {
+        "-M" | "--maximized" => out.maximized = true,
+        "-F" | "--fullscreen" => out.fullscreen = true,
+        "--kitty-demo" => out.kitty_demo = true,
+        "--admin-shell" => out.admin_shell = true,
+        "--pos" | "-w" | "--window" | "--drive" => {
+            let value = match inline {
+                Some(v) => v.to_string(),
+                None => {
+                    *i += 1;
+                    args.get(*i).cloned().unwrap_or_default()
+                }
+            };
+            match flag {
+                "--pos" => {
+                    let (x, y) = value.split_once(',').unwrap_or((&value, ""));
+                    out.pos = (x.trim().parse().ok(), y.trim().parse().ok());
+                }
+                "--drive" => out.drive = Some(value).filter(|v| !v.is_empty()),
+                _ => out.join_last = matches!(value.as_str(), "0" | "last"),
+            }
+        }
+        _ => return false,
+    }
+    *i += 1;
+    true
+}
+
+/// parse `termie [-M] [-F] [--pos X,Y] [-w 0] [--cwd DIR | -d DIR] [--shell NAME]
+/// [COMMAND... | -- COMMAND...]`, or wt-style layout verbs once a verb, a `;`
+/// or a wt-only tab flag shows up:
+/// `termie new-tab [-d DIR] [-p NAME] [--title T] ; split-pane [-H|-V] ...`.
 /// lenient and silent: release is a windowed subsystem with no console to print
-/// help to, so unknown flags are ignored rather than erroring. `--` ends option
-/// parsing and the remainder is a command argv to run instead of the default shell
+/// help to, so unknown flags are ignored rather than erroring. the first bare
+/// word or a `--` starts a command argv to run instead of the default shell
 fn parse_args<I: Iterator<Item = String>>(args: I) -> CliArgs {
+    let args: Vec<String> = args.collect();
     let mut out = CliArgs::default();
-    let mut it = args.peekable();
-    if matches!(it.peek().map(String::as_str), Some("new-tab" | "nt" | "split-pane" | "sp")) {
-        out.tabs = parse_layout_verbs(&it.collect::<Vec<_>>());
+    let mut i = 0;
+    while i < args.len() && take_launch_option(&mut out, &args, &mut i) {}
+    let rest = &args[i..];
+    let verb = matches!(
+        rest.first().map(String::as_str),
+        Some("new-tab" | "nt" | "split-pane" | "sp" | "focus-tab" | "ft")
+    );
+    if verb || rest.iter().take_while(|a| *a != "--").any(|a| a == ";" || WT_TAB_FLAGS.contains(&split_flag(a).0)) {
+        (out.tabs, out.active_tab) = parse_layout_verbs(rest);
         return out;
     }
-    while let Some(a) = it.next() {
-        if a == "--" {
-            let rest: Vec<String> = it.by_ref().collect();
-            if !rest.is_empty() {
-                out.command = Some(rest);
-            }
-            break;
-        } else if a == "--cwd" || a == "-d" {
-            if let Some(dir) = it.next() {
-                out.cwd = Some(dir);
-            }
-        } else if let Some(dir) = a.strip_prefix("--cwd=").or_else(|| a.strip_prefix("-d=")) {
-            out.cwd = Some(dir.to_string());
-        } else if a == "--shell" {
-            if let Some(name) = it.next() {
-                out.shell = Some(name);
-            }
-        } else if let Some(name) = a.strip_prefix("--shell=") {
-            out.shell = Some(name.to_string());
-        } else if a == "--kitty-demo" {
-            out.kitty_demo = true;
-        } else if a == "--admin-shell" {
-            out.admin_shell = true;
-        } else if a == "--drive" {
-            if let Some(path) = it.next() {
-                out.drive = Some(path);
-            }
-        } else if let Some(path) = a.strip_prefix("--drive=") {
-            out.drive = Some(path.to_string());
+    while i < args.len() {
+        if take_launch_option(&mut out, &args, &mut i) {
+            continue;
         }
+        let (flag, inline) = split_flag(&args[i]);
+        let mut value = || {
+            inline.map(str::to_string).or_else(|| {
+                i += 1;
+                args.get(i).cloned()
+            })
+        };
+        match flag {
+            "--cwd" | "-d" => out.cwd = value(),
+            "--shell" => out.shell = value(),
+            "--" => {
+                out.command = Some(args[i + 1..].to_vec()).filter(|c| !c.is_empty());
+                break;
+            }
+            // a lone folder (dropped on the exe) opens there instead of running
+            word if i + 1 == args.len() && Path::new(word).is_dir() => out.cwd = Some(word.to_string()),
+            word if !word.starts_with('-') && !word.eq_ignore_ascii_case("/embedding") => {
+                out.command = Some(args[i..].to_vec());
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
     }
     out
+}
+
+/// a wt `--tabColor` hex as the nearest of the six tab tints (ansi 1-6 by
+/// hue); grays have no hue and pick none
+fn tab_color_index(hex: &str) -> Option<u8> {
+    let c = parse_color(hex)?;
+    let (r, g, b) = (c.r as f32, c.g as f32, c.b as f32);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let span = max - min;
+    if span < 24.0 {
+        return None;
+    }
+    let hue = 60.0
+        * if max == r {
+            (g - b) / span
+        } else if max == g {
+            2.0 + (b - r) / span
+        } else {
+            4.0 + (r - g) / span
+        };
+    let sector = ((hue.rem_euclid(360.0) + 30.0) / 60.0) as usize % 6;
+    Some([1, 3, 2, 6, 4, 5][sector])
+}
+
+/// open, maximize or fullscreen a new window as its `-M` / `-F` / `--pos` ask
+fn apply_window_options(window: &Window, cli: &CliArgs) {
+    if cli.pos != (None, None) {
+        let at = window.outer_position().unwrap_or_default();
+        window.set_outer_position(PhysicalPosition::new(cli.pos.0.unwrap_or(at.x), cli.pos.1.unwrap_or(at.y)));
+    }
+    if cli.maximized {
+        window.set_maximized(true);
+    }
+    if cli.fullscreen {
+        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+    }
 }
 
 fn launch_can_join(args: &[String]) -> bool {
@@ -2640,74 +2735,95 @@ fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
     out
 }
 
-/// wt-style layout verbs, segments separated by standalone `;` tokens. each
-/// `split-pane` splits the current tab's newest pane; `-V` (the default) puts
-/// the new pane beside it, `-H` below it. a leading split-pane implies a first
-/// tab, matching wt
-fn parse_layout_verbs(args: &[String]) -> Vec<session::TabSnap> {
+/// wt-style layout verbs, segments separated by standalone `;` tokens, plus
+/// the index of the tab `focus-tab -t N` picked. a segment without a verb is a
+/// `new-tab`, so `termie ; ;` opens three tabs. each `split-pane` splits the
+/// current tab's newest pane; `-V` (the default) puts the new pane beside it,
+/// `-H` below it, `-s 0.3` gives it 30%, `-D` copies the pane it splits. a
+/// leading split-pane implies a first tab, matching wt
+fn parse_layout_verbs(args: &[String]) -> (Vec<session::TabSnap>, usize) {
     // the newest leaf is always on the rightmost spine: every split replaces
     // it with Split { a: old, b: new }, so descending `b` finds it
-    fn split_newest(node: &mut session::NodeSnap, vertical: bool, leaf: session::NodeSnap) {
+    fn newest(node: &mut session::NodeSnap) -> &mut session::NodeSnap {
         match node {
-            session::NodeSnap::Split { b, .. } => split_newest(b, vertical, leaf),
-            session::NodeSnap::Leaf { .. } => {
-                let old = std::mem::replace(node, session::NodeSnap::Leaf { cwd: None, shell: String::new() });
-                *node = session::NodeSnap::Split { vertical, ratio: 0.5, a: Box::new(old), b: Box::new(leaf) };
-            }
+            session::NodeSnap::Split { b, .. } => newest(b),
+            leaf => leaf,
         }
     }
 
     let mut tabs: Vec<session::TabSnap> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let end = args[i..].iter().position(|a| a == ";").map(|p| i + p).unwrap_or(args.len());
-        let seg = &args[i..end];
-        i = end + 1;
-        let Some(verb) = seg.first().map(String::as_str) else {
-            continue;
+    let mut active = 0;
+    for seg in args.split(|a| a == ";") {
+        let (verb, opts) = match seg.first().map(String::as_str) {
+            Some(verb @ ("new-tab" | "nt" | "split-pane" | "sp" | "focus-tab" | "ft")) => (verb, &seg[1..]),
+            _ => ("new-tab", seg),
         };
-        let (mut cwd, mut shell, mut vertical) = (None, None, true);
-        let mut j = 1;
-        while j < seg.len() {
-            let a = seg[j].as_str();
-            match a {
+        let (mut cwd, mut shell, mut command, mut title, mut color) = (None, None, None, None, None);
+        let (mut vertical, mut size, mut duplicate, mut target) = (true, None, false, None);
+        let mut j = 0;
+        while j < opts.len() {
+            let (flag, inline) = split_flag(&opts[j]);
+            let mut value = || {
+                inline.map(str::to_string).or_else(|| {
+                    j += 1;
+                    opts.get(j).cloned()
+                })
+            };
+            match flag {
                 "-H" | "--horizontal" => vertical = false,
                 "-V" | "--vertical" => vertical = true,
-                "-d" | "--cwd" => {
-                    j += 1;
-                    cwd = seg.get(j).cloned();
+                "-D" | "--duplicate" => duplicate = true,
+                "-d" | "--cwd" | "--startingDirectory" => cwd = value(),
+                "-p" | "--profile" | "--shell" => shell = value(),
+                "--title" => title = value(),
+                "--tabColor" => color = value().and_then(|c| tab_color_index(&c)),
+                "-s" | "--size" => size = value().and_then(|s| s.parse::<f32>().ok()).filter(|s| s.is_finite()),
+                "-t" | "--target" => target = value().and_then(|t| t.parse().ok()),
+                "--" => {
+                    command = Some(opts[j + 1..].to_vec());
+                    break;
                 }
-                "--shell" | "-p" | "--profile" => {
-                    j += 1;
-                    shell = seg.get(j).cloned();
+                word if !word.starts_with('-') => {
+                    command = Some(opts[j..].to_vec());
+                    break;
                 }
-                _ => {
-                    if let Some(v) = a.strip_prefix("--cwd=").or_else(|| a.strip_prefix("-d=")) {
-                        cwd = Some(v.to_string());
-                    } else if let Some(v) = a.strip_prefix("--shell=").or_else(|| a.strip_prefix("--profile=")) {
-                        shell = Some(v.to_string());
-                    }
-                }
+                _ => {}
             }
             j += 1;
         }
-        // an empty shell label rebuilds as ShellKind::Auto, the default
-        let leaf = session::NodeSnap::Leaf { cwd, shell: shell.unwrap_or_default() };
-        match verb {
-            "new-tab" | "nt" => {
-                tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None, buffers: Vec::new() });
+        if matches!(verb, "focus-tab" | "ft") {
+            active = target.unwrap_or(0);
+            continue;
+        }
+        let split = matches!(verb, "split-pane" | "sp");
+        if split
+            && duplicate
+            && let Some(tab) = tabs.last_mut()
+            && let session::NodeSnap::Leaf { cwd: c, shell: sh, .. } = newest(&mut tab.root)
+        {
+            cwd = cwd.or_else(|| c.clone());
+            shell = shell.or_else(|| Some(sh.clone()));
+        }
+        // an empty shell label spawns the configured default shell
+        let leaf = session::NodeSnap::Leaf {
+            cwd,
+            shell: shell.unwrap_or_default(),
+            command: command.filter(|c: &Vec<String>| !c.is_empty()),
+        };
+        match tabs.last_mut().filter(|_| split) {
+            Some(tab) => {
+                let node = newest(&mut tab.root);
+                let old = std::mem::replace(node, session::NodeSnap::Leaf { cwd: None, shell: String::new(), command: None });
+                let ratio = size.map_or(0.5, |s| (1.0 - s).clamp(0.1, 0.9));
+                *node = session::NodeSnap::Split { vertical, ratio, a: Box::new(old), b: Box::new(leaf) };
+                tab.focused_leaf += 1;
+                tab.title = title.or(tab.title.take());
+                tab.color = color.or(tab.color);
             }
-            "split-pane" | "sp" => match tabs.last_mut() {
-                Some(tab) => {
-                    split_newest(&mut tab.root, vertical, leaf);
-                    tab.focused_leaf += 1;
-                }
-                None => tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title: None, color: None, buffers: Vec::new() }),
-            },
-            _ => {}
+            None => tabs.push(session::TabSnap { focused_leaf: 0, root: leaf, title, color, buffers: Vec::new() }),
         }
     }
-    tabs
+    (tabs, active)
 }
 
 /// a 96x96 gradient as real kitty-graphics bytes (chunked transmit+display),
@@ -2845,6 +2961,7 @@ fn node_to_snap(node: &Node, leaf_ids: &mut Vec<usize>) -> session::NodeSnap {
             session::NodeSnap::Leaf {
                 cwd: cwd_path(p.term.cwd.as_deref()),
                 shell: p.shell.label().to_string(),
+                command: None,
             }
         }
         Node::Split { dir, ratio, a, b } => session::NodeSnap::Split {
@@ -3871,6 +3988,8 @@ struct PaneWindow {
     // os focus (drives this window's cursor blink/render) + its in-flight ime
     // composition; both are per-window and must not leak through the swap
     focused: bool,
+    /// when this window last gained os focus, for `-w 0` launches
+    focused_at: Option<Instant>,
     ime_composing: bool,
     /// the composition string + winit's caret byte range, drawn inline at the
     /// focused pane's cursor until the IME commits or cancels
@@ -3957,6 +4076,7 @@ fn pane_window(window: Option<Arc<Window>>, renderer: Option<Renderer>, tabs: Ve
         settings_open: false,
         on_top: false,
         focused: true,
+        focused_at: None,
         ime_composing: false,
         ime_preedit: String::new(),
         ime_preedit_caret: None,
@@ -4655,6 +4775,7 @@ impl App {
         if restore_max {
             window.set_maximized(true);
         }
+        apply_window_options(&window, &self.cli);
         constrain_window_to_monitor(&window);
         timing("window created");
 
@@ -4785,7 +4906,7 @@ impl App {
             // the scripted window never overwrites the saved session
             self.session_ephemeral = true;
             let tabs = self.cli.tabs.clone();
-            self.restore_session(session::WindowSnap { active_tab: 0, tabs, bounds: None });
+            self.restore_session(session::WindowSnap { active_tab: self.cli.active_tab, tabs, bounds: None });
         } else if command.is_some() || first_cwd.is_some() || first_shell.is_some() {
             self.session_ephemeral = true;
             let (cols, rows) = self.content_pane_size();
@@ -8720,6 +8841,47 @@ impl App {
     }
 
     fn open_launch_window(&mut self, event_loop: &ActiveEventLoop, request: instance::LaunchRequest) {
+        let mut cli = parse_args(request.args.into_iter());
+        let base = request.process_cwd.as_deref();
+        if let Some(cwd) = cli.cwd.as_deref() {
+            cli.cwd = Some(resolve_launch_path(cwd, base));
+        }
+        for tab in &mut cli.tabs {
+            resolve_layout_dirs(&mut tab.root, base);
+        }
+        let cwd = if cli.is_bare() {
+            request.launch_cwd
+        } else if cli.command.is_some() {
+            cli.cwd.clone().or(request.process_cwd)
+        } else {
+            cli.cwd.clone()
+        };
+        if cli.join_last {
+            // wt `-w 0`: the tabs join the most recently focused window
+            let tabs = if cli.tabs.is_empty() {
+                let shell = cli.shell.clone().unwrap_or_default();
+                let root = session::NodeSnap::Leaf { cwd, shell, command: cli.command.clone() };
+                vec![session::TabSnap { focused_leaf: 0, root, title: None, color: None, buffers: Vec::new() }]
+            } else {
+                cli.tabs
+            };
+            let add = move |app: &mut Self| {
+                let first = app.pw.tabs.len();
+                app.restore_session(session::WindowSnap { active_tab: first + cli.active_tab, tabs, bounds: None });
+                if app.pw.tabs.len() == first {
+                    app.show_error("couldn't start the requested shell");
+                } else if let Some(window) = app.pw.window.as_ref() {
+                    window.focus_window();
+                }
+                app.redraw();
+            };
+            let recent = self.satellites.iter().map(|s| s.focused_at).enumerate().max_by_key(|&(_, at)| at);
+            match recent.filter(|&(_, at)| at > self.main_pw().focused_at) {
+                Some((slot, _)) => self.with_window(slot, add),
+                None => add(self),
+            }
+            return;
+        }
         let point = self.main_pw().window.as_ref().and_then(|window| {
             window
                 .inner_position()
@@ -8734,13 +8896,8 @@ impl App {
                 return;
             }
         };
-        let mut cli = parse_args(request.args.into_iter());
-        let base = request.process_cwd.as_deref();
-        if let Some(cwd) = cli.cwd.as_deref() {
-            cli.cwd = Some(resolve_launch_path(cwd, base));
-        }
-        for tab in &mut cli.tabs {
-            resolve_layout_dirs(&mut tab.root, base);
+        if let Some(window) = pw.window.as_ref() {
+            apply_window_options(window, &cli);
         }
         pw.session_ephemeral = !cli.is_bare();
 
@@ -8748,20 +8905,13 @@ impl App {
         let slot = self.satellites.len() - 1;
         self.with_window(slot, |app| {
             if cli.tabs.is_empty() {
-                let cwd = if cli.is_bare() {
-                    request.launch_cwd
-                } else if cli.command.is_some() {
-                    cli.cwd.or(request.process_cwd)
-                } else {
-                    cli.cwd
-                };
                 let shell = cli.shell.as_deref().map(ShellKind::from_label);
                 let (cols, rows) = app.content_pane_size();
                 if let Ok(pane) = app.spawn_pane(cols, rows, cwd, shell, cli.command.as_deref()) {
                     app.install_first_tab(pane);
                 }
             } else {
-                app.restore_session(session::WindowSnap { active_tab: 0, tabs: cli.tabs, bounds: None });
+                app.restore_session(session::WindowSnap { active_tab: cli.active_tab, tabs: cli.tabs, bounds: None });
             }
             if let Some(renderer) = app.pw.renderer.as_mut() {
                 renderer.begin_reveal();
@@ -9782,9 +9932,9 @@ impl App {
         leaf_ids: &mut Vec<usize>,
     ) -> Option<Node> {
         match snap {
-            session::NodeSnap::Leaf { cwd, shell } => {
-                let kind = ShellKind::from_label(shell);
-                let pane = self.spawn_pane(cols, rows, cwd.clone(), Some(kind), None).ok()?;
+            session::NodeSnap::Leaf { cwd, shell, command } => {
+                let kind = (!shell.is_empty()).then(|| ShellKind::from_label(shell));
+                let pane = self.spawn_pane(cols, rows, cwd.clone(), kind, command.as_deref()).ok()?;
                 leaf_ids.push(pane.id);
                 Some(Node::Leaf(pane))
             }
@@ -10728,6 +10878,9 @@ impl App {
                 // a --drive window paints focused no matter the real focus
                 // (it is WS_EX_NOACTIVATE, so real focus never arrives)
                 self.pw.focused = f || self.drive.is_some();
+                if f {
+                    self.pw.focused_at = Some(Instant::now());
+                }
                 if !f {
                     self.pw.ime_composing = false;
                     self.pw.ime_preedit.clear();
@@ -13186,6 +13339,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // a --drive window paints focused no matter the real focus
                 // (it is WS_EX_NOACTIVATE, so real focus never arrives)
                 self.pw.focused = f || self.drive.is_some();
+                if f {
+                    self.pw.focused_at = Some(Instant::now());
+                }
                 // losing focus mid-composition must clear the IME flag, or a
                 // missing Disabled/Commit (a real winit-on-Windows gap) would
                 // leave every keystroke swallowed with no in-app recovery
@@ -14200,6 +14356,38 @@ mod tests {
     }
 
     #[test]
+    fn wt_options_flags_and_commandlines() {
+        let p = |v: &str| parse_args(v.split(' ').map(str::to_string));
+        let cli = p("--drive d.txt -M --pos 10, nt --title build --tabColor #009999 cmd /k dir ; sp -s 0.3 -D -H ; ; ft -t 1");
+        assert!(cli.maximized && !cli.fullscreen && !cli.join_last);
+        assert_eq!(cli.drive.as_deref(), Some("d.txt"));
+        assert_eq!(cli.pos, (Some(10), None));
+        assert_eq!((cli.tabs.len(), cli.active_tab), (2, 1));
+        let tab = &cli.tabs[0];
+        assert_eq!((tab.title.as_deref(), tab.color), (Some("build"), Some(6)));
+        let session::NodeSnap::Split { vertical: false, ratio, a, b } = &tab.root else {
+            panic!("expected a horizontal split")
+        };
+        assert!((ratio - 0.7).abs() < 1e-6, "the new pane takes 30%");
+        assert!(matches!(&**a, session::NodeSnap::Leaf { command: Some(c), .. } if c == &["cmd", "/k", "dir"]));
+        assert!(matches!(&**b, session::NodeSnap::Leaf { command: None, .. }));
+        // a verbless segment is a new tab; -p switches to the wt form
+        let cli = p("-w 0 -p cmd -d C:/w");
+        assert!(cli.join_last);
+        assert!(matches!(&cli.tabs[..], [t] if matches!(&t.root, session::NodeSnap::Leaf { cwd: Some(d), shell, .. } if d == "C:/w" && shell == "cmd")));
+        assert_eq!(p("; ;").tabs.len(), 3);
+        // a bare word starts a command in the plain form too
+        let cli = p("-F -d C:/x ping -n 3 host");
+        assert!(cli.fullscreen && cli.tabs.is_empty());
+        assert_eq!(cli.command.as_deref(), Some(&["ping", "-n", "3", "host"].map(String::from)[..]));
+        assert!(p("-Embedding").is_bare() && p("/embedding").is_bare());
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let cli = parse_args([dir.clone()].into_iter());
+        assert_eq!((cli.cwd, cli.command), (Some(dir), None));
+        assert_eq!([tab_color_index("#f00"), tab_color_index("#f59218"), tab_color_index("#2a6fbf"), tab_color_index("#777")], [Some(1), Some(3), Some(4), None]);
+    }
+
+    #[test]
     fn layout_verbs_leading_split_implies_a_tab_and_legacy_args_stay_legacy() {
         let cli = parse_args(["split-pane".to_string()].into_iter());
         assert_eq!(cli.tabs.len(), 1);
@@ -14601,10 +14789,12 @@ mod tests {
             a: Box::new(session::NodeSnap::Leaf {
                 cwd: Some("child".into()),
                 shell: "default".into(),
+                command: None,
             }),
             b: Box::new(session::NodeSnap::Leaf {
                 cwd: None,
                 shell: "default".into(),
+                command: None,
             }),
         };
         resolve_layout_dirs(&mut root, Some(&inherited));

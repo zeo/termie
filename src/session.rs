@@ -64,6 +64,9 @@ pub enum NodeSnap {
     Leaf {
         cwd: Option<String>,
         shell: String,
+        /// a command line run instead of the shell; only cli layouts set it and
+        /// it is never saved
+        command: Option<Vec<String>>,
     },
     Split {
         vertical: bool,
@@ -203,7 +206,7 @@ impl TabSnap {
 impl NodeSnap {
     fn to_json(&self) -> Json {
         match self {
-            NodeSnap::Leaf { cwd, shell } => {
+            NodeSnap::Leaf { cwd, shell, .. } => {
                 // cwd is optional: omit the key when unknown rather than null
                 let mut pairs = vec![
                     ("kind".to_string(), Json::Str("leaf".to_string())),
@@ -239,6 +242,7 @@ impl NodeSnap {
                         .filter(|shell| shell.len() <= MAX_RESTORED_SHELL_BYTES)
                         .unwrap_or("auto")
                         .to_string(),
+                    command: None,
                 })
             }
             "split" => Some(NodeSnap::Split {
@@ -263,7 +267,7 @@ mod tests {
             tabs: vec![
                 TabSnap {
                     focused_leaf: 0,
-                    root: NodeSnap::Leaf { cwd: Some("C:/a".into()), shell: "pwsh".into() },
+                    root: NodeSnap::Leaf { cwd: Some("C:/a".into()), shell: "pwsh".into(), command: None },
                     title: None,
                     color: None,
                     buffers: vec!["7.vt".into()],
@@ -273,8 +277,8 @@ mod tests {
                     root: NodeSnap::Split {
                         vertical: true,
                         ratio: 0.4,
-                        a: Box::new(NodeSnap::Leaf { cwd: None, shell: "cmd".into() }),
-                        b: Box::new(NodeSnap::Leaf { cwd: Some("C:/b".into()), shell: "wsl".into() }),
+                        a: Box::new(NodeSnap::Leaf { cwd: None, shell: "cmd".into(), command: None }),
+                        b: Box::new(NodeSnap::Leaf { cwd: Some("C:/b".into()), shell: "wsl".into(), command: None }),
                     },
                     title: Some("build".into()),
                     color: Some(4),
@@ -291,7 +295,7 @@ mod tests {
         let w = back.bounds.expect("window bounds round-trip");
         assert_eq!((w.x, w.y, w.width, w.height, w.maximized), (-12, 40, 1200, 800, true));
         match &back.tabs[0].root {
-            NodeSnap::Leaf { cwd, shell } => {
+            NodeSnap::Leaf { cwd, shell, .. } => {
                 assert_eq!(cwd.as_deref(), Some("C:/a"));
                 assert_eq!(shell, "pwsh");
             }
@@ -330,7 +334,7 @@ mod tests {
     fn keeps_every_window_and_shares_the_caps() {
         let leaf = |shell: &str| TabSnap {
             focused_leaf: 0,
-            root: NodeSnap::Leaf { cwd: None, shell: shell.into() },
+            root: NodeSnap::Leaf { cwd: None, shell: shell.into(), command: None },
             title: None,
             color: None,
             buffers: Vec::new(),
@@ -406,7 +410,7 @@ mod tests {
         let tab = &session.windows[0].tabs[0];
         assert_eq!(tab.title, None);
         match &tab.root {
-            NodeSnap::Leaf { cwd, shell } => {
+            NodeSnap::Leaf { cwd, shell, .. } => {
                 assert_eq!(cwd, &None);
                 assert_eq!(shell, "auto");
             }
