@@ -4553,6 +4553,8 @@ struct App {
     session_flush_at: Option<Instant>,
     /// when the status-bar notification readout (OSC 9/777 text) expires
     notice_until: Option<Instant>,
+    /// when the idle blink or running-dot frame is next due
+    idle_frame_at: Option<Instant>,
     /// fractional wheel-scroll remainder, so slow precision-touchpad deltas
     /// accumulate into whole lines instead of rounding away
     wheel_accum: f32,
@@ -4685,6 +4687,7 @@ impl App {
             session_dirty: false,
             session_flush_at: None,
             notice_until: None,
+            idle_frame_at: None,
             wheel_accum: 0.0,
             update: None,
             update_checked: false,
@@ -14080,10 +14083,26 @@ impl ApplicationHandler<UserEvent> for App {
                 .and_then(|r| r.cursor_wake_ms())
                 .map(|ms| ms.max(33));
             let ms = blink.into_iter().chain(r.and_then(|r| r.ambient_wake_ms())).min();
-            if ms.is_some() {
-                self.redraw();
+            // each paint re-enters this loop, so redraw only when the frame is
+            // due or the fade would run at the display's refresh rate
+            let now = Instant::now();
+            match ms {
+                Some(ms) => {
+                    let due = *self.idle_frame_at.get_or_insert(now);
+                    let next = if now >= due {
+                        self.redraw();
+                        now + Duration::from_millis(ms)
+                    } else {
+                        due
+                    };
+                    self.idle_frame_at = Some(next);
+                    Some(next.saturating_duration_since(now).as_millis() as u64 + 1)
+                }
+                None => {
+                    self.idle_frame_at = None;
+                    None
+                }
             }
-            ms
         };
         // a torn-off window mid-animation needs ~60fps wakeups; take the soonest
         // of the main window's need and the satellite tick so neither is starved
