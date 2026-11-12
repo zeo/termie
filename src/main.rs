@@ -1329,6 +1329,7 @@ fn parse_key(s: &str) -> Option<Key> {
         "end" => Key::Named(NamedKey::End),
         "pageup" | "pgup" => Key::Named(NamedKey::PageUp),
         "pagedown" | "pgdn" => Key::Named(NamedKey::PageDown),
+        "contextmenu" | "menu" | "apps" => Key::Named(NamedKey::ContextMenu),
         s if s.chars().count() == 1 => Key::Character(s.into()),
         _ => return None,
     })
@@ -1377,6 +1378,7 @@ fn key_label(key: &Key) -> Option<String> {
             NamedKey::End => named("end"),
             NamedKey::PageUp => named("pageup"),
             NamedKey::PageDown => named("pagedown"),
+            NamedKey::ContextMenu => named("menu"),
             NamedKey::F1 => named("f1"),
             NamedKey::F2 => named("f2"),
             NamedKey::F3 => named("f3"),
@@ -5165,6 +5167,12 @@ impl App {
 
     /// close the open context menu, running `item` first when one was picked
     fn pick_pane_menu(&mut self, item: Option<usize>, event_loop: &ActiveEventLoop) {
+        // a dim row ignores the pick and the menu stays up
+        if let (Some(i), Some(m)) = (item, self.pw.pane_menu.as_ref())
+            && self.menu_view(m).is_disabled(i)
+        {
+            return;
+        }
         let Some(menu) = self.pw.pane_menu.take() else {
             return;
         };
@@ -6206,45 +6214,7 @@ impl App {
         let config = self.config;
         let settings_open = self.pw.settings_open;
         let settings_p = self.settings_p();
-        let tab_color_of = |t: usize| self.pw.tabs.get(t).and_then(|tab| tab.color);
-        let pane_menu_view = self.pw.pane_menu.as_ref().map(|m| {
-            let items: Vec<String> = match m.target {
-                MenuTarget::Pane => render::PANE_MENU_ITEMS.iter().map(|s| s.to_string()).collect(),
-                MenuTarget::Tab(t) => {
-                    let marked = self.tab_cwd(t).is_some_and(|path| self.is_bookmarked(&path));
-                    render::TAB_MENU_ITEMS
-                        .iter()
-                        .map(|s| {
-                            if *s == "bookmark location" && marked {
-                                "remove bookmark".to_string()
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                        .collect()
-                }
-                MenuTarget::TabColor(t) => {
-                    let current = tab_color_of(t);
-                    render::TAB_COLOR_ITEMS
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| {
-                            let sel = if i == 0 { current.is_none() } else { current == Some(i as u8) };
-                            if sel { format!("{s} \u{f00c}") } else { s.to_string() }
-                        })
-                        .collect()
-                }
-                MenuTarget::NewTab => new_tab_menu_entries().into_iter().map(|(l, _)| l).collect(),
-            };
-            // the color menu's rows carry their swatch tint (row 0 is "none")
-            let accents = match m.target {
-                MenuTarget::TabColor(_) => {
-                    (0..render::TAB_COLOR_ITEMS.len()).map(|i| (i > 0).then_some(i as u8)).collect()
-                }
-                _ => Vec::new(),
-            };
-            render::PaneMenuView { x: m.x, y: m.y, hovered: m.hovered, items, accents }
-        });
+        let pane_menu_view = self.pw.pane_menu.as_ref().map(|m| self.menu_view(m));
         let hud = if self.persisted.latency_hud { self.lat.hud() } else { None };
         if let Some(r) = self.pw.renderer.as_mut() {
             r.set_latency_hud(hud);
@@ -6729,34 +6699,26 @@ impl App {
     /// advanced to the caret within an in-flight composition so the candidate
     /// list tracks the character being converted
     fn apply_ime_area(&mut self) {
-        let Some(id) = self.active_focused_id() else {
-            return;
-        };
         let caret_cells = self
             .pw
             .ime_preedit_caret
             .map(|(s, _)| render::preedit_cell_offset(&self.pw.ime_preedit, s))
             .unwrap_or(0);
-        let rect = self.pw.layout_cache.iter().find(|(pid, _)| *pid == id).map(|(_, r)| *r);
-        let cursor = self
-            .pw.tabs
-            .get(self.pw.active_tab)
-            .and_then(|t| t.root.as_ref())
-            .and_then(|r| find_pane(r, id))
-            .map(|p| {
-                let g = &p.term.grid;
-                (g.cursor.row, (g.cursor.col + caret_cells).min(g.cols.saturating_sub(1)))
-            });
-        let area = match (rect, cursor, self.pw.renderer.as_ref()) {
-            (Some(rect), Some((row, col)), Some(r)) => Some(r.cell_screen_rect(rect, row, col)),
-            _ => None,
-        };
-        if let (Some((x, y, cw, ch)), Some(w)) = (area, self.pw.window.as_ref()) {
+        if let (Some((x, y, cw, ch)), Some(w)) = (self.caret_rect(caret_cells), self.pw.window.as_ref()) {
             w.set_ime_cursor_area(
                 winit::dpi::PhysicalPosition::new(x, y),
                 winit::dpi::PhysicalSize::new(cw, ch),
             );
         }
+    }
+
+    /// the screen rect of the focused pane's cursor cell, `ahead` cells right of it
+    fn caret_rect(&self, ahead: usize) -> Option<(f64, f64, f64, f64)> {
+        let id = self.active_focused_id()?;
+        let rect = self.pw.layout_cache.iter().find(|(pid, _)| *pid == id).map(|(_, r)| *r)?;
+        let g = &find_pane(self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?, id)?.term.grid;
+        let col = (g.cursor.col + ahead).min(g.cols.saturating_sub(1));
+        Some(self.pw.renderer.as_ref()?.cell_screen_rect(rect, g.cursor.row, col))
     }
 
     /// the focused pane's working directory (from OSC 7), as a filesystem path
@@ -6770,6 +6732,182 @@ impl App {
     /// the chord that runs `action`, formatted for display ("Ctrl+Shift+E");
     /// a user binding wins, and a built-in chord the user took for something
     /// else no longer counts
+    /// the rows, shortcut hints and dim rows of the open context menu
+    fn menu_view(&self, m: &PaneMenu) -> render::PaneMenuView {
+        use PaletteAction as A;
+        let defaults = default_keybindings();
+        let hint = |a: Option<A>| a.map(|a| self.shortcut_hint(a, &defaults)).unwrap_or_default();
+        let tabs = self.pw.tabs.len();
+        let mut view = render::PaneMenuView { x: m.x, y: m.y, hovered: m.hovered, ..Default::default() };
+        match m.target {
+            MenuTarget::Pane => {
+                let panes = self.pw.tabs.get(self.pw.active_tab).and_then(|t| t.root.as_ref()).map_or(0, pane_count);
+                view.items = render::PANE_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
+                view.hints = [Some(A::Copy), Some(A::SplitV), Some(A::SplitH), None, Some(A::CloseFocusedPane), Some(A::Paste)]
+                    .map(hint)
+                    .into();
+                view.disabled = vec![self.selection.is_none(), false, false, panes < 2, false, false];
+            }
+            MenuTarget::Tab(t) => {
+                let cwd = self.tab_cwd(t);
+                let marked = cwd.as_deref().is_some_and(|path| self.is_bookmarked(path));
+                view.items = render::TAB_MENU_ITEMS
+                    .iter()
+                    .map(|s| if *s == "bookmark location" && marked { "remove bookmark".to_string() } else { s.to_string() })
+                    .collect();
+                view.hints = [
+                    Some(A::RenameTab),
+                    Some(A::DuplicateTab),
+                    Some(A::ToggleBookmark),
+                    None,
+                    Some(A::MoveTabLeft),
+                    Some(A::MoveTabRight),
+                    Some(A::CloseTab),
+                    None,
+                ]
+                .map(hint)
+                .into();
+                view.disabled = vec![false, false, cwd.is_none(), false, t == 0, t + 1 >= tabs, false, tabs < 2];
+                view.submenu = Some(3);
+            }
+            MenuTarget::TabColor(t) => {
+                let current = self.pw.tabs.get(t).and_then(|tab| tab.color);
+                view.items = render::TAB_COLOR_ITEMS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let sel = if i == 0 { current.is_none() } else { current == Some(i as u8) };
+                        if sel { format!("{s} \u{f00c}") } else { s.to_string() }
+                    })
+                    .collect();
+                // the color menu's rows carry their swatch tint (row 0 is "none")
+                view.accents = (0..render::TAB_COLOR_ITEMS.len()).map(|i| (i > 0).then_some(i as u8)).collect();
+            }
+            MenuTarget::NewTab => {
+                (view.items, view.hints) =
+                    new_tab_menu_entries().into_iter().map(|(l, shell)| (l, hint(Some(A::NewShell(shell))))).unzip();
+            }
+        }
+        view
+    }
+
+    /// where keyboard focus lands in a freshly opened menu: the color menu's
+    /// current pick, else the first row that can run
+    fn menu_first_row(&self, m: &PaneMenu) -> Option<usize> {
+        if let MenuTarget::TabColor(t) = m.target {
+            return Some(self.pw.tabs.get(t).and_then(|tab| tab.color).map_or(0, usize::from));
+        }
+        let view = self.menu_view(m);
+        (0..view.items.len()).find(|&i| !view.is_disabled(i))
+    }
+
+    /// the menu key (or shift+f10 on a focused tab or the new-tab button)
+    /// opens the menu the right click would, anchored under the tab or at
+    /// the caret, with its first row focused
+    fn open_menu_by_key(&mut self) {
+        let anchor = match self.pw.chrome_focus {
+            Some(Hot::Tab(i)) => self
+                .pw
+                .renderer
+                .as_ref()
+                .and_then(|r| r.chrome_rect(Hot::Tab(i)))
+                .map(|(x, y, _, h)| (x, y + h, MenuTarget::Tab(i))),
+            Some(Hot::NewTab | Hot::NewTabMenu) => {
+                self.pw.renderer.as_ref().map(|r| r.newtab_rect()).map(|(x, y, _, h)| (x, y + h, MenuTarget::NewTab))
+            }
+            Some(_) => None,
+            None => self.caret_rect(0).map(|(x, y, w, h)| ((x + w) as f32, (y + h) as f32, MenuTarget::Pane)),
+        };
+        let Some((x, y, target)) = anchor else {
+            return;
+        };
+        let mut menu = PaneMenu { x, y, hovered: None, target };
+        menu.hovered = self.menu_first_row(&menu);
+        self.pw.pane_menu = Some(menu);
+        self.redraw();
+    }
+
+    /// a key while a context menu is open: up, down, tab, home and end walk
+    /// the rows that can run, enter or space runs one, right opens the color
+    /// submenu and left comes back, a letter jumps to the next row starting
+    /// with it. every other key is swallowed so none reaches the pane below
+    fn menu_key(&mut self, logical: &Key, text: Option<&str>, event_loop: &ActiveEventLoop) {
+        let Some(menu) = self.pw.pane_menu.as_ref() else {
+            return;
+        };
+        let target = menu.target;
+        let view = self.menu_view(menu);
+        let enabled: Vec<usize> = (0..view.items.len()).filter(|&i| !view.is_disabled(i)).collect();
+        let at = view.hovered.and_then(|h| enabled.iter().position(|&i| i == h));
+        let step = |by: isize| {
+            let n = enabled.len() as isize;
+            let i = match at {
+                Some(i) => (i as isize + by).rem_euclid(n.max(1)),
+                None if by > 0 => 0,
+                None => n - 1,
+            };
+            enabled.get(i as usize).copied()
+        };
+        let run = view.hovered.filter(|&h| !view.is_disabled(h));
+        let hovered = match logical {
+            Key::Named(NamedKey::ArrowDown) => step(1),
+            Key::Named(NamedKey::ArrowUp) => step(-1),
+            Key::Named(NamedKey::Tab) => step(if self.mods.shift_key() { -1 } else { 1 }),
+            Key::Named(NamedKey::Home) => enabled.first().copied(),
+            Key::Named(NamedKey::End) => enabled.last().copied(),
+            Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                if run.is_some() {
+                    self.set_chrome_focus(None);
+                    self.pick_pane_menu(run, event_loop);
+                    // a row that swapped in the color submenu hands it the focus
+                    if let Some(m) = self.pw.pane_menu.as_ref()
+                        && m.hovered.is_none()
+                    {
+                        let first = self.menu_first_row(m);
+                        if let Some(m) = self.pw.pane_menu.as_mut() {
+                            m.hovered = first;
+                        }
+                    }
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowRight) if run.is_some() && run == view.submenu => {
+                self.pick_pane_menu(run, event_loop);
+                if let Some(m) = self.pw.pane_menu.as_ref() {
+                    let first = self.menu_first_row(m);
+                    if let Some(m) = self.pw.pane_menu.as_mut() {
+                        m.hovered = first;
+                    }
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let MenuTarget::TabColor(t) = target
+                    && let Some(m) = self.pw.pane_menu.as_mut()
+                {
+                    m.target = MenuTarget::Tab(t);
+                    m.hovered = Some(3);
+                    self.redraw();
+                }
+                return;
+            }
+            _ => {
+                let Some(ch) = text.and_then(|t| t.chars().next()).filter(|c| c.is_alphanumeric()) else {
+                    return;
+                };
+                let starts = |i: &usize| view.items[*i].chars().next().is_some_and(|c| c.to_lowercase().eq(ch.to_lowercase()));
+                let from = at.map_or(0, |i| i + 1);
+                enabled[from.min(enabled.len())..].iter().chain(&enabled[..from.min(enabled.len())]).copied().find(|i| starts(i))
+            }
+        };
+        if let Some(h) = hovered
+            && let Some(m) = self.pw.pane_menu.as_mut()
+        {
+            m.hovered = Some(h);
+            self.redraw();
+        }
+    }
+
     fn shortcut_hint(&self, action: PaletteAction, defaults: &[(ModifiersState, Key, PaletteAction)]) -> String {
         if action == PaletteAction::PaneMode {
             return "Ctrl+Shift+P".to_string();
@@ -10327,6 +10465,7 @@ impl App {
 
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.pw.cursor_inside = true;
+        let moved = self.pw.cursor != position;
         self.pw.cursor = position;
         let (px, py) = (position.x as f32, position.y as f32);
         let modal = self.pointer_modal();
@@ -10360,8 +10499,13 @@ impl App {
         if modal.is_some() {
             return;
         }
-        // while the pane menu is open, only track which item is hovered
+        // while the pane menu is open, only track which item is hovered. a
+        // resting pointer still gets moves when the window repaints under it,
+        // and those must not wipe a row the keyboard picked
         if self.pw.pane_menu.is_some() {
+            if !moved {
+                return;
+            }
             let h = self.pw.renderer.as_ref().and_then(|r| r.pane_menu_item_at(px, py));
             if let Some(m) = self.pw.pane_menu.as_mut()
                 && m.hovered != h
@@ -11429,6 +11573,10 @@ impl App {
             self.redraw();
             return true;
         }
+        if self.pw.pane_menu.is_some() {
+            self.menu_key(logical, text, event_loop);
+            return true;
+        }
         // a modal confirm prompt captures every key while open: enter runs the
         // held action, esc cancels, anything else is swallowed (no accidental
         // dismissal and no leakage to the pane underneath)
@@ -11466,6 +11614,13 @@ impl App {
                 }
             }
             self.redraw();
+            return true;
+        }
+        // shift+f10 stays with the program unless the title bar holds the keys
+        let menu_chord = *logical == Key::Named(NamedKey::ContextMenu)
+            || (self.pw.chrome_focus.is_some() && *logical == Key::Named(NamedKey::F10) && self.mods == ModifiersState::SHIFT);
+        if menu_chord && !self.overlay_open() {
+            self.open_menu_by_key();
             return true;
         }
         // a ctrl or alt chord hands the keys back and runs as usual
@@ -13335,7 +13490,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 7);
+        assert_eq!(paths.len(), 8);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);

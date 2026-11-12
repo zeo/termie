@@ -1,0 +1,26 @@
+600 key menu
+300 key enter
+800 assert panes 2
+100 key menu
+100 key c
+100 key enter
+800 assert panes 1
+100 key ctrl+t
+800 assert tabs 2
+100 key alt
+100 key menu
+100 key end
+100 key enter
+800 assert tabs 1
+100 key alt
+100 key shift+f10
+100 key c
+100 key right
+100 key down
+100 key enter
+100 key alt
+100 key shift+f10
+100 key escape
+100 key escape
+300 assert tabs 1
+100 exit

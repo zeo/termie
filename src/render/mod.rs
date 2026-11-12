@@ -212,6 +212,7 @@ pub struct PaletteView {
 /// clicked item index maps to an action in main.rs's handler, keyed to the
 /// menu's target (pane, tab, or new-tab profiles). items are owned because the
 /// new-tab menu's profile labels are built at runtime
+#[derive(Default)]
 pub struct PaneMenuView {
     pub x: f32,
     pub y: f32,
@@ -220,6 +221,18 @@ pub struct PaneMenuView {
     /// per-row swatch tints (ansi palette indices) for the tab-color menu;
     /// empty for every other menu. a None row draws a hollow "none" box
     pub accents: Vec<Option<u8>>,
+    /// per-row shortcut shown at the right edge; missing or empty shows none
+    pub hints: Vec<String>,
+    /// rows that can't run right now; drawn dim, never lit or picked
+    pub disabled: Vec<bool>,
+    /// the row that opens a submenu, marked with a chevron
+    pub submenu: Option<usize>,
+}
+
+impl PaneMenuView {
+    pub fn is_disabled(&self, row: usize) -> bool {
+        self.disabled.get(row).copied().unwrap_or(false)
+    }
 }
 
 pub const PANE_MENU_ITEMS: [&str; 6] =
@@ -2383,6 +2396,10 @@ impl Renderer {
     }
 
     /// the title-bar targets in keyboard order, left to right
+    pub fn chrome_rect(&self, hot: Hot) -> Option<Rect> {
+        self.chrome_targets().into_iter().find(|(h, _)| *h == hot).map(|(_, r)| r)
+    }
+
     pub fn chrome_focus_order(&self) -> Vec<Hot> {
         self.chrome_targets().into_iter().map(|(hot, _)| hot).collect()
     }
@@ -2569,13 +2586,21 @@ impl Renderer {
 
     /// clamped (x, y, width, row_h, pad) of the context menu, shared by the
     /// renderer and the hit-test so the two never drift
-    fn pane_menu_geom(&self, mx: f32, my: f32, items: &[String], swatches: bool) -> (f32, f32, f32, f32, f32) {
+    fn pane_menu_geom(&self, v: &PaneMenuView) -> (f32, f32, f32, f32, f32) {
+        let (mx, my, items) = (v.x, v.y, &v.items);
         let t = |pt| tokens::px(pt, self.scale);
         let chrome_h = self.atlas.metrics(FontId::Chrome).cell_h;
         let row_h = chrome_h + t(tokens::SPACE_M);
         let pad = t(tokens::SPACE_XS) + t(tokens::SPACE_2XS);
-        let widest = items.iter().map(|i| self.text_w(FontId::Label, i, 0.0)).fold(0.0, f32::max);
-        let swatch = if swatches { t(tokens::SPACE_M) + t(tokens::SPACE_S) } else { 0.0 };
+        let small_track = self.track_for(FontId::Small);
+        // a row's hint or submenu chevron sits at the right edge, a gap past its label
+        let trailing = |i: usize| match v.hints.get(i).filter(|h| !h.is_empty()) {
+            Some(h) => self.text_w(FontId::Small, h, small_track) + t(tokens::SPACE_L),
+            None if v.submenu == Some(i) => t(tokens::ICON_SMALL) + t(tokens::SPACE_L),
+            None => 0.0,
+        };
+        let widest = items.iter().enumerate().map(|(i, l)| self.text_w(FontId::Label, l, 0.0) + trailing(i)).fold(0.0, f32::max);
+        let swatch = if !v.accents.is_empty() { t(tokens::SPACE_M) + t(tokens::SPACE_S) } else { 0.0 };
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         let mw = (widest + swatch + t(tokens::SPACE_M) * 2.0 + pad * 2.0).clamp(t(tokens::MENU_W), t(tokens::MENU_MAX_W).min(w - t(tokens::SPACE_S) * 2.0)).round();
@@ -2590,7 +2615,7 @@ impl Renderer {
     pub fn pane_menu_item_at(&self, px: f32, py: f32) -> Option<usize> {
         let v = self.pane_menu_view.as_ref()?;
         let rows = v.items.len();
-        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v.x, v.y, &v.items, !v.accents.is_empty());
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v);
         if px < bx || px >= bx + mw || py < by + pad || py >= by + pad + row_h * rows as f32 {
             return None;
         }
@@ -5410,11 +5435,14 @@ impl Renderer {
         let Some(v) = self.pane_menu_view.as_ref() else {
             return;
         };
-        let (mx, my, hovered) = (v.x, v.y, v.hovered);
+        let hovered = v.hovered;
+        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(v);
         // owned so the pane_menu_view borrow ends before the atlas is drawn into
         let items = v.items.clone();
         let accents = v.accents.clone();
-        let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mx, my, &items, !accents.is_empty());
+        let hints = v.hints.clone();
+        let disabled: Vec<bool> = (0..items.len()).map(|i| v.is_disabled(i)).collect();
+        let submenu = v.submenu;
         if self.menu_hover.map(|(i, _)| i) != hovered {
             self.menu_hover = hovered.map(|i| (i, Instant::now()));
         }
@@ -5424,11 +5452,17 @@ impl Renderer {
         let RULE_2 = self.palette.rule2;
         let hair = self.scale.max(1.0);
         let label_h = self.atlas.metrics(FontId::Label).cell_h;
+        let small_h = self.atlas.metrics(FontId::Small).cell_h;
+        let small_track = self.track_for(FontId::Small);
+        let QUIET = self.quiet(self.palette.ink1);
         let mh = row_h * items.len() as f32 + pad * 2.0;
+        // trailing hints and the chevron mirror the label's inset from the left edge
+        let right = bx + mw - pad - t(tokens::SPACE_M) + t(tokens::SPACE_XS);
         self.overlay_frame(out, (bx, by, mw, mh), t(tokens::RADIUS_OVERLAY));
         for (i, lbl) in items.iter().enumerate() {
             let ry = by + pad + row_h * i as f32;
-            let a = lit.filter(|(li, _)| *li == i).map_or(0.0, |(_, a)| a);
+            let off = disabled[i];
+            let a = lit.filter(|(li, _)| *li == i && !off).map_or(0.0, |(_, a)| a);
             if a > 0.0 {
                 self.row_fill(out, (bx, ry, mw, row_h), a);
             }
@@ -5445,7 +5479,18 @@ impl Renderer {
                 lx += d + t(tokens::SPACE_S);
             }
             let picked = self.skin.picked_text;
-            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ty, lbl, TEXT_2.lerp(picked, a), 0.85 + 0.15 * a, 0.0);
+            let (ink, alpha) = if off { (QUIET, 0.55) } else { (TEXT_2.lerp(picked, a), 0.85 + 0.15 * a) };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Label, lx, ty, lbl, ink, alpha, 0.0);
+            if let Some(hint) = hints.get(i).filter(|h| !h.is_empty()) {
+                let hw = self.text_w(FontId::Small, hint, small_track);
+                let hy = (ry + (row_h - small_h) / 2.0).round();
+                let hc = if off { QUIET } else { QUIET.lerp(self.skin.picked_meta, a) };
+                let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (right - hw).round(), hy, hint, hc, if off { 0.55 } else { 1.0 }, small_track);
+            } else if submenu == Some(i) {
+                let icon = t(tokens::ICON_SMALL);
+                let rect = ((right - icon).round(), (ry + (row_h - icon) / 2.0).round(), icon, icon);
+                Self::draw_icon(&mut self.atlas, out, Icon::ChevronRight, rect, icon, hair, ink, alpha);
+            }
         }
     }
 
@@ -5946,7 +5991,7 @@ impl Renderer {
             });
         }
         if let Some(mv) = self.pane_menu_view.as_ref() {
-            let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mv.x, mv.y, &mv.items, !mv.accents.is_empty());
+            let (bx, by, mw, row_h, pad) = self.pane_menu_geom(mv);
             let radio = !mv.accents.is_empty();
             let total = mv.items.len();
             let items = mv
@@ -5962,7 +6007,10 @@ impl Renderer {
                         bounds: Some(rect((bx, by + pad + row_h * i as f32, mw, row_h))),
                         toggled: radio.then_some(checked),
                         position: Some((i + 1, total)),
-                        click: true,
+                        shortcut: mv.hints.get(i).cloned(),
+                        disabled: mv.is_disabled(i),
+                        popup: mv.submenu == Some(i),
+                        click: !mv.is_disabled(i),
                         ..Default::default()
                     }
                 })
@@ -7860,7 +7908,7 @@ mod hit_tests {
         r.set_palette(None);
         r.set_find(None);
         let menu: Vec<String> = TAB_COLOR_ITEMS.iter().map(|s| s.to_string()).chain(["blue \u{f00c}".to_string()]).collect();
-        r.set_pane_menu(Some(PaneMenuView { x: 60.0, y: 60.0, hovered: Some(2), accents: (0..menu.len()).map(|i| (i > 0).then_some(i as u8)).collect(), items: menu }));
+        r.set_pane_menu(Some(PaneMenuView { x: 60.0, y: 60.0, hovered: Some(2), accents: (0..menu.len()).map(|i| (i > 0).then_some(i as u8)).collect(), items: menu, ..Default::default() }));
         r.set_confirm(Some(ConfirmView { prompt: "Close 2 tabs?".into(), buttons: ("close", "cancel") }));
         let _ = r.render_png(&[], true, false, false, &tmp_png("a11y"));
         let panels = r.a11y_panels();
@@ -7918,10 +7966,16 @@ mod hit_tests {
         r.set_tabs(vec!["a".into(), "b".into()], 0);
         // the tab menu carries a different item list than the pane menu; the
         // shared geometry must resolve each of its rows and reject the outside
-        let items: Vec<String> = TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
-        r.set_pane_menu(Some(PaneMenuView { x: 60.0, y: 60.0, hovered: None, items, accents: Vec::new() }));
-        let labels: Vec<String> = TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect();
-        let (bx, by, mw, row_h, pad) = r.pane_menu_geom(60.0, 60.0, &labels, false);
+        let view = || PaneMenuView {
+            x: 60.0,
+            y: 60.0,
+            items: TAB_MENU_ITEMS.iter().map(|s| s.to_string()).collect(),
+            hints: vec!["F2".into(), "Ctrl+Shift+D".into()],
+            submenu: Some(3),
+            ..Default::default()
+        };
+        r.set_pane_menu(Some(view()));
+        let (bx, by, mw, row_h, pad) = r.pane_menu_geom(&view());
         for i in 0..TAB_MENU_ITEMS.len() {
             let cy = by + pad + row_h * (i as f32 + 0.5);
             assert_eq!(r.pane_menu_item_at(bx + mw / 2.0, cy), Some(i));

@@ -11,6 +11,7 @@ pub enum Icon {
     Plus,
     Chevron,
     ChevronUp,
+    ChevronRight,
     SplitV,
     SplitH,
     Grid,
@@ -50,6 +51,7 @@ fn prims(icon: Icon) -> Vec<Prim> {
         Icon::Plus => vec![Line(5.0, 1.0, 5.0, 9.0), Line(1.0, 5.0, 9.0, 5.0)],
         Icon::Chevron => vec![Line(2.0, 3.75, 5.0, 6.75), Line(5.0, 6.75, 8.0, 3.75)],
         Icon::ChevronUp => vec![Line(2.0, 6.25, 5.0, 3.25), Line(5.0, 3.25, 8.0, 6.25)],
+        Icon::ChevronRight => vec![Line(3.75, 2.0, 6.75, 5.0), Line(6.75, 5.0, 3.75, 8.0)],
         Icon::SplitV => vec![Frame(0.5, 1.5, 9.0, 7.0, 1.5), Line(5.0, 1.5, 5.0, 8.5), Tint(0.5, 1.5, 4.5, 7.0, 0.35)],
         Icon::SplitH => vec![Frame(0.5, 1.5, 9.0, 7.0, 1.5), Line(0.5, 5.0, 9.5, 5.0), Tint(0.5, 1.5, 9.0, 3.5, 0.35)],
         Icon::Grid => vec![
@@ -153,7 +155,7 @@ pub fn rasterize(icon: Icon, size: u32, stroke: f32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 17] = [
+    const ALL: [Icon; 18] = [
         Icon::Close,
         Icon::Minimize,
         Icon::Maximize,
@@ -161,6 +163,7 @@ mod tests {
         Icon::Plus,
         Icon::Chevron,
         Icon::ChevronUp,
+        Icon::ChevronRight,
         Icon::SplitV,
         Icon::SplitH,
         Icon::Grid,

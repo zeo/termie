@@ -137,7 +137,9 @@ pub fn capture(
                 y: 150.0,
                 hovered: Some(0),
                 items: render::PANE_MENU_ITEMS.iter().map(|s| s.to_string()).collect(),
-                accents: Vec::new(),
+                hints: ["Ctrl+Shift+C", "Ctrl+Shift+E", "Ctrl+Shift+O", "", "Ctrl+Shift+W", "Ctrl+Shift+V"].map(String::from).into(),
+                disabled: vec![false, false, false, true, false, false],
+                ..Default::default()
             }));
             r.settle_overlay();
         }

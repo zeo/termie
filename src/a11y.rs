@@ -128,6 +128,9 @@ pub struct Item {
     pub selected: Option<bool>,
     pub toggled: Option<bool>,
     pub click: bool,
+    pub disabled: bool,
+    /// opens a submenu
+    pub popup: bool,
     pub modal: bool,
     pub live: Option<Live>,
     pub position: Option<(usize, usize)>,
@@ -171,6 +174,12 @@ fn push_item(layer: Layer, item: Item, nodes: &mut Vec<(NodeId, Node)>) -> NodeI
     }
     if item.click {
         node.add_action(Action::Click);
+    }
+    if item.disabled {
+        node.set_disabled();
+    }
+    if item.popup {
+        node.set_has_popup(HasPopup::Menu);
     }
     if item.modal {
         node.set_modal();
