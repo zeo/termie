@@ -116,6 +116,8 @@ pub enum Hot {
     ThemeAuto,
     LineHeightDec,
     LineHeightInc,
+    UiScaleDec,
+    UiScaleInc,
     BoldBright,
     Mica,
     ScrollbackDec,
@@ -385,6 +387,8 @@ pub struct SettingsView {
     pub shell_name: &'static str,
     pub close_action_name: &'static str,
     pub backend_name: &'static str,
+    /// the ui_scale setting alone, without the os text size on top
+    pub ui_scale: f32,
 }
 
 impl Default for SettingsView {
@@ -398,6 +402,7 @@ impl Default for SettingsView {
             shell_name: "auto",
             close_action_name: "quit",
             backend_name: "auto",
+            ui_scale: 1.0,
         }
     }
 }
@@ -513,6 +518,7 @@ struct SettingsGeom {
     pad_y: f32,
     opacity_y: f32,
     line_height_y: f32,
+    ui_scale_y: f32,
     boldbright_y: f32,
     mica_y: f32,
     cursor_y: f32,
@@ -537,6 +543,8 @@ struct SettingsGeom {
     op_inc: Rect,
     lh_dec: Rect,
     lh_inc: Rect,
+    ui_dec: Rect,
+    ui_inc: Rect,
     boldbright_btn: Rect,
     mica_btn: Rect,
     cursor_btn: Rect,
@@ -2393,6 +2401,28 @@ impl Renderer {
 
     pub fn set_chrome_focus(&mut self, focus: Option<Hot>) {
         self.chrome_focus = focus;
+        // a settings control tabbed to outside the panel's viewport scrolls into view
+        if !self.settings_open {
+            return;
+        }
+        let g = self.settings_geom();
+        let Some((_, r)) = g.controls.iter().find(|(h, _)| Some(*h) == focus) else {
+            return;
+        };
+        let m = tokens::px(tokens::SPACE_S, self.scale);
+        let below = r.1 + r.3 + m - g.body_bottom;
+        let above = g.body_top - (r.1 - m);
+        if below > 0.0 {
+            self.scroll_settings(below);
+        } else if above > 0.0 {
+            self.scroll_settings(-above);
+        }
+    }
+
+    fn push_focus_ring(&self, out: &mut Vec<Instance>, r: Rect) {
+        let ring = tokens::px(2.0, self.scale).round().max(2.0);
+        let inset = (r.0 + ring, r.1 + ring, r.2 - ring * 2.0, r.3 - ring * 2.0);
+        Self::push_ring(out, inset, tokens::px(tokens::RADIUS_FIELD, self.scale), ring, self.skin.focus, 1.0);
     }
 
     /// the title-bar targets in keyboard order, left to right
@@ -2404,7 +2434,16 @@ impl Renderer {
         self.chrome_targets().into_iter().map(|(hot, _)| hot).collect()
     }
 
+    /// with the settings panel open the keys walk its controls instead,
+    /// top to bottom and then left to right
     fn chrome_targets(&self) -> Vec<(Hot, Rect)> {
+        if self.settings_open {
+            let g = self.settings_geom();
+            let mut targets = g.controls;
+            targets.sort_by(|a, b| a.1.1.total_cmp(&b.1.1).then(a.1.0.total_cmp(&b.1.0)));
+            targets.insert(0, (Hot::PanelClose, g.close_btn));
+            return targets;
+        }
         let chrome = self.a11y_chrome_layout();
         let mut targets: Vec<(Hot, Rect)> = chrome.tabs.into_iter().map(|(i, r)| (Hot::Tab(i), r)).collect();
         targets.push((Hot::NewTab, chrome.new_tab));
@@ -2867,6 +2906,8 @@ impl Renderer {
         y += row;
         let mica_l = y;
         y += row;
+        let ui_scale_l = y;
+        y += row;
         let theme_label_l = y;
         y += lh;
         let theme_chip_l = y;
@@ -2911,6 +2952,7 @@ impl Renderer {
         let (pad_dec, pad_inc) = stepper(val_x, pad_l);
         let (op_dec, op_inc) = stepper(val_x, opacity_l);
         let (lh_dec, lh_inc) = stepper(val_x, line_height_l);
+        let (ui_dec, ui_inc) = stepper(val_x, ui_scale_l);
         let (sb_dec, sb_inc) = stepper(val_x, scrollback_l);
         // font names run long; this field gets more room than the steppers
         let fontfam_btn = (val_x, ay(fontfam_l), (cluster * 1.6).round(), bh);
@@ -2960,6 +3002,8 @@ impl Renderer {
             (Hot::OpacityInc, op_inc),
             (Hot::LineHeightDec, lh_dec),
             (Hot::LineHeightInc, lh_inc),
+            (Hot::UiScaleDec, ui_dec),
+            (Hot::UiScaleInc, ui_inc),
             (Hot::BoldBright, boldbright_btn),
             (Hot::Mica, mica_btn),
             (Hot::CursorCycle, cursor_btn),
@@ -3007,6 +3051,7 @@ impl Renderer {
             pad_y: ay(pad_l),
             opacity_y: ay(opacity_l),
             line_height_y: ay(line_height_l),
+            ui_scale_y: ay(ui_scale_l),
             boldbright_y: ay(boldbright_l),
             mica_y: ay(mica_l),
             cursor_y: ay(cursor_l),
@@ -3029,6 +3074,8 @@ impl Renderer {
             op_inc,
             lh_dec,
             lh_inc,
+            ui_dec,
+            ui_inc,
             boldbright_btn,
             mica_btn,
             cursor_btn,
@@ -4706,10 +4753,11 @@ impl Renderer {
             Self::draw_icon(&mut self.atlas, &mut out, glyph, (x0, 0.0, x1 - x0, tbh - hair * 2.0), size, stroke, color, 1.0);
         }
 
-        if let Some((_, r)) = self.chrome_focus.and_then(|f| self.chrome_targets().into_iter().find(|(h, _)| *h == f)) {
-            let ring = tokens::px(2.0, self.scale).round().max(2.0);
-            let inset = (r.0 + ring, r.1 + ring, r.2 - ring * 2.0, r.3 - ring * 2.0);
-            Self::push_ring(&mut out, inset, t(tokens::RADIUS_FIELD), ring, self.skin.focus, 1.0);
+        // the settings panel draws its own ring so the body scissor clips it
+        if !self.settings_open
+            && let Some((_, r)) = self.chrome_focus.and_then(|f| self.chrome_targets().into_iter().find(|(h, _)| *h == f))
+        {
+            self.push_focus_ring(&mut out, r);
         }
 
         // ---- status bar: a shallow brushed band under the content ----
@@ -5068,6 +5116,9 @@ impl Renderer {
             Self::push_shape(out, g.close_btn, [t(tokens::RADIUS_ROW), 0.0, 0.0], self.palette.ink3, qa);
         }
         Self::draw_icon(&mut self.atlas, out, Icon::Close, g.close_btn, t(tokens::ICON_STATUS), hair, MUTE.lerp(TEXT_2, qa), 1.0);
+        if self.chrome_focus == Some(Hot::PanelClose) {
+            self.push_focus_ring(out, g.close_btn);
+        }
         Self::push_rect(out, cx, g.body_top - t(tokens::SPACE_M), cw, hair, RULE, 1.0);
 
         // ── scrollable body: everything after this index is scissor-clipped ──
@@ -5114,6 +5165,9 @@ impl Renderer {
         };
         self.setting_label(out, cx, g.mica_y, bh, backdrop_label);
         self.toggle_btn(out, g.mica_btn, sv.acrylic, Hot::Mica, track);
+        self.setting_label(out, cx, g.ui_scale_y, bh, "Interface size");
+        let ui_label = format!("{}%", (sv.ui_scale * 100.0).round());
+        self.stepper(out, g.ui_dec, g.ui_inc, &ui_label, Hot::UiScaleDec, Hot::UiScaleInc, g.val_w, track);
         self.setting_label(out, cx, g.cursor_y, bh, "Cursor");
         self.cycle_btn(out, g.cursor_btn, cur_name, Hot::CursorCycle, track);
         self.setting_label(out, cx, g.blink_y, bh, "Cursor blink");
@@ -5191,6 +5245,55 @@ impl Renderer {
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, cx, ya + (chrome_h - small_h) / 2.0, k, QUIET, 1.0, key_track);
             let _ = Self::draw_text(&mut self.atlas, out, FontId::Chrome, cx + about_dx, ya, v, TEXT_2, 1.0, track);
         }
+        if let Some((_, r)) = g.controls.iter().find(|(h, _)| Some(*h) == self.chrome_focus) {
+            self.push_focus_ring(out, *r);
+        }
+    }
+
+    /// what a screen reader hears for a settings control: its name, whether
+    /// it is on, and the value it changes
+    fn settings_a11y(&self, hot: Hot) -> (String, Option<bool>, Option<String>) {
+        let sv = &self.settings_view;
+        let font = format!("{} pt", self.content_pt as i32);
+        let pad = format!("{} px", self.pane_pad_px as i32);
+        let opacity = format!("{}%", self.opacity_pct());
+        let lh = format!("{:.2}", self.content_line_height);
+        let ui = format!("{}%", (sv.ui_scale * 100.0).round());
+        let sb = sv.scrollback.to_string();
+        let (label, toggled, value): (&str, Option<bool>, Option<String>) = match hot {
+            Hot::PanelClose => ("Close settings", None, None),
+            Hot::OpenPlugins => ("Browse plugins", None, None),
+            Hot::PluginToggle(i) => {
+                let (name, on) = self.plugins_installed.get(i).cloned().unwrap_or_default();
+                return (name, Some(on), None);
+            }
+            Hot::FontDec => ("Smaller font", None, Some(font)),
+            Hot::FontInc => ("Larger font", None, Some(font)),
+            Hot::FontCycle => ("Font", None, Some(self.font_name().to_string())),
+            Hot::PadDec => ("Less padding", None, Some(pad)),
+            Hot::PadInc => ("More padding", None, Some(pad)),
+            Hot::OpacityDec => ("Less opaque", None, Some(opacity)),
+            Hot::OpacityInc => ("More opaque", None, Some(opacity)),
+            Hot::LineHeightDec => ("Shorter lines", None, Some(lh)),
+            Hot::LineHeightInc => ("Taller lines", None, Some(lh)),
+            Hot::UiScaleDec => ("Smaller interface", None, Some(ui)),
+            Hot::UiScaleInc => ("Larger interface", None, Some(ui)),
+            Hot::BoldBright => ("Bold as bright", Some(self.bold_as_bright), None),
+            Hot::Mica => (if cfg!(windows) { "Mica backdrop" } else { "System blur" }, Some(sv.acrylic), None),
+            Hot::CursorCycle => ("Cursor", None, Some(self.cursor_style_name().to_string())),
+            Hot::CursorBlink => ("Cursor blink", Some(self.cursor_blink), None),
+            Hot::ScrollbackDec => ("Less scrollback", None, Some(sb)),
+            Hot::ScrollbackInc => ("More scrollback", None, Some(sb)),
+            Hot::CopyOnSelect => ("Copy on select", Some(sv.copy_on_select), None),
+            Hot::ShellCycle => ("Default shell", None, Some(sv.shell_name.to_string())),
+            Hot::LoadProfile => ("Load profile", Some(sv.load_profile), None),
+            Hot::CloseActionCycle => ("Close button", None, Some(sv.close_action_name.to_string())),
+            Hot::BackendCycle => ("Renderer", None, Some(sv.backend_name.to_string())),
+            Hot::ThemeSet(id) => return (format!("{} theme", id.name()), Some(self.theme == id && !sv.theme_auto), None),
+            Hot::ThemeAuto => ("Follow system theme", Some(sv.theme_auto), None),
+            _ => ("", None, None),
+        };
+        (label.to_string(), toggled, value)
     }
 
     /// the right-side plugin dock: a flat instrument panel listing each Tier-1
@@ -6056,6 +6159,32 @@ impl Renderer {
                     children,
                     ..Default::default()
                 },
+            });
+        }
+        if self.settings_open {
+            let order = self.chrome_targets();
+            let children = order
+                .iter()
+                .enumerate()
+                .map(|(i, (hot, r))| {
+                    let (label, toggled, value) = self.settings_a11y(*hot);
+                    Item {
+                        id: i as u32,
+                        role: if toggled.is_some() { Role::CheckBox } else { Role::Button },
+                        label,
+                        value,
+                        toggled,
+                        bounds: Some(rect(*r)),
+                        click: true,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let focus = self.chrome_focus.and_then(|f| order.iter().position(|(h, _)| *h == f)).map(|i| i as u32);
+            panels.push(Panel {
+                layer: Layer::Settings,
+                focus,
+                root: Item { id: PANEL, role: Role::Dialog, label: "Settings".to_string(), children, ..Default::default() },
             });
         }
         if let Some(notice) = self.notice.as_ref() {
@@ -7955,6 +8084,36 @@ mod hit_tests {
             assert_eq!(r.market_hit_at(x, y), Some(want), "{}", control.label);
         }
         let _ = std::fs::remove_file(tmp_png("a11y"));
+    }
+
+    #[test]
+    fn settings_keys_walk_every_control_and_scroll_it_into_view() {
+        let _gpu = gpu_serial();
+        let Some(mut r) = headless() else {
+            return;
+        };
+        r.set_settings_panel(true, 1.0);
+        let order = r.chrome_focus_order();
+        assert_eq!(order.first(), Some(&Hot::PanelClose));
+        let dec = order.iter().position(|h| *h == Hot::UiScaleDec).expect("ui scale stepper");
+        assert_eq!(order.get(dec + 1), Some(&Hot::UiScaleInc));
+        let targets = r.chrome_targets();
+        assert!(targets[1..].windows(2).all(|w| w[0].1.1 <= w[1].1.1), "panel order runs top to bottom");
+        let panels = r.a11y_panels();
+        let panel = panels.iter().find(|p| p.layer == crate::a11y::Layer::Settings).expect("settings panel node");
+        assert_eq!(panel.root.children.len(), order.len());
+        assert!(panel.root.children.iter().all(|c| !c.label.is_empty()), "every control is named");
+        // the last control sits below the fold; focusing it scrolls it into the viewport
+        let last = *order.last().unwrap();
+        r.set_chrome_focus(Some(last));
+        let g = r.settings_geom();
+        let (_, rect) = g.controls.iter().find(|(h, _)| *h == last).copied().unwrap();
+        assert!(rect.1 >= g.body_top && rect.1 + rect.3 <= g.body_bottom, "{rect:?} outside {}..{}", g.body_top, g.body_bottom);
+        r.set_chrome_focus(Some(Hot::PanelClose));
+        r.set_chrome_focus(Some(order[1]));
+        let g = r.settings_geom();
+        let (_, rect) = g.controls.iter().find(|(h, _)| *h == order[1]).copied().unwrap();
+        assert!(rect.1 >= g.body_top, "scrolled back up to the first control");
     }
 
     #[test]

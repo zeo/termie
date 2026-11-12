@@ -3195,6 +3195,8 @@ fn is_settings_hot(h: Hot) -> bool {
             | Hot::ThemeAuto
             | Hot::LineHeightDec
             | Hot::LineHeightInc
+            | Hot::UiScaleDec
+            | Hot::UiScaleInc
             | Hot::BoldBright
             | Hot::ScrollbackDec
             | Hot::ScrollbackInc
@@ -5209,6 +5211,12 @@ impl App {
                 id => render::MarketHit::Chip(id as usize / 2),
             }),
             a11y::Layer::Notice => self.dismiss_notice(),
+            a11y::Layer::Settings if self.pw.settings_open => {
+                let order = self.pw.renderer.as_ref().map(|r| r.chrome_focus_order()).unwrap_or_default();
+                if let Some(&hot) = order.get(id as usize) {
+                    self.button_action(event_loop, hot);
+                }
+            }
             _ => return,
         }
         self.redraw();
@@ -6237,6 +6245,7 @@ impl App {
                 shell_name: config.shell.label(),
                 close_action_name: config.close_action.label(),
                 backend_name: config.backend.label(),
+                ui_scale: self.persisted.ui_scale,
             });
             r.set_settings_panel(settings_open, settings_p);
         }
@@ -7083,6 +7092,10 @@ impl App {
     fn close_settings(&mut self) {
         if self.pw.settings_open {
             self.pw.settings_open = false;
+            // keyboard focus inside the panel goes back to the gear that opened it
+            if self.pw.chrome_focus.is_some() {
+                self.set_chrome_focus(Some(Hot::Gear));
+            }
             self.settings_anim = Some(Instant::now());
             self.redraw();
         }
@@ -8929,6 +8942,12 @@ impl App {
                     r.nudge_opacity(d);
                 }
                 self.redraw();
+            }
+            Hot::UiScaleDec | Hot::UiScaleInc => {
+                let d = if hot == Hot::UiScaleInc { 0.05 } else { -0.05 };
+                // snap to 5% steps so repeated presses never drift
+                self.persisted.ui_scale = ((self.persisted.ui_scale + d) * 20.0).round().clamp(15.0, 40.0) / 20.0;
+                self.apply_ui_factor();
             }
             Hot::LineHeightDec | Hot::LineHeightInc => {
                 let d = if hot == Hot::LineHeightInc { 0.04 } else { -0.04 };
@@ -11417,8 +11436,14 @@ impl App {
             at.map_or(order.first(), |i| order.get((i as isize + by).rem_euclid(n.max(1)) as usize)).copied()
         };
         let back = self.mods.shift_key();
+        // inside the settings panel a press keeps focus on the control and
+        // typing never leaks to the shell behind it
+        let panel = self.pw.settings_open;
         match logical {
+            Key::Named(NamedKey::Escape) if panel => self.close_settings(),
             Key::Named(NamedKey::Escape) => self.set_chrome_focus(None),
+            Key::Named(NamedKey::Enter | NamedKey::Space) if panel => self.button_action(event_loop, hot),
+            _ if panel && text.is_some() => {}
             Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp) => self.set_chrome_focus(step(-1)),
             Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown) => self.set_chrome_focus(step(1)),
             Key::Named(NamedKey::Tab) => self.set_chrome_focus(step(if back { -1 } else { 1 })),
@@ -11873,6 +11898,18 @@ impl App {
                 && matches!(logical, Key::Character(c) if c.as_str() == ",");
             if esc || ctrl_comma {
                 self.close_settings();
+                return true;
+            }
+            // tab or an arrow walks into the panel's controls
+            let order = self.pw.renderer.as_ref().map(|r| r.chrome_focus_order()).unwrap_or_default();
+            let first = match logical {
+                Key::Named(NamedKey::Tab) if self.mods.shift_key() => order.last(),
+                Key::Named(NamedKey::ArrowUp | NamedKey::End) => order.last(),
+                Key::Named(NamedKey::Tab | NamedKey::ArrowDown | NamedKey::Home) => order.first(),
+                _ => None,
+            };
+            if let Some(&hot) = first {
+                self.set_chrome_focus(Some(hot));
             }
             return true;
         }

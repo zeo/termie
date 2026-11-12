@@ -39,11 +39,12 @@ pub enum Layer {
     Menu,
     Dialog,
     Notice,
+    Settings,
 }
 
 impl Layer {
     fn from_u8(n: u8) -> Option<Self> {
-        [Self::Find, Self::Market, Self::Palette, Self::Menu, Self::Dialog, Self::Notice]
+        [Self::Find, Self::Market, Self::Palette, Self::Menu, Self::Dialog, Self::Notice, Self::Settings]
             .into_iter()
             .find(|layer| *layer as u8 == n)
     }
