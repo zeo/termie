@@ -1,8 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-12
 
 ### Interface
+- The chrome takes on the rot suite's Aqua surface: a graphite gloss title bar in every theme, gel buttons, inset fields, bevelled panels, and an aqua gradient for selection and the default action. Labels, menus, settings and dialogs use Source Sans 3 (bundled, OFL); tab titles, keycaps, paths, the status bar and the terminal stay in Maple Mono. The terminal grid itself stays flat.
+- Menus walk by keyboard, show each item's shortcut, dim rows that can't run, and mark submenus with a chevron.
+- The settings panel works from the keyboard alone, keybindings included: pick a shortcut and press the new chord. Changes apply live and keep the comments in `keybindings.conf`.
+- Command blocks: with shell integration, the palette can copy or select a command's output, copy the command, or rerun it, and `add mark` / `clear marks` set your own scrollbar marks.
+- Find matches case on its `Aa` button or `Alt+C`, next to the regex toggle.
+- Snippets: `snippet.<name>=<text>` lines in `config` and a `.termie-snippets` file in the nearest folder up from the pane's directory show up in the palette and type into the focused pane.
+- Hints (`Ctrl+Shift+H`) label every link, path, git hash and IP address on screen, soft-wrapped ones included. Type a label to copy it, or Shift and the label to type it at the prompt.
+- Panes can be swapped, restarted, or made read-only from the palette and the pane menu.
+- Every literal `Host` alias in `~/.ssh/config` appears as its own `ssh:` profile, next to the WSL distros.
+- `import color scheme from clipboard` takes a Windows Terminal scheme object, a Ghostty theme, or an iTerm2 `.itermcolors` file.
+- `font_features` turns the terminal font's OpenType features on or off, such as `ss01` or `zero`.
+- The command line takes Windows Terminal's verbs and flags: `new-tab`, `split-pane` and `focus-tab` separated by `;`, plus the window options and tab flags that go with them.
+- `termie @ list`, `send-text`, `new-tab` and `focus` drive a running termie when `remote_control=true`. It is off by default, sandboxed plugins can't reach it, and an elevated termie doesn't listen.
+- Session restore brings back every window with its own tabs and splits. After a clean exit each pane's last 5,000 lines come back too; `restore_contents=false` keeps only the layout.
+- cmd's first prompt starts on the top row instead of below a blank line.
+- The bell flash fires at most once a second, and `bell=off` drops the flash, the tab dot and the taskbar flash.
 - The chrome is rebuilt on one spacing, type, and motion scale. Overlays, menus, the find bar, dialogs, the marketplace, and settings share rounded surfaces with soft shadows, inset row highlights, and an open animation that grows from 98% while fading in. Window controls, tab buttons, and settings controls use one set of anti-aliased vector icons, and window close turns red on hover.
 - Tabs size to their titles and give way widest-first when the strip fills. The active tab keeps its fill and a short rounded rail that springs between tabs; hairline dividers separate idle tabs. When a background tab's command finishes, its rail draws in green or red, holds, and settles into a dot. A running command's dot breathes.
 - Split panes meet on a single hairline. Focus dims the other panes instead of boxing the focused one, crossfading on every switch. A bell now pools a warm glow along the pane's inner edge.
@@ -16,13 +32,42 @@
 - Precision wheels and touchpads accumulate small zoom deltas and reset at gesture boundaries, giving each font-size step deliberate weight.
 - Find keeps its newest matches within fixed scan, run, and result budgets, refreshes live output without losing the selected result, and paints wrapped or wide-cell matches across every covered row. Reflowed and evicted results cannot leave stale highlights or dead navigation entries.
 
+### Accessibility
+- Screen readers see every overlay through AccessKit: the palette, find, menus, settings, dialogs, the marketplace and notices, with focus and clicks routed through the same actions as the mouse.
+- The terminal is exposed as text with a caret, and new output is announced politely.
+- A lone `Alt` tap moves keyboard focus to the title bar with a visible ring. Arrows or `Tab` move, `Enter` presses, `Esc` gives the keys back to the terminal.
+- Chrome text follows the system text size, and `ui_scale` (0.75 to 2, also a stepper in settings) scales it further without touching the terminal font.
+- Windows high contrast redraws the chrome in system colors.
+- Done and failed marks carry a check or a bang as well as a color, status marks hold 3:1 contrast, and tab close and the new-tab chevron are 24 points wide.
+- Errors stay on the status bar until dismissed and carry a cross.
+- The cursor follows the system caret blink rate and holds steady under reduced motion.
+
 ### Reliability
+- Idle windows paint only when a blink or a running-command dot is due, instead of on every vsync.
+- The find bar no longer crashes on a regex with `|` inside a character class, and a keybindings action with multibyte text no longer panics at startup.
+- A tall kitty image can no longer push the cursor past the bottom of the screen.
+- Scrollback marks keep their ids when old lines are dropped, the cursor homes inside the margins in origin mode, overwriting half of a wide glyph clears its other half, and torn-off windows honor synchronized output and close cleanly when the main window goes first.
+- Config parsing moved into its own module. A UTF-8 byte order mark or a stray invalid byte no longer discards the whole file, a file that can't be read is never overwritten with defaults, fractional font sizes survive a save, and every switch takes the same on/off spellings.
+- An exit requested between events no longer leaves the event loop waiting.
+- Unsandboxed plugins start in their install folder, so relative script arguments resolve, and the `hello-plugin` example loads as shipped.
 - Quit confirmation now counts tabs and panes in every window. Saved sessions keep tabs and split trees from detached interactive windows while command-line layout windows remain ephemeral.
 - Debounced session writes now set their own event-loop deadline, so an idle or unfocused app persists changes on time.
 
 ### Security
+- The updater checks every download against the release's minisign key before it is written to disk.
+- On Linux, the single-instance launch socket moved from the abstract namespace into a private `$XDG_RUNTIME_DIR` folder, so a sandboxed plugin that shares the network can't reach it.
+- Windows loads DLLs only from the app and system folders.
+- PNG decoding is capped by its expanded RGBA size, and a Linux update archive by its unpacked size.
+- Plugin notices show in the status bar, and each plugin's widgets are bounded.
+- A misspelled `plugin_sandbox` value keeps the sandbox on.
+- CI and release jobs no longer keep the checkout token after checkout.
 - Dropped paths now use the launch shell's literal syntax only after Termie's prompt and shell-ownership checks pass. WSL paths are converted with `wslpath`; drops outside terminal content, nested programs, parser-active filename characters, control characters, and unsupported or custom shells are rejected instead of receiving input. Platforms without a fresh native drop point open the location in a new tab without injecting terminal input.
 - Windows AppContainer plugins now receive a minimal container-local environment and inherit only stdin, stdout, and a NUL stderr handle. They join a kill-on-close job before their first instruction can run. Plugin files grant access to the exact package SID, legacy all-container access is removed, and long plugin IDs retain separate stable container profiles.
+
+### Platform
+- Windows installs and updates through the shared rot installer only; the unused WiX source is gone.
+- wgpu 30, accesskit 0.25 and accesskit_winit 0.34, with routine dependency updates.
+- CI runs on pull requests from forks.
 
 ## 0.5.2 - 2026-07-26
 
