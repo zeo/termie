@@ -2445,8 +2445,9 @@ fn spawn_plugin(
     d: &Discovered,
     on_msg: impl Fn(plugin::PluginMsg) + Send + 'static,
 ) -> std::io::Result<plugin::Plugin> {
+    let dir = plugins_dir().map(|b| b.join(&d.manifest.id));
     if sandbox
-        && let Some(dir) = plugins_dir().map(|b| b.join(&d.manifest.id))
+        && let Some(dir) = &dir
     {
         let net = d.granted.iter().any(|g| g == "network");
         let moniker = plugin::sandbox::moniker_for(&d.manifest.id);
@@ -2455,12 +2456,13 @@ fn spawn_plugin(
             &moniker,
             std::path::Path::new(&d.program),
             &d.manifest.args,
-            &dir,
+            dir,
             net,
             on_msg,
         );
     }
-    plugin::Plugin::spawn(id.to_string(), &d.program, &d.manifest.args, on_msg)
+    // relative args resolve against the install dir, as they do in the sandbox
+    plugin::Plugin::spawn(id.to_string(), &d.program, &d.manifest.args, dir.as_deref(), on_msg)
 }
 
 /// build a pane (pty + child + screen) without starting its reader thread.

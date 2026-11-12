@@ -102,17 +102,21 @@ impl Drop for Plugin {
 }
 
 impl Plugin {
-    /// spawn `program args...` as a plugin and wire its stdout to `on_msg`
-    /// (called on a reader thread, once per ndjson line). stderr is inherited
-    /// for now so plugin logs are visible in debug runs
+    /// spawn `program args...` as a plugin, in `dir` when given, and wire its
+    /// stdout to `on_msg` (called on a reader thread, once per ndjson line).
+    /// stderr is inherited for now so plugin logs are visible in debug runs
     pub fn spawn(
         id: impl Into<String>,
         program: &str,
         args: &[String],
+        dir: Option<&std::path::Path>,
         on_msg: impl Fn(PluginMsg) + Send + 'static,
     ) -> std::io::Result<Plugin> {
         let id = id.into();
         let mut cmd = Command::new(program);
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -273,7 +277,7 @@ mod tests {
             .as_nanos();
         let marker = std::env::temp_dir().join(format!("termie-plugin-child-{}-{nonce}", std::process::id()));
         let command = format!("sleep 60 & printf %s \"$!\" > '{}' && wait", marker.display());
-        let mut plugin = Plugin::spawn("test", "/bin/sh", &["-c".into(), command], |_| {}).expect("spawn plugin");
+        let mut plugin = Plugin::spawn("test", "/bin/sh", &["-c".into(), command], None, |_| {}).expect("spawn plugin");
         let deadline = Instant::now() + Duration::from_secs(1);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -286,6 +290,22 @@ mod tests {
         }
         let _ = std::fs::remove_file(marker);
         assert!(!std::path::Path::new(&format!("/proc/{child_pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsandboxed_plugin_runs_in_its_install_dir() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hello-plugin");
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            eprintln!("skipping: /usr/bin/python3 is not installed");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let _plugin = Plugin::spawn("hello-plugin", "/usr/bin/python3", &["plugin.py".into()], Some(&dir), move |msg| {
+            let _ = tx.send(matches!(msg, PluginMsg::Cmd(PluginCmd::Ready { .. })));
+        })
+        .expect("spawn example plugin");
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 {
-  "id": "hello-world",
+  "id": "hello-plugin",
   "name": "Hello World",
   "version": "0.1.0",
   "api_version": 2,
   "entry": {
-    "cmd": "python",
+    "cmd": "/usr/bin/python3",
     "args": ["plugin.py"]
   },
   "permissions": []

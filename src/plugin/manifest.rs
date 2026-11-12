@@ -124,6 +124,14 @@ mod tests {
         }
     }
 
+    // the shipped example names a linux interpreter; windows users point cmd at python.exe
+    #[cfg(unix)]
+    #[test]
+    fn example_plugin_manifest_loads_from_its_folder() {
+        let text = include_str!("../../examples/hello-plugin/plugin.json");
+        assert!(Manifest::parse(text, "hello-plugin").is_some(), "the shipped example must load as copied");
+    }
+
     #[test]
     fn parses_a_valid_manifest() {
         let text = r#"{"id":"pet","name":"Pet","version":"1.2.3","api_version":1,
