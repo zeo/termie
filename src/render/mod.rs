@@ -1012,6 +1012,9 @@ pub struct Renderer {
     dialog_btns: Option<(Rect, Rect)>,
     pane_menu_view: Option<PaneMenuView>,
     find_view: Option<FindView>,
+    /// keyboard hints on the focused pane: (viewport row, col_start, col_end
+    /// exclusive, the label still to type)
+    hints: Option<Vec<(usize, usize, usize, String)>>,
     market_view: Option<MarketView>,
     /// per-frame clickable regions for the market overlay (close, cards, chips),
     /// rebuilt by build_market so a click can route to a row or its action
@@ -1731,6 +1734,7 @@ impl Renderer {
             dialog_btns: None,
             pane_menu_view: None,
             find_view: None,
+            hints: None,
             market_view: None,
             market_hits: Vec::new(),
             confirm_view: None,
@@ -2682,6 +2686,10 @@ impl Renderer {
 
     pub fn set_find(&mut self, f: Option<FindView>) {
         self.find_view = f;
+    }
+
+    pub fn set_hints(&mut self, h: Option<Vec<(usize, usize, usize, String)>>) {
+        self.hints = h;
     }
 
     pub fn set_confirm(&mut self, c: Option<ConfirmView>) {
@@ -4356,6 +4364,8 @@ impl Renderer {
             let forced = self.system.is_some();
             let atlas = &mut self.atlas;
             let find_view = self.find_view.as_ref();
+            let hints = self.hints.as_deref();
+            let hint_ranges: Vec<_> = hints.unwrap_or(&[]).iter().map(|h| (h.0, h.1, h.2, false)).collect();
             for (pv, info) in panes.iter().zip(pane_info.iter_mut()) {
                 let themed = pv.theme.filter(|&id| id != theme && !forced);
                 let mut pal = themed
@@ -4378,7 +4388,9 @@ impl Renderer {
                     let (x, y, pw, ph) = pv.rect;
                     Self::push_rect(&mut out, x, y, pw, ph, pal.bg, 1.0);
                 }
-                let fmatches: &[(usize, usize, usize, bool)] = if pv.focused {
+                let fmatches: &[(usize, usize, usize, bool)] = if pv.focused && hints.is_some() {
+                    &hint_ranges
+                } else if pv.focused {
                     find_view.map(|f| f.matches.as_slice()).unwrap_or(&[])
                 } else {
                     &[]
@@ -4407,6 +4419,14 @@ impl Renderer {
                     && focused
                 {
                     Self::draw_preedit(atlas, pal, &mut out, pv.term, info.0, info.1, pre, beam_w);
+                }
+                if pv.focused {
+                    let m = atlas.metrics(FontId::Content);
+                    for (row, col, _, label) in hints.unwrap_or(&[]) {
+                        let (x, y) = (info.0 + *col as f32 * m.cell_w, info.1 + *row as f32 * m.cell_h);
+                        Self::push_rect(&mut out, x, y, label.len() as f32 * m.cell_w, m.cell_h, pal.paper, 1.0);
+                        let _ = Self::draw_text(atlas, &mut out, FontId::Content, x, y, label, pal.bg, 1.0, 0.0);
+                    }
                 }
             }
         }
@@ -4903,6 +4923,8 @@ impl Renderer {
                 ("PANE MODE", PAPER, 1.0)
             } else if self.mark_mode {
                 ("MARK MODE", PAPER, 1.0)
+            } else if self.hints.is_some() {
+                ("HINTS", PAPER, 1.0)
             } else {
                 ("READY", self.quiet(INK_0).lerp(TEXT_2, 0.25), 1.0)
             };

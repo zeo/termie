@@ -291,12 +291,23 @@ pub fn capture(
         // a first launch shows a fresh prompt, not a session's worth of output
         let sample: &[u8] = if scene.starts_with("welcome") { b"\x1b[1;32m~\x1b[0m \x1b[36m>\x1b[0m " } else { samples[i % samples.len()] };
         p.advance(&mut t, sample);
+        if scene == "hints" && i == 0 {
+            p.advance(&mut t, b"git show 1efec83\r\nsee https://termie.dev/docs\r\nat src/render/mod.rs:4382\r\nssh 10.0.0.12:22\r\n\x1b[1;32m$\x1b[0m ");
+        }
         if scene == "preedit" && i == 0 {
             // park the cursor mid-line so the composition draws from a real
             // prompt position, not col 0
             p.advance(&mut t, b"\x1b[1;32m$\x1b[0m echo ");
         }
         terms.push(t);
+    }
+
+    if scene == "hints"
+        && let Some(t) = terms.first()
+    {
+        let spans = t.grid.hint_spans();
+        let labels = crate::hint_labels(spans.len());
+        r.set_hints(Some(spans.into_iter().rev().zip(labels).map(|((row, a, b, _), label)| (row, a, b, label)).collect()));
     }
 
     let panes: Vec<PaneView> = terms
@@ -332,10 +343,10 @@ mod tests {
     use crate::color::ThemeId;
 
     /// every chrome surface worth guarding, each rendered in every theme
-    const SCENES: [&str; 19] = [
+    const SCENES: [&str; 20] = [
         "split", "attention", "hover", "palette", "menu", "find", "confirm", "rename", "market",
         "settings", "settings2", "panemode", "notice", "error", "focus", "large-text", "high-contrast",
-        "welcome-hints", "readme",
+        "welcome-hints", "readme", "hints",
     ];
     const W: u32 = 1100;
     const H: u32 = 680;

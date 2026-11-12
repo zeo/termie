@@ -342,6 +342,23 @@ pub struct CommandBlock {
 
 /// terminal cell width of a char: 0 (combining/zero-width), 1 (normal), or 2
 /// (East-Asian wide / fullwidth / emoji). a compact built-in table (no deps)
+fn is_hint(t: &str) -> bool {
+    let url = (t.starts_with("https://") || t.starts_with("http://")) && t.len() >= 10;
+    let (host, port) = t.split_once(':').unwrap_or((t, "0"));
+    let octets: Vec<&str> = host.split('.').collect();
+    let ip = octets.len() == 4
+        && octets.iter().all(|o| (1..=3).contains(&o.len()) && o.parse::<u8>().is_ok())
+        && !port.is_empty()
+        && port.parse::<u16>().is_ok();
+    let hash = (7..=64).contains(&t.len())
+        && t.chars().all(|c| c.is_ascii_hexdigit())
+        && t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().any(|c| c.is_ascii_alphabetic());
+    // a letter keeps dates (12/11/2026) and bare slashes out
+    let path = t.len() >= 3 && t.contains(['/', '\\']) && t.chars().any(|c| c.is_ascii_alphabetic());
+    url || ip || hash || path
+}
+
 pub(crate) fn char_width(c: char) -> usize {
     let cp = c as u32;
     // fast path: printable ASCII is width 1 and dominates shell output — return
@@ -543,6 +560,45 @@ impl Grid {
             return None;
         }
         Some((col_start, col_end, url))
+    }
+
+    /// every url, path, git hash and ipv4 address on screen, as (viewport row,
+    /// col_start, col_end exclusive, text), top to bottom
+    pub fn hint_spans(&self) -> Vec<(usize, usize, usize, String)> {
+        let delim = |c: char| c.is_whitespace() || "\"'`<>()[]{}|".contains(c);
+        let mut out = Vec::new();
+        for row in 0..self.rows {
+            let cells: Vec<(usize, char)> =
+                self.line_at(row).iter().enumerate().filter(|(_, c)| c.c != '\0').map(|(i, c)| (i, c.c)).collect();
+            let mut i = 0;
+            while i < cells.len() {
+                if delim(cells[i].1) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < cells.len() && !delim(cells[i].1) {
+                    i += 1;
+                }
+                let mut run = &cells[start..i];
+                while let [rest @ .., (_, c)] = run
+                    && ".,;:!?$#>".contains(*c)
+                {
+                    run = rest;
+                }
+                let text: String = run.iter().map(|c| c.1).collect();
+                // a url glued to a prefix (href=https://...) starts at its scheme
+                let skip = ["https://", "http://"].iter().filter_map(|s| text.find(s)).min().unwrap_or(0);
+                let run = &run[text[..skip].chars().count()..];
+                let text = &text[skip..];
+                if let (Some(&(c0, _)), Some(&(last, lc))) = (run.first(), run.last())
+                    && is_hint(text)
+                {
+                    out.push((row, c0, last + char_width(lc), text.to_string()));
+                }
+            }
+        }
+        out
     }
 
     /// inclusive (col_start, col_end) of the word under viewport cell (row, col)
@@ -2610,6 +2666,28 @@ mod tests {
         assert_eq!(g.lines[0][1].c, 'b');
         // the now-orphaned lead must be blanked
         assert_eq!(g.lines[0][0].c, ' ');
+    }
+
+    #[test]
+    fn hint_spans_find_links_paths_hashes_and_addresses() {
+        let mut g = Grid::new(3, 80);
+        for c in "see (https://a.io/x). at src/main.rs:12, 1a2b3c4 \u{4e2d}10.0.0.1:22 12/11/2026 cafe deadbeefs".chars() {
+            g.put_char(c);
+        }
+        assert_eq!(
+            g.hint_spans(),
+            [
+                (0, 5, 19, "https://a.io/x".to_string()),
+                (0, 25, 39, "src/main.rs:12".to_string()),
+                (0, 41, 48, "1a2b3c4".to_string()),
+            ]
+        );
+        let mut g = Grid::new(2, 40);
+        for c in "\u{4e2d}x 10.0.0.1:22 href=http://b.co/q".chars() {
+            g.put_char(c);
+        }
+        let spans: Vec<_> = g.hint_spans().into_iter().map(|(_, a, b, t)| (a, b, t)).collect();
+        assert_eq!(spans, [(4, 15, "10.0.0.1:22".to_string()), (21, 34, "http://b.co/q".to_string())]);
     }
 
     #[test]

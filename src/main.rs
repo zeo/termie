@@ -518,6 +518,27 @@ struct Sel {
 /// keyboard mark mode: the selection cursor cell (viewport-relative — it moves
 /// with the keys and rides the view at the edges) and, once shift-extending,
 /// the content-anchored point it grows from
+/// keyboard hints: each on-screen match as (absolute line, col_start, col_end,
+/// text, label) and the label letters typed so far
+struct HintState {
+    pane: usize,
+    reflow_gen: u32,
+    items: Vec<(u64, usize, usize, String, String)>,
+    typed: String,
+}
+
+/// `n` hint labels, home row first; one letter each while they fit, else two
+/// so no label is a prefix of another
+fn hint_labels(n: usize) -> Vec<String> {
+    const KEYS: &[u8; 26] = b"asdfjklghqweruiopzxcvbnmty";
+    let one = |i: usize| char::from(KEYS[i % 26]);
+    if n <= 26 {
+        (0..n).map(|i| one(i).to_string()).collect()
+    } else {
+        (0..n.min(26 * 26)).map(|i| format!("{}{}", one(i / 26), one(i))).collect()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MarkState {
     cur: (usize, usize),
@@ -586,6 +607,7 @@ enum PaletteAction {
     PaneMode,
     /// keyboard selection: move a cursor through screen + scrollback and copy
     MarkMode,
+    Hints,
     /// select the focused pane's retained history and live screen
     SelectAll,
     /// toggle termie as the platform's default terminal
@@ -687,6 +709,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("settings", PaletteAction::Settings),
     ("pane mode", PaletteAction::PaneMode),
     ("mark mode", PaletteAction::MarkMode),
+    ("hints", PaletteAction::Hints),
     ("select all", PaletteAction::SelectAll),
     ("jump to attention", PaletteAction::JumpAttention),
     ("always on top", PaletteAction::ToggleOnTop),
@@ -1690,6 +1713,7 @@ fn default_keybindings() -> Vec<(ModifiersState, Key, PaletteAction)> {
         (cs, chr("o"), A::SplitH),
         // keyboard selection, the windows terminal chord
         (cs, chr("m"), A::MarkMode),
+        (cs, chr("h"), A::Hints),
         (cs, chr("a"), A::SelectAll),
         // cockpit: hop to the pane that needs eyes
         (ctrl | ModifiersState::ALT, chr("a"), A::JumpAttention),
@@ -4173,6 +4197,7 @@ struct App {
     selection: Option<Sel>,
     /// keyboard mark mode state; Some while active (selection mirrors it)
     mark: Option<MarkState>,
+    hints: Option<HintState>,
     /// --kitty-demo: inject the gradient into the first pane's first output
     kitty_demo_pending: bool,
     selecting: bool,
@@ -4390,6 +4415,7 @@ impl App {
             pool: Vec::new(),
             selection: None,
             mark: None,
+            hints: None,
             selecting: false,
             sel_autoscroll: None,
             sel_scroll_at: None,
@@ -6483,6 +6509,7 @@ impl App {
             })
         };
         let find_view = self.build_find_view();
+        let hint_view = self.build_hint_view();
         let market_view = self.market.as_ref().map(|m| render::MarketView {
             rows: m
                 .rows
@@ -6512,6 +6539,7 @@ impl App {
             r.set_palette(palette_view);
             r.set_pane_menu(pane_menu_view);
             r.set_find(find_view);
+            r.set_hints(hint_view);
             r.set_market(market_view);
             r.set_confirm(self.pw.confirm.as_ref().map(|c| render::ConfirmView {
                 prompt: c.prompt.clone(),
@@ -7744,6 +7772,7 @@ impl App {
                 }
             }
             PaletteAction::MarkMode => self.set_mark_mode(true),
+            PaletteAction::Hints => self.start_hints(),
             PaletteAction::SelectAll => self.select_all(),
             PaletteAction::JumpAttention => self.jump_attention(),
             PaletteAction::FontPicker => self.open_font_picker(),
@@ -9846,6 +9875,96 @@ impl App {
         self.redraw();
     }
 
+    /// label every link, path, hash and address on the focused pane's screen;
+    /// the nearest the prompt gets the shortest reach
+    fn start_hints(&mut self) {
+        let Some(pane) = self.active_focused_id() else {
+            return;
+        };
+        let Some((spans, reflow_gen)) = self.focused_grid().map(|g| {
+            let spans: Vec<_> = g.hint_spans().into_iter().rev().map(|(r, a, b, t)| (g.viewport_to_abs(r), a, b, t)).collect();
+            (spans, g.reflow_gen)
+        }) else {
+            return;
+        };
+        if spans.is_empty() {
+            self.show_notice("no links, paths, hashes or addresses on screen");
+            return;
+        }
+        if self.mark.is_some() {
+            self.set_mark_mode(false);
+        }
+        let labels = hint_labels(spans.len());
+        let items: Vec<_> = spans
+            .into_iter()
+            .zip(labels)
+            .map(|((line, a, b, text), label)| (line, a, b, text, label))
+            .collect();
+        let n = items.len();
+        self.hints = Some(HintState { pane, reflow_gen, items, typed: String::new() });
+        self.show_notice(&format!("{n} hints: type a label to copy, shift and the label to type it, esc cancels"));
+    }
+
+    /// on-screen hints still matching what was typed, as viewport spans with
+    /// the label letters left to type
+    fn build_hint_view(&self) -> Option<Vec<(usize, usize, usize, String)>> {
+        let h = self.hints.as_ref().filter(|h| Some(h.pane) == self.active_focused_id())?;
+        let g = self.focused_grid().filter(|g| g.reflow_gen == h.reflow_gen)?;
+        Some(
+            h.items
+                .iter()
+                .filter_map(|(line, a, b, _, label)| {
+                    Some((g.abs_to_viewport(*line)?, *a, *b, label.strip_prefix(h.typed.as_str())?.to_string()))
+                })
+                .collect(),
+        )
+    }
+
+    /// one key while hints show: label letters narrow them down, and the last
+    /// one copies (or with shift types) the match; anything else leaves
+    fn hint_key(&mut self, logical: &Key) {
+        let ch = match logical {
+            Key::Character(c) if !self.mods.control_key() && !self.mods.alt_key() => {
+                c.chars().next().filter(char::is_ascii_alphabetic)
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(h) = self.hints.as_mut() {
+                    h.typed.pop();
+                }
+                self.redraw();
+                return;
+            }
+            _ => None,
+        };
+        let live = self.build_hint_view().is_some();
+        let Some((ch, h)) = ch.zip(self.hints.as_mut()).filter(|_| live) else {
+            self.hints = None;
+            self.redraw();
+            return;
+        };
+        h.typed.push(ch.to_ascii_lowercase());
+        let mut left = h.items.iter().filter(|i| i.4.starts_with(h.typed.as_str()));
+        let outcome = match (left.next(), left.next()) {
+            (None, _) => Some(None),
+            (Some(one), None) if one.4 == h.typed => Some(Some((h.pane, one.3.clone()))),
+            _ => None,
+        };
+        let Some(picked) = outcome else {
+            self.redraw();
+            return;
+        };
+        self.hints = None;
+        if let Some((pane, text)) = picked {
+            if ch.is_ascii_uppercase() || self.mods.shift_key() {
+                self.send_paste_bytes(pane, text.as_bytes());
+            } else {
+                win::clipboard_set(&text);
+                self.show_notice(&format!("copied {text}"));
+            }
+        }
+        self.redraw();
+    }
+
     /// one key in mark mode: arrows move the cursor (scrolling into history at
     /// the edges), shift extends, enter/ctrl+c copy and exit, esc exits
     fn mark_key(&mut self, logical: &Key) {
@@ -11538,6 +11657,9 @@ impl App {
                 if self.mark.is_some() && state == ElementState::Pressed {
                     self.set_mark_mode(false);
                 }
+                if state == ElementState::Pressed {
+                    self.hints = None;
+                }
                 // pane mode: drag a divider to resize or place a pane beside another
                 if self.pw.pane_mode && !matches!(hit, Some(Hit::Button(_)) | Some(Hit::TitleBar) | Some(Hit::Resize(_))) {
                     match state {
@@ -12361,6 +12483,10 @@ impl App {
         // screen + scrollback without touching the mouse
         if self.mark.is_some() {
             self.mark_key(logical);
+            return true;
+        }
+        if self.hints.is_some() {
+            self.hint_key(logical);
             return true;
         }
 
@@ -14304,6 +14430,16 @@ mod tests {
         assert_eq!(merged[2].argv, ["wsl.exe", "-d", "Arch"]);
         assert_eq!(merged[3].name, "wsl: Ubuntu 22.04 LTS");
         assert_eq!(merged[3].argv, ["wsl.exe", "-d", "Ubuntu 22.04 LTS"]);
+    }
+
+    #[test]
+    fn hint_labels_never_prefix_each_other() {
+        assert_eq!(hint_labels(3), ["a", "s", "d"]);
+        for n in [26, 27, 700] {
+            let labels = hint_labels(n);
+            assert_eq!(labels.len(), n.min(676));
+            assert!(labels.iter().all(|a| labels.iter().filter(|b| b.starts_with(a.as_str())).count() == 1));
+        }
     }
 
     #[test]

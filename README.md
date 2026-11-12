@@ -55,6 +55,7 @@ termie checks for a newer release once a day and shows a small `UPDATE` chip on 
 | `Ctrl+P` | command palette |
 | `Ctrl+Shift+P` | pane mode (move / resize / zoom / close) |
 | `Ctrl+Shift+M` | mark mode (arrows move, Ctrl+arrows jump words, Shift extends, Enter copies) |
+| `Ctrl+Shift+H` | hints: label every link, path, git hash and IP address on screen; type a label to copy it, or Shift and the label to type it at the prompt |
 | `Ctrl+Shift+A` | select all text in the focused pane |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste (also `Ctrl+Insert` / `Shift+Insert`) |
 | `Ctrl+Shift+F` | find in scrollback |
