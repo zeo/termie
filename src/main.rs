@@ -4537,6 +4537,7 @@ impl App {
         renderer.set_font_weight(settings.font_weight);
         renderer.set_min_contrast(settings.min_contrast);
         renderer.set_ligatures(settings.ligatures);
+        renderer.set_font_features(&settings.font_features);
         if let Some(path) = settings.background_image.as_deref() {
             match image::load_png(std::path::Path::new(path)) {
                 Some(image) => {

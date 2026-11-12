@@ -2225,6 +2225,11 @@ impl Renderer {
         self.min_contrast
     }
 
+    /// the terminal font's opentype features, as a `font_features=` value
+    pub fn set_font_features(&mut self, spec: &str) {
+        self.atlas.set_features(atlas::parse_font_features(spec));
+    }
+
     pub fn set_ligatures(&mut self, on: bool) {
         self.ligatures = on;
     }

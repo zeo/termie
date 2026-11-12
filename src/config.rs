@@ -49,6 +49,9 @@ pub struct Persisted {
     /// shape punctuation runs through the font's ligature rules (`ligatures=`,
     /// default on; fonts without liga/calt render identically)
     pub ligatures: bool,
+    /// opentype features the terminal font shapes with (`font_features=zero,
+    /// ss01, -calt`); empty leaves the font's defaults
+    pub font_features: String,
     pub opacity: i32,
     #[cfg(windows)]
     pub quake_key: Option<(u32, u32)>,
@@ -131,6 +134,7 @@ impl Default for Persisted {
             background_image: None,
             background_image_opacity: 0.3,
             ligatures: true,
+            font_features: String::new(),
             opacity: 85,
             #[cfg(any(windows, target_os = "linux"))]
             quake_key: None,
@@ -218,6 +222,9 @@ pub fn render(p: &Persisted) -> String {
     }
     if !p.ligatures {
         let _ = writeln!(s, "ligatures=false");
+    }
+    if !p.font_features.is_empty() {
+        let _ = writeln!(s, "font_features={}", p.font_features);
     }
     if let Some(q) = &p.quake_key_raw {
         // an opt-in the panel can't edit; dropping it here silently killed
@@ -384,6 +391,7 @@ pub fn parse(text: &str) -> Persisted {
                 }
             }
             "ligatures" => set_bool(&mut p.ligatures, k, v),
+            "font_features" => p.font_features = v.to_string(),
             "background_image" => p.background_image = (!v.is_empty()).then(|| v.to_string()),
             "background_image_opacity" => {
                 if let Ok(x) = v.parse::<f32>()
@@ -744,7 +752,7 @@ mod tests {
         let text = "scrollback=2500\ncopy_on_select=true\nrestore_on_launch=false\nfont_size=10.5\npadding=3.5\n\
             opacity=90\ncursor=underline\ncursor_blink=false\nline_height=1.2\ntheme=auto\ntheme_dark=nord\n\
             font=Cascadia Code\nfont_weight=600\nmin_contrast=4.5\nbackground_image=C:\\bg.png\n\
-            background_image_opacity=0.25\nligatures=false\nwsl_distro=Arch\nplugin_sandbox=off\nosc52=true\n\
+            background_image_opacity=0.25\nligatures=false\nfont_features=zero, -calt\nwsl_distro=Arch\nplugin_sandbox=off\nosc52=true\n\
             acrylic=true\nprofile.dev=pwsh.exe -NoLogo\nprofile.dev.cwd=C:\\repo\ntheme.cmd=koi\n\
             bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\nui_scale=1.25\n\
             snippet.logs=git log --oneline -20\nsnippet.eq=a=b\nsnippet.=x\nsnippet.tab=a\tb\n";
@@ -757,6 +765,7 @@ mod tests {
         assert!(parse("").bell);
         assert_eq!(p.profiles[0].cwd.as_deref(), Some("C:\\repo"));
         assert_eq!(p.font.as_deref(), Some("Cascadia Code"));
+        assert_eq!(p.font_features, "zero, -calt");
         let snippets: Vec<(&str, &str)> = p.snippets.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
         assert_eq!(snippets, [("logs", "git log --oneline -20"), ("eq", "a=b")]);
     }

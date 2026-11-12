@@ -2,8 +2,33 @@ use crate::fxhash::FxHashMap;
 use std::path::PathBuf;
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    Attrs, Buffer, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
+    Weight,
 };
+
+/// a `font_features=` value as opentype features: `ss01`/`+ss01` turns one
+/// on, `-calt` off, `cv01=2` picks a variant; tokens that are no 4-char tag
+/// are skipped
+pub fn parse_font_features(spec: &str) -> FontFeatures {
+    let mut features = FontFeatures::new();
+    for token in spec.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+        let (token, on) = match token.strip_prefix('-') {
+            Some(rest) => (rest, 0),
+            None => (token.strip_prefix('+').unwrap_or(token), 1),
+        };
+        let (tag, value) = match token.split_once('=') {
+            Some((tag, v)) => (tag, v.parse().ok()),
+            None => (token, Some(on)),
+        };
+        match (<[u8; 4]>::try_from(tag.as_bytes()), value) {
+            (Ok(tag), Some(value)) if tag.iter().all(u8::is_ascii_alphanumeric) => {
+                features.set(FeatureTag::new(&tag), value);
+            }
+            _ => log::warn!("font_features: skipping '{token}'"),
+        }
+    }
+    features
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontId {
@@ -139,6 +164,8 @@ pub struct GlyphAtlas {
     /// composited grapheme-cluster glyphs, keyed by a string whose first char
     /// encodes bold/italic so the lookup borrows `&str` (no per-hit allocation)
     cluster_cache: FxHashMap<String, Option<AtlasGlyph>>,
+    /// opentype features the terminal font shapes with (`font_features=`)
+    features: FontFeatures,
     /// reused scratch for the cluster lookup key (style prefix + cluster text)
     cluster_key: String,
     /// kitty images packed into the color atlas, keyed by global image key
@@ -212,6 +239,7 @@ impl GlyphAtlas {
             cache: FxHashMap::default(),
             icon_cache: FxHashMap::default(),
             cluster_cache: FxHashMap::default(),
+            features: FontFeatures::new(),
             cluster_key: String::new(),
             image_cache: FxHashMap::default(),
             image_repacked_this_frame: false,
@@ -408,6 +436,15 @@ impl GlyphAtlas {
         self.repack_at(self.dim);
     }
 
+    /// shape the terminal font with these features from now on, dropping every
+    /// glyph rasterized without them
+    pub fn set_features(&mut self, features: FontFeatures) {
+        if features != self.features {
+            self.features = features;
+            self.repack_at(self.dim);
+        }
+    }
+
     /// reset the shelf packing + glyph cache and clear the cpu atlas buffers,
     /// reallocating them when `dim` changes (the grow path); flags a full
     /// re-upload. shared by reconfigure (same dim) and the 1024 -> 2048 grow
@@ -566,7 +603,8 @@ impl GlyphAtlas {
         let mut s = [0u8; 4];
         let text = key.c.encode_utf8(&mut s);
         let weight = if key.bold { m.bold } else { m.weight };
-        let mut shaped = match self.shape_char_image(text, m.family, weight, key.italic) {
+        let content = key.font == FontId::Content;
+        let mut shaped = match self.shape_char_image(text, m.family, weight, key.italic, content) {
             Some(i) => i,
             None => return RasterOutcome::Empty,
         };
@@ -578,7 +616,7 @@ impl GlyphAtlas {
         if key.font == FontId::Content && crate::grid::emoji_vs_base(key.c) {
             if shaped.4
                 && let Some(mono) =
-                    self.shape_char_image(text, "Segoe UI Symbol", weight, key.italic)
+                    self.shape_char_image(text, "Segoe UI Symbol", weight, key.italic, true)
                 && !mono.4
             {
                 shaped = mono;
@@ -592,7 +630,7 @@ impl GlyphAtlas {
                 let family = if shaped.4 { m.family } else { "Segoe UI Symbol" };
                 let px = m.px * max_w / shaped.0 as f32;
                 self.buffer.set_metrics(Metrics::new(px, m.line_height));
-                if let Some(small) = self.shape_char_image(text, family, weight, key.italic) {
+                if let Some(small) = self.shape_char_image(text, family, weight, key.italic, true) {
                     shaped = small;
                 }
                 self.buffer.set_metrics(Metrics::new(m.px, m.line_height));
@@ -642,17 +680,22 @@ impl GlyphAtlas {
 
     /// shape one char through `family` (plus system fallback) and pull its
     /// swash image as (w, h, left, top, is_color, pixels) — RGBA for color
-    /// glyphs, coverage otherwise. the caller sets buffer metrics first
+    /// glyphs, coverage otherwise. the caller sets buffer metrics first;
+    /// `content` shapes with the terminal font's features
     fn shape_char_image(
         &mut self,
         text: &str,
         family: &str,
         weight: Weight,
         italic: bool,
+        content: bool,
     ) -> Option<(u32, u32, i32, i32, bool, Vec<u8>)> {
         let mut attrs = Attrs::new().family(Family::Name(family)).weight(weight);
         if italic {
             attrs = attrs.style(Style::Italic);
+        }
+        if content {
+            attrs = attrs.font_features(self.features.clone());
         }
         self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
         self.buffer.shape_until_scroll(&mut self.font_system, false);
@@ -780,7 +823,8 @@ impl GlyphAtlas {
         let baseline = m.ascent.round() as i32;
         let mut attrs = Attrs::new()
             .family(Family::Name(m.family))
-            .weight(if bold { m.bold } else { m.weight });
+            .weight(if bold { m.bold } else { m.weight })
+            .font_features(self.features.clone());
         if italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -888,7 +932,8 @@ impl GlyphAtlas {
         let family = if emoji_seq { "Segoe UI Emoji" } else { m.family };
         let mut attrs = Attrs::new()
             .family(Family::Name(family))
-            .weight(if bold { m.bold } else { m.weight });
+            .weight(if bold { m.bold } else { m.weight })
+            .font_features(self.features.clone());
         if italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -1311,6 +1356,33 @@ fn to_alpha(data: &[u8], w: usize, h: usize, content: SwashContent) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_features_parse_on_off_and_values() {
+        let tags: Vec<(String, u32)> = parse_font_features("zero, +ss01 -calt cv01=2,toolong,x=1,cv02=z")
+            .features
+            .iter()
+            .map(|f| (String::from_utf8_lossy(f.tag.as_bytes()).into_owned(), f.value))
+            .collect();
+        let want = [("zero", 1), ("ss01", 1), ("calt", 0), ("cv01", 2)].map(|(t, v)| (t.to_string(), v));
+        assert_eq!(tags, want);
+    }
+
+    #[test]
+    fn font_features_change_the_shaped_glyph() {
+        let mut atlas = GlyphAtlas::new(16.0, 13.0, 1.0, None, 1.32);
+        let m = atlas.metrics(FontId::Content);
+        let family = atlas.content_family().to_string();
+        let zero = |atlas: &mut GlyphAtlas| {
+            atlas.buffer.set_metrics(Metrics::new(m.px, m.line_height));
+            atlas.shape_char_image("0", &family, m.weight, false, true).map(|g| g.5)
+        };
+        let plain = zero(&mut atlas);
+        atlas.set_features(parse_font_features("zero"));
+        let featured = zero(&mut atlas);
+        assert!(plain.is_some() && featured.is_some());
+        assert_ne!(plain, featured);
+    }
 
     #[test]
     fn bundled_font_is_terminal_ready() {
