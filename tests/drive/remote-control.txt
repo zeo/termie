@@ -1,0 +1,10 @@
+500 key ctrl+shift+n
+1000 assert windows 2
+0 remote new-tab --title api
+1000 assert tabs 3
+0 remote focus --pane 0
+200 remote send-text --pane 0 echo remote-ok\r
+0 remote send-text echo to-the-focused-pane\r
+0 remote list
+500 assert tabs 3
+100 exit

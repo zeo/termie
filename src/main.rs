@@ -219,6 +219,8 @@ enum UserEvent {
     OsPrefsRead { text_scale: f32, system_colors: Option<color::SystemColors> },
     /// another ordinary launch joined this process and needs its own window
     Launch { request: instance::LaunchRequest, _permit: EventPermit },
+    /// a `termie @` command from another process, answered on `reply`
+    Remote { request: instance::LaunchRequest, reply: std::sync::mpsc::Sender<String> },
     #[cfg(target_os = "linux")]
     KwinDragGeometry(win::KwinDragSnapshot),
     /// a default-terminal console session handed to this running instance
@@ -2201,6 +2203,16 @@ fn kill_all(node: &mut Node) {
     }
 }
 
+fn leaves<'a>(node: &'a Node, out: &mut Vec<&'a Pane>) {
+    match node {
+        Node::Leaf(p) => out.push(p),
+        Node::Split { a, b, .. } => {
+            leaves(a, out);
+            leaves(b, out);
+        }
+    }
+}
+
 fn leaves_mut<'a>(node: &'a mut Node, out: &mut Vec<&'a mut Pane>) {
     match node {
         Node::Leaf(p) => out.push(p),
@@ -2620,6 +2632,8 @@ enum DriveStep {
     PointerTab(usize, usize),
     Mouse(ElementState),
     Assert(DriveMetric, usize),
+    /// a `termie @` command run as if remote_control were on; an error reply fails the drive
+    Remote(Vec<String>),
     Exit,
 }
 
@@ -2729,6 +2743,7 @@ fn parse_drive_script(text: &str) -> Vec<(Duration, DriveStep)> {
                 }
             }
             "exit" if arg.is_empty() => out.push((at, DriveStep::Exit)),
+            "remote" => out.push((at, DriveStep::Remote(arg.split_whitespace().map(String::from).collect()))),
             _ => {}
         }
     }
@@ -8840,6 +8855,133 @@ impl App {
         None
     }
 
+    /// the satellite slot that most recently held os focus, None when it was the main window
+    fn recent_window(&self) -> Option<usize> {
+        let recent = self.satellites.iter().map(|s| s.focused_at).enumerate().max_by_key(|&(_, at)| at);
+        recent.filter(|&(_, at)| at > self.main_pw().focused_at).map(|(slot, _)| slot)
+    }
+
+    /// (window, tab, pane) for a `--pane` id, or the focused pane of the most
+    /// recently focused window; window 0 is the main window, n is satellite n-1
+    fn remote_target(&self, pane: Option<usize>) -> Option<(usize, usize, usize)> {
+        let windows: Vec<&PaneWindow> = std::iter::once(&self.pw).chain(&self.satellites).collect();
+        if let Some(id) = pane {
+            return windows.iter().enumerate().find_map(|(w, pw)| {
+                let owns = |tab: &Tab| tab.root.as_ref().is_some_and(|root| find_pane(root, id).is_some());
+                pw.tabs.iter().position(owns).map(|t| (w, t, id))
+            });
+        }
+        let w = self.recent_window().map_or(0, |slot| slot + 1);
+        let pw = windows[w];
+        Some((w, pw.active_tab, pw.tabs.get(pw.active_tab)?.focused))
+    }
+
+    /// answer a `termie @` command from another process of this user; the reply
+    /// is printed by that process, and one starting `error: ` exits nonzero
+    fn remote_command(&mut self, event_loop: &ActiveEventLoop, request: instance::LaunchRequest) -> String {
+        if !self.persisted.remote_control {
+            return "error: remote control is off; set remote_control=true in the config\n".into();
+        }
+        let mut args = request.args.into_iter();
+        let verb = args.next().unwrap_or_default();
+        let mut rest: Vec<String> = args.collect();
+        let pane = if rest.first().is_some_and(|a| a == "--pane") {
+            match rest.get(1).and_then(|n| n.parse::<usize>().ok()) {
+                Some(id) => {
+                    rest.drain(..2);
+                    Some(id)
+                }
+                None => return "error: --pane needs a pane id from `termie @ list`\n".into(),
+            }
+        } else {
+            None
+        };
+        let missing = || match pane {
+            Some(id) => format!("error: no pane {id}; `termie @ list` shows the ids\n"),
+            None => "error: no pane is open\n".to_string(),
+        };
+        match verb.as_str() {
+            "list" | "ls" => {
+                let clean = |text: &str| text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>();
+                let mut out = String::new();
+                for (w, pw) in std::iter::once(&self.pw).chain(&self.satellites).enumerate() {
+                    for (t, tab) in pw.tabs.iter().enumerate() {
+                        let mut panes = Vec::new();
+                        if let Some(root) = tab.root.as_ref() {
+                            leaves(root, &mut panes);
+                        }
+                        for p in panes {
+                            let mark = if t == pw.active_tab && p.id == tab.focused { '*' } else { '-' };
+                            let title = clean(&pane_label(p));
+                            let cwd = clean(&cwd_path(p.term.cwd.as_deref()).unwrap_or_default());
+                            out.push_str(&format!("{}\t{w}\t{t}\t{mark}\t{title}\t{cwd}\n", p.id));
+                        }
+                    }
+                }
+                out
+            }
+            "send-text" => {
+                let Some((w, t, id)) = self.remote_target(pane) else {
+                    return missing();
+                };
+                let bytes = unescape_send_input(&rest.join(" ")).into_bytes();
+                let pw = if w == 0 { &mut self.pw } else { &mut self.satellites[w - 1] };
+                let Some(p) = pw.tabs.get_mut(t).and_then(|tab| tab.root.as_mut()).and_then(|root| find_pane_mut(root, id))
+                else {
+                    return missing();
+                };
+                if p.read_only {
+                    return format!("error: pane {id} is read-only\n");
+                }
+                p.term.grid.view_offset = 0;
+                if !p.write_user_input(&bytes) {
+                    return format!("error: pane {id}'s input queue is full\n");
+                }
+                self.redraw_pane_window(id);
+                String::new()
+            }
+            "focus" => {
+                if pane.is_none() {
+                    return "error: focus needs --pane N\n".into();
+                }
+                let Some((w, t, id)) = self.remote_target(pane) else {
+                    return missing();
+                };
+                let go = move |app: &mut Self| {
+                    let before = app.focus_identity();
+                    app.pw.active_tab = t;
+                    if let Some(tab) = app.pw.tabs.get_mut(t) {
+                        tab.focused = id;
+                        if tab.zoom.is_some_and(|z| z != id) {
+                            tab.zoom = None;
+                        }
+                    }
+                    app.relayout_all();
+                    app.sync_tabs();
+                    app.after_focus_context_change(before);
+                    if let Some(window) = app.pw.window.as_ref() {
+                        window.focus_window();
+                    }
+                };
+                match w {
+                    0 => go(self),
+                    w => self.with_window(w - 1, go),
+                }
+                if !self.plugins.is_empty() {
+                    self.plugins_broadcast(&plugin::HostEvent::FocusChanged { pane: id as u64 });
+                }
+                String::new()
+            }
+            "new-tab" | "nt" => {
+                let args = ["-w", "0", "nt"].map(String::from).into_iter().chain(rest).collect();
+                let launch = instance::LaunchRequest { args, process_cwd: request.process_cwd, launch_cwd: None, remote: false };
+                self.open_launch_window(event_loop, launch);
+                String::new()
+            }
+            _ => format!("error: unknown command '{verb}'; use list, send-text, new-tab or focus\n"),
+        }
+    }
+
     fn open_launch_window(&mut self, event_loop: &ActiveEventLoop, request: instance::LaunchRequest) {
         let mut cli = parse_args(request.args.into_iter());
         let base = request.process_cwd.as_deref();
@@ -8875,9 +9017,8 @@ impl App {
                 }
                 app.redraw();
             };
-            let recent = self.satellites.iter().map(|s| s.focused_at).enumerate().max_by_key(|&(_, at)| at);
-            match recent.filter(|&(_, at)| at > self.main_pw().focused_at) {
-                Some((slot, _)) => self.with_window(slot, add),
+            match self.recent_window() {
+                Some(slot) => self.with_window(slot, add),
                 None => add(self),
             }
             return;
@@ -10607,6 +10748,16 @@ impl App {
                         );
                         log::error!("{error}");
                         self.drive_error.get_or_insert(error);
+                    }
+                }
+                DriveStep::Remote(args) => {
+                    let enabled = std::mem::replace(&mut self.persisted.remote_control, true);
+                    let request = instance::LaunchRequest { args, process_cwd: None, launch_cwd: None, remote: true };
+                    let reply = self.remote_command(event_loop, request);
+                    self.persisted.remote_control = enabled;
+                    print!("{reply}");
+                    if reply.starts_with("error: ") {
+                        self.drive_error.get_or_insert(format!("--drive: remote {}", reply.trim_end()));
                     }
                 }
                 DriveStep::Exit => event_loop.exit(),
@@ -13140,6 +13291,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             },
             UserEvent::Launch { request, _permit } => self.open_launch_window(event_loop, request),
+            UserEvent::Remote { request, reply } => {
+                let _ = reply.send(self.remote_command(event_loop, request));
+            }
             #[cfg(target_os = "linux")]
             UserEvent::KwinDragGeometry(snapshot) => self.accept_kwin_drag_geometry(snapshot),
             UserEvent::Market(result) => {
@@ -13854,6 +14008,18 @@ pub(crate) fn timing(label: &str) {
     }
 }
 
+/// `termie @ <command>`: ask the running termie and print its reply
+fn run_remote(args: Vec<String>) -> Result<()> {
+    win::attach_parent_console();
+    let cwd = std::env::current_dir().ok().map(|cwd| cwd.to_string_lossy().into_owned());
+    let reply = instance::remote(args, cwd).map_err(|error| anyhow::anyhow!("no running termie answered: {error}"))?;
+    match reply.strip_prefix("error: ") {
+        Some(message) => anyhow::bail!("{}", message.trim_end()),
+        None => print!("{reply}"),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     win::restrict_dll_search();
     // dev-only headless screen dumper; never compiled into release
@@ -13870,6 +14036,10 @@ fn main() -> Result<()> {
     #[cfg(feature = "microbench")]
     if microbench::maybe_run() {
         return Ok(());
+    }
+    let mut remote_args = std::env::args().skip(1);
+    if remote_args.next().as_deref() == Some("@") {
+        return run_remote(remote_args.collect());
     }
     timing("process start");
     // give the log facade a sink (file, since release has no console); the
@@ -13908,6 +14078,7 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|cwd| cwd.to_string_lossy().into_owned()),
             launch_cwd: launch_cwd(win::foreground_window()),
+            remote: false,
         };
         match instance::claim(&request) {
             instance::Claim::Primary(server) => Some(server),
@@ -13924,8 +14095,17 @@ fn main() -> Result<()> {
         let launch_proxy = proxy.clone();
         let launch_budget = EventBudget::new(MAX_PENDING_LAUNCH_EVENTS);
         server.start(move |request| {
+            if request.remote {
+                let (reply, answer) = std::sync::mpsc::channel();
+                launch_proxy.send_event(UserEvent::Remote { request, reply }).ok()?;
+                return Some(
+                    answer
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap_or_else(|_| "error: termie didn't answer in time\n".into()),
+                );
+            }
             let permit = launch_budget.acquire();
-            launch_proxy.send_event(UserEvent::Launch { request, _permit: permit }).is_ok()
+            launch_proxy.send_event(UserEvent::Launch { request, _permit: permit }).is_ok().then(String::new)
         });
     }
     let mut app = App::new(proxy);
@@ -14323,7 +14503,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 8);
+        assert_eq!(paths.len(), 9);
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("drive fixture text");
             let steps = parse_drive_script(&text);

@@ -49,6 +49,26 @@ pub fn restrict_dll_search() {
 #[cfg(not(windows))]
 pub fn restrict_dll_search() {}
 
+/// the release build has no console of its own; borrow the parent shell's so
+/// `termie @` can print, unless its output is already redirected
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe extern "system" {
+        fn GetStdHandle(id: u32) -> isize;
+        fn AttachConsole(pid: u32) -> i32;
+    }
+    unsafe {
+        if matches!(GetStdHandle(STD_OUTPUT_HANDLE), 0 | -1) {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn attach_parent_console() {}
+
 /// app / taskbar / alt-tab icon as RGBA: the ">_<" mark, decoded from the 1024
 /// master (assets/icon.png) into a 128x128 raw RGBA blob at build time so we
 /// stay free of any image-decoding dependency at runtime

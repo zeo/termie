@@ -67,6 +67,9 @@ pub struct Persisted {
     pub plugin_sandbox: bool,
     /// let terminal programs replace the OS clipboard through OSC 52
     pub osc52: bool,
+    /// answer `termie @ list|send-text|new-tab|focus` from other processes of
+    /// this user (`remote_control=true`); off by default
+    pub remote_control: bool,
     /// system backdrop behind the window (`acrylic=true`, alias `mica`): mica
     /// on windows 11 and compositor blur on linux
     pub acrylic: bool,
@@ -142,6 +145,7 @@ impl Default for Persisted {
             wsl_distro: None,
             plugin_sandbox: true,
             osc52: false,
+            remote_control: false,
             acrylic: false,
             profiles_raw: Vec::new(),
             profiles: Vec::new(),
@@ -239,6 +243,9 @@ pub fn render(p: &Persisted) -> String {
     }
     if p.osc52 {
         let _ = writeln!(s, "osc52=true");
+    }
+    if p.remote_control {
+        let _ = writeln!(s, "remote_control=true");
     }
     if p.acrylic {
         let _ = writeln!(s, "acrylic=true");
@@ -430,6 +437,7 @@ pub fn parse(text: &str) -> Persisted {
                 })
             }
             "osc52" => set_bool(&mut p.osc52, k, v),
+            "remote_control" => set_bool(&mut p.remote_control, k, v),
             "acrylic" | "mica" => set_bool(&mut p.acrylic, k, v),
             "inline_paint" => set_bool(&mut p.inline_paint, k, v),
             "latency_hud" => set_bool(&mut p.latency_hud, k, v),
@@ -566,6 +574,8 @@ mod tests {
         assert!(!parse("plugin_sandbox=off").plugin_sandbox);
         assert!(Persisted::default().plugin_sandbox);
         assert!(!Persisted::default().osc52);
+        assert!(!Persisted::default().remote_control);
+        assert!(parse("remote_control=true").remote_control);
         assert!(parse("osc52=true").osc52);
 
         assert!(parse("inline_paint=true").inline_paint);
