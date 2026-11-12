@@ -1,7 +1,7 @@
 //! tiny thompson-NFA regex for find-in-scrollback: literals, `.`, classes
 //! (`[a-z0-9]`, `[^…]`), `\d \w \s` and their negations, `* + ?`, alternation
 //! `|`, non-capturing groups `(…)`, and `^ $` anchored to the logical line.
-//! matching is case-insensitive with the same fold as the plain find. hand-
+//! matching folds case like the plain find unless compiled case-sensitive. hand-
 //! rolled like the rest of termie's codecs — a regex crate would be the
 //! project's largest dependency, bought for one search box
 
@@ -22,6 +22,7 @@ enum Inst {
 
 pub struct Regex {
     prog: Vec<Inst>,
+    case: bool,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -32,14 +33,19 @@ pub struct RegexMatches {
 }
 
 /// one-to-one case folding, identical to the plain find's
-fn fold(c: char) -> char {
+pub fn fold(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
+}
+
+fn norm(case: bool, c: char) -> char {
+    if case { c } else { crate::regex::fold(c) }
 }
 
 struct Parser {
     pat: Vec<char>,
     pos: usize,
     prog: Vec<Inst>,
+    case: bool,
 }
 
 impl Parser {
@@ -174,9 +180,9 @@ impl Parser {
                         self.bump();
                         let hi = self.bump()?;
                         let hi = if hi == '\\' { self.bump()? } else { hi };
-                        ranges.push((fold(lo), fold(hi)));
+                        ranges.push((norm(self.case, lo), norm(self.case, hi)));
                     } else {
-                        ranges.push((fold(lo), fold(lo)));
+                        ranges.push((norm(self.case, lo), norm(self.case, lo)));
                     }
                 }
                 self.prog.push(Inst::Class { neg, ranges });
@@ -190,16 +196,16 @@ impl Parser {
                 let inst = match c {
                     'd' => class(vec![('0', '9')], false),
                     'D' => class(vec![('0', '9')], true),
-                    'w' => class(vec![('a', 'z'), ('0', '9'), ('_', '_')], false),
-                    'W' => class(vec![('a', 'z'), ('0', '9'), ('_', '_')], true),
+                    'w' => class(vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], false),
+                    'W' => class(vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], true),
                     's' => class(vec![(' ', ' '), ('\t', '\t')], false),
                     'S' => class(vec![(' ', ' '), ('\t', '\t')], true),
-                    other => Inst::Char(fold(other)),
+                    other => Inst::Char(norm(self.case, other)),
                 };
                 self.prog.push(inst);
             }
             '*' | '+' | '?' | ')' | '|' | ']' => return None,
-            c => self.prog.push(Inst::Char(fold(c))),
+            c => self.prog.push(Inst::Char(norm(self.case, c))),
         }
         Some(())
     }
@@ -207,21 +213,25 @@ impl Parser {
 
 impl Regex {
     /// compile a pattern; None when it is malformed
-    pub fn compile(pattern: &str) -> Option<Regex> {
+    pub fn compile(pattern: &str, case: bool) -> Option<Regex> {
         if pattern.is_empty() {
             return None;
         }
-        let mut p = Parser { pat: pattern.chars().collect(), pos: 0, prog: Vec::new() };
+        let mut p = Parser { pat: pattern.chars().collect(), pos: 0, prog: Vec::new(), case };
         p.alt()?;
         if p.pos != p.pat.len() {
             return None; // trailing garbage (e.g. an unmatched ')')
         }
         p.prog.push(Inst::Match);
-        Some(Regex { prog: p.prog })
+        Some(Regex { prog: p.prog, case })
     }
 
-    fn hit(inst: &Inst, c: char) -> bool {
-        let f = fold(c);
+    pub fn case_sensitive(&self) -> bool {
+        self.case
+    }
+
+    fn hit(&self, inst: &Inst, c: char) -> bool {
+        let f = norm(self.case, c);
         match inst {
             Inst::Char(want) => f == *want,
             Inst::Any => true,
@@ -281,7 +291,7 @@ impl Regex {
             let mut next: Vec<usize> = Vec::new();
             seen.iter_mut().for_each(|s| *s = false);
             for &pc in &clist {
-                if Self::hit(&self.prog[pc], c) {
+                if self.hit(&self.prog[pc], c) {
                     self.add(&mut next, &mut seen, pc + 1, pos + 1, hay.len());
                 }
             }
@@ -319,7 +329,7 @@ impl Regex {
             }
             *budget -= 1;
             if let Some(f) = first
-                && fold(hay[start]) != f
+                && norm(self.case, hay[start]) != f
             {
                 start += 1;
                 continue;
@@ -363,9 +373,19 @@ mod tests {
     use super::*;
 
     fn all(pat: &str, hay: &str) -> Vec<(usize, usize)> {
-        let re = Regex::compile(pat).expect("compiles");
+        let re = Regex::compile(pat, false).expect("compiles");
         let chars: Vec<char> = hay.chars().collect();
         re.find_all(&chars, &mut 1_000_000, usize::MAX).matches
+    }
+
+    #[test]
+    fn case_sensitive_patterns_keep_case() {
+        let chars: Vec<char> = "Foo foo FOO".chars().collect();
+        let find = |pat: &str| Regex::compile(pat, true).expect("compiles").find_all(&chars, &mut 1_000_000, usize::MAX).matches;
+        assert_eq!(find("foo"), vec![(4, 7)]);
+        assert_eq!(find("F[a-z]+"), vec![(0, 3)]);
+        assert_eq!(find("\\w+"), vec![(0, 3), (4, 7), (8, 11)]);
+        assert_eq!(all("\\w+", "Foo foo"), vec![(0, 3), (4, 7)]);
     }
 
     #[test]
@@ -424,7 +444,7 @@ mod tests {
             let pat: String = (0..len)
                 .map(|i| alphabet[((seed >> (i * 5)) as usize) % alphabet.len()])
                 .collect();
-            if let Some(re) = Regex::compile(&pat) {
+            if let Some(re) = Regex::compile(&pat, false) {
                 re.find_all(&hay, &mut 10_000, 64);
             }
         }
@@ -441,13 +461,13 @@ mod tests {
     #[test]
     fn malformed_patterns_refuse_to_compile() {
         for bad in ["", "(", "(ab", "a)", "[", "[]", "*a", "+", "a**"] {
-            assert!(Regex::compile(bad).is_none(), "{bad:?} should not compile");
+            assert!(Regex::compile(bad, false).is_none(), "{bad:?} should not compile");
         }
     }
 
     #[test]
     fn budget_bails_instead_of_hanging() {
-        let re = Regex::compile("(a+)+$").expect("compiles");
+        let re = Regex::compile("(a+)+$", false).expect("compiles");
         let hay: Vec<char> = "a".repeat(5000).chars().chain("b".chars()).collect();
         let mut budget = 10_000usize;
         let found = re.find_all(&hay, &mut budget, usize::MAX);
@@ -457,7 +477,7 @@ mod tests {
 
     #[test]
     fn result_limit_keeps_the_newest_matches() {
-        let re = Regex::compile("x").expect("compiles");
+        let re = Regex::compile("x", false).expect("compiles");
         let hay: Vec<char> = "xxxxx".chars().collect();
         let found = re.find_all(&hay, &mut 100, 3);
         assert_eq!(found.matches, vec![(2, 3), (3, 4), (4, 5)]);
@@ -467,7 +487,7 @@ mod tests {
 
     #[test]
     fn literal_skips_spend_the_work_budget() {
-        let re = Regex::compile("z").expect("compiles");
+        let re = Regex::compile("z", false).expect("compiles");
         let hay: Vec<char> = "aaaaaaaa".chars().collect();
         let mut budget = 3;
         let found = re.find_all(&hay, &mut budget, usize::MAX);

@@ -210,6 +210,7 @@ pub fn capture(
                 capped: false,
                 matches: vec![],
                 regex_on: false,
+                case_on: false,
                 bad: false,
             }));
             r.settle_overlay();

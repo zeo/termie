@@ -3990,6 +3990,8 @@ struct App {
     /// regex mode for the find bar; remembered across open/close (toggled by
     /// the .* button or Alt+R while find is open)
     find_regex: bool,
+    /// match case for the find bar, kept like `find_regex` (the Aa button or Alt+C)
+    find_case: bool,
     /// the plugins marketplace overlay, when open
     market: Option<MarketState>,
     /// plugin id currently installing on the marketplace worker
@@ -4187,6 +4189,7 @@ impl App {
             font_pick_orig: None,
             find: None,
             find_regex: false,
+            find_case: false,
             market: None,
             market_installing: None,
             pressed: None,
@@ -5202,11 +5205,16 @@ impl App {
         self.redraw();
     }
 
-    /// find-bar button: 0 regex toggle, 1 previous, 2 next, anything else closes
+    /// find-bar button: 0 regex toggle, 1 previous, 2 next, 4 match case,
+    /// anything else closes
     fn find_button(&mut self, btn: u8) {
         match btn {
             0 => {
                 self.find_regex = !self.find_regex;
+                self.find_recompute();
+            }
+            4 => {
+                self.find_case = !self.find_case;
                 self.find_recompute();
             }
             1 => self.find_step(false),
@@ -5222,7 +5230,7 @@ impl App {
             a11y::Layer::Dialog if id <= 1 => self.answer_dialog(id == 1, event_loop),
             a11y::Layer::Palette if id < a11y::CLOSE => self.pick_palette_row(id as usize, event_loop),
             a11y::Layer::Menu if id < a11y::CLOSE => self.pick_pane_menu(Some(id as usize), event_loop),
-            a11y::Layer::Find if id <= 3 && self.find_is_open_here() => self.find_button(id as u8),
+            a11y::Layer::Find if id <= 4 && self.find_is_open_here() => self.find_button(id as u8),
             a11y::Layer::Market if self.market.is_some() => self.market_hit(match id {
                 a11y::CLOSE => render::MarketHit::Close,
                 id if id % 2 == 0 => render::MarketHit::Card(id as usize / 2),
@@ -5719,7 +5727,7 @@ impl App {
         };
         let mut bad = false;
         let matches = if self.find_regex && !query.is_empty() {
-            match regex::Regex::compile(&query) {
+            match regex::Regex::compile(&query, self.find_case) {
                 Some(re) => self
                     .focused_grid()
                     .map(|g| g.search_regex(&re))
@@ -5730,7 +5738,7 @@ impl App {
                 }
             }
         } else {
-            self.focused_grid().map(|g| g.search(&query)).unwrap_or_default()
+            self.focused_grid().map(|g| g.search(&query, self.find_case)).unwrap_or_default()
         };
         let grid::SearchMatches {
             hits,
@@ -5931,6 +5939,7 @@ impl App {
             capped: f.truncated || f.budget_exhausted,
             matches: vps,
             regex_on: self.find_regex,
+            case_on: self.find_case,
             bad: f.bad,
         })
     }
@@ -11084,7 +11093,7 @@ impl App {
                     }
                     return;
                 }
-                // find-bar buttons: regex toggle / prev / next / close (misses
+                // find-bar buttons: case / regex toggles, prev / next / close (misses
                 // fall through so text can still be selected while find is open)
                 if self.find_is_open_here()
                     && state == ElementState::Pressed
@@ -11812,6 +11821,10 @@ impl App {
                 // Alt+R mirrors the .* button (alt keeps plain 'r' typeable)
                 Key::Character(c) if self.mods.alt_key() && c.eq_ignore_ascii_case("r") => {
                     self.find_regex = !self.find_regex;
+                    self.find_recompute();
+                }
+                Key::Character(c) if self.mods.alt_key() && c.eq_ignore_ascii_case("c") => {
+                    self.find_case = !self.find_case;
                     self.find_recompute();
                 }
                 _ => {

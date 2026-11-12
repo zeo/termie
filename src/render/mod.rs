@@ -264,6 +264,8 @@ pub struct FindView {
     pub matches: Vec<(usize, usize, usize, bool)>,
     /// regex mode is on (the .* button paints lit)
     pub regex_on: bool,
+    /// match case is on (the Aa button paints lit)
+    pub case_on: bool,
     /// the pattern failed to compile; the counter slot says so
     pub bad: bool,
 }
@@ -1004,7 +1006,8 @@ pub struct Renderer {
     /// shown item count, window offset (None while the palette is closed)
     palette_geom: Option<(Rect, f32, usize, usize)>,
     /// find-bar button rects, refreshed each build: (prev, next, close)
-    find_btns: Option<(Rect, Rect, Rect, Rect)>,
+    /// regex, prev, next, close, match case: indexed by the button id
+    find_btns: Option<[Rect; 5]>,
     /// the open dialog's (cancel, default) buttons
     dialog_btns: Option<(Rect, Rect)>,
     pane_menu_view: Option<PaneMenuView>,
@@ -5735,7 +5738,7 @@ impl Renderer {
         let count = fv.count;
         let current = fv.current;
         let capped = fv.capped;
-        let regex_on = fv.regex_on;
+        let toggles = [(fv.case_on, "Aa"), (fv.regex_on, ".*")];
         let bad = fv.bad;
         let INK_1 = self.palette.ink1;
         let MUTE = self.palette.mute;
@@ -5754,8 +5757,8 @@ impl Renderer {
         self.overlay_frame(out, (bx, by, bw, bh), t(tokens::RADIUS_OVERLAY));
         let pad = t(tokens::SPACE_M);
         let iy = (by + (bh - chrome_h) / 2.0).round();
-        // right cluster: regex toggle / prev / next / close buttons, with the
-        // counter to their left. rects are remembered so clicks land on them
+        // right cluster: case and regex toggles, prev / next / close buttons,
+        // with the counter to their left. rects are remembered so clicks land on them
         let btn = (bh - t(tokens::SPACE_S)).round();
         let bgap = t(tokens::SPACE_2XS);
         let byy = (by + (bh - btn) / 2.0).round();
@@ -5763,16 +5766,18 @@ impl Renderer {
         let next_r = (close_r.0 - btn - bgap, byy, btn, btn);
         let prev_r = (next_r.0 - btn - bgap, byy, btn, btn);
         let rx_r = (prev_r.0 - btn - bgap - t(tokens::SPACE_XS), byy, btn, btn);
-        self.find_btns = Some((rx_r, prev_r, next_r, close_r));
+        let case_r = (rx_r.0 - btn - bgap, byy, btn, btn);
+        self.find_btns = Some([rx_r, prev_r, next_r, close_r, case_r]);
         let chip_r = t(tokens::RADIUS_ROW);
-        if regex_on {
-            Self::push_gel(out, rx_r, chip_r, self.skin.accent_pressed, 1.0);
-            Self::push_ring(out, rx_r, chip_r, hair, self.skin.accent_edge, 1.0);
+        for (r, (on, label)) in [case_r, rx_r].into_iter().zip(toggles) {
+            if on {
+                Self::push_gel(out, r, chip_r, self.skin.accent_pressed, 1.0);
+                Self::push_ring(out, r, chip_r, hair, self.skin.accent_edge, 1.0);
+            }
+            let lw = self.text_w(FontId::Small, label, small_track);
+            let ink = if on { self.skin.picked_text } else { QUIET };
+            let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (r.0 + (r.2 - lw) / 2.0).round(), (r.1 + (r.3 - small_h) / 2.0).round(), label, ink, 1.0, small_track);
         }
-        let rx_text = ".*";
-        let rw = self.text_w(FontId::Small, rx_text, small_track);
-        let rx_ink = if regex_on { self.skin.picked_text } else { QUIET };
-        let _ = Self::draw_text(&mut self.atlas, out, FontId::Small, (rx_r.0 + (rx_r.2 - rw) / 2.0).round(), (rx_r.1 + (rx_r.3 - small_h) / 2.0).round(), rx_text, rx_ink, 1.0, small_track);
         let icon = t(tokens::ICON - 1.0);
         let glyph = crate::color::apply_min_contrast(MUTE, INK_1, tokens::ICON_CONTRAST);
         Self::draw_icon(&mut self.atlas, out, Icon::ChevronUp, prev_r, icon, hair, glyph, 1.0);
@@ -5792,7 +5797,7 @@ impl Renderer {
             format!("{}/{}{}", current + 1, count, if capped { "+" } else { "" })
         };
         let iw = if info.is_empty() { 0.0 } else { self.text_w(FontId::Small, &info, small_track) };
-        let right_edge = rx_r.0 - t(tokens::SPACE_S);
+        let right_edge = case_r.0 - t(tokens::SPACE_S);
         // the query sits in an inset search well spanning the bar up to the buttons
         let inset = t(tokens::SPACE_XS);
         let well = (bx + inset, by + inset, right_edge + t(tokens::SPACE_XS) - bx - inset, bh - inset * 2.0);
@@ -5837,20 +5842,10 @@ impl Renderer {
         self.palette_geom.map(|(r, ..)| in_rect(x, y, r)).unwrap_or(false)
     }
 
-    /// find-bar button under a point: 0 regex toggle, 1 prev, 2 next, 3 close
+    /// find-bar button under a point: 0 regex toggle, 1 prev, 2 next, 3 close,
+    /// 4 match case
     pub fn find_btn_at(&self, x: f32, y: f32) -> Option<u8> {
-        let (rx, prev, next, close) = self.find_btns?;
-        if in_rect(x, y, rx) {
-            Some(0)
-        } else if in_rect(x, y, prev) {
-            Some(1)
-        } else if in_rect(x, y, next) {
-            Some(2)
-        } else if in_rect(x, y, close) {
-            Some(3)
-        } else {
-            None
-        }
+        self.find_btns?.iter().position(|&r| in_rect(x, y, r)).map(|i| i as u8)
     }
 
     /// modal confirm box: centered panel with the prompt on top and a key hint
@@ -5977,10 +5972,11 @@ impl Renderer {
                     children: vec![
                         Item { id: INPUT, role: Role::SearchInput, label: "Find".to_string(), value: Some(fv.query.clone()), ..Default::default() },
                         Item { id: STATUS, role: Role::Status, label: status, live: Some(accesskit::Live::Polite), ..Default::default() },
-                        button(0, "Regular expression", btns.map(|b| b.0), Some(fv.regex_on)),
-                        button(1, "Previous match", btns.map(|b| b.1), None),
-                        button(2, "Next match", btns.map(|b| b.2), None),
-                        button(3, "Close find", btns.map(|b| b.3), None),
+                        button(4, "Match case", btns.map(|b| b[4]), Some(fv.case_on)),
+                        button(0, "Regular expression", btns.map(|b| b[0]), Some(fv.regex_on)),
+                        button(1, "Previous match", btns.map(|b| b[1]), None),
+                        button(2, "Next match", btns.map(|b| b[2]), None),
+                        button(3, "Close find", btns.map(|b| b[3]), None),
                     ],
                     ..Default::default()
                 },
@@ -7971,14 +7967,14 @@ mod hit_tests {
             capped: false,
             matches: Vec::new(),
             regex_on: true,
+            case_on: false,
             bad: false,
         }));
         let _ = r.render_png(&[], true, false, false, &tmp_png("find"));
-        let (rx, prev, next, close) = r.find_btns.expect("find buttons recorded");
-        assert_eq!(r.find_btn_at(rx.0 + rx.2 / 2.0, rx.1 + rx.3 / 2.0), Some(0));
-        assert_eq!(r.find_btn_at(prev.0 + prev.2 / 2.0, prev.1 + prev.3 / 2.0), Some(1));
-        assert_eq!(r.find_btn_at(next.0 + next.2 / 2.0, next.1 + next.3 / 2.0), Some(2));
-        assert_eq!(r.find_btn_at(close.0 + close.2 / 2.0, close.1 + close.3 / 2.0), Some(3));
+        let btns = r.find_btns.expect("find buttons recorded");
+        for (i, b) in btns.iter().enumerate() {
+            assert_eq!(r.find_btn_at(b.0 + b.2 / 2.0, b.1 + b.3 / 2.0), Some(i as u8));
+        }
         assert_eq!(r.find_btn_at(2.0, 2.0), None);
         let _ = std::fs::remove_file(tmp_png("palette"));
         let _ = std::fs::remove_file(tmp_png("find"));
@@ -8016,7 +8012,7 @@ mod hit_tests {
             selected: 15,
             scope: "fonts",
         }));
-        r.set_find(Some(FindView { query: "err".into(), count: 4, current: 1, capped: false, matches: Vec::new(), regex_on: true, bad: false }));
+        r.set_find(Some(FindView { query: "err".into(), count: 4, current: 1, capped: false, matches: Vec::new(), regex_on: true, case_on: false, bad: false }));
         r.settle_overlay();
         let _ = r.render_png(&[], true, false, false, &tmp_png("a11y"));
         let panels = r.a11y_panels();
