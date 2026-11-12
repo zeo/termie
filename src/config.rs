@@ -7,8 +7,8 @@ use crate::parse_quake_key;
 use crate::quake_portal_trigger;
 use crate::{
     CONTENT_PT, CloseAction, MAX_BOOKMARKS, MAX_PROFILE_ENV, MAX_PROFILE_RAW_LINES, MAX_SHELL_THEMES,
-    MAX_STARTUP_TEXT_BYTES, RightClick, ShellKind, color, config_path, grid, profile_mut, pty, read_text, render,
-    same_location, split_cmdline,
+    MAX_SNIPPETS, MAX_STARTUP_TEXT_BYTES, RightClick, ShellKind, color, config_path, grid, profile_mut, pty,
+    read_text, render, same_location, snippet_entry, split_cmdline,
 };
 
 /// all persisted settings (App-owned + renderer-owned), read at startup
@@ -94,6 +94,8 @@ pub struct Persisted {
     pub term_program: String,
     /// working directories saved from the command palette or tab menu
     pub bookmarks: Vec<String>,
+    /// `snippet.<name>=<text>` lines, typed into the prompt from the palette
+    pub snippets: Vec<(String, String)>,
     /// the file exists but could not be read (oversized, permission denied);
     /// saving would replace it with defaults, so it is left alone
     pub unreadable: bool,
@@ -144,6 +146,7 @@ impl Default for Persisted {
             ui_scale: 1.0,
             term_program: String::from("termie"),
             bookmarks: Vec::new(),
+            snippets: Vec::new(),
             unreadable: false,
         }
     }
@@ -238,6 +241,9 @@ pub fn render(p: &Persisted) -> String {
     }
     for path in &p.bookmarks {
         let _ = writeln!(s, "bookmark={path}");
+    }
+    for (name, text) in &p.snippets {
+        let _ = writeln!(s, "snippet.{name}={text}");
     }
     if p.term_program != "termie" {
         let _ = writeln!(s, "term_program={}", p.term_program);
@@ -431,7 +437,13 @@ pub fn parse(text: &str) -> Persisted {
                 }
             }
             other => {
-                if let Some(name) = other.strip_prefix("theme.") {
+                if let Some(name) = other.strip_prefix("snippet.") {
+                    match snippet_entry(name, v) {
+                        Some(entry) if p.snippets.len() < MAX_SNIPPETS => p.snippets.push(entry),
+                        Some(_) => {}
+                        None => log::warn!("config: snippet line `{other}` needs a name and plain text"),
+                    }
+                } else if let Some(name) = other.strip_prefix("theme.") {
                     if !name.is_empty() && !v.is_empty() {
                         if p.shell_themes.len() < MAX_SHELL_THEMES {
                             p.shell_themes.push((name.to_string(), color::ThemeId::from_name(v)));
@@ -729,7 +741,8 @@ mod tests {
             font=Cascadia Code\nfont_weight=600\nmin_contrast=4.5\nbackground_image=C:\\bg.png\n\
             background_image_opacity=0.25\nligatures=false\nwsl_distro=Arch\nplugin_sandbox=off\nosc52=true\n\
             acrylic=true\nprofile.dev=pwsh.exe -NoLogo\nprofile.dev.cwd=C:\\repo\ntheme.cmd=koi\n\
-            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\nui_scale=1.25\n";
+            bookmark=C:\\work\nterm_program=ghostty\ninline_paint=false\nlatency_hud=true\nupdate_check=false\nbell=off\nui_scale=1.25\n\
+            snippet.logs=git log --oneline -20\nsnippet.eq=a=b\nsnippet.=x\nsnippet.tab=a\tb\n";
         let first = render(&parse(text));
         assert_eq!(render(&parse(&first)), first);
         let p = parse(&first);
@@ -739,6 +752,22 @@ mod tests {
         assert!(parse("").bell);
         assert_eq!(p.profiles[0].cwd.as_deref(), Some("C:\\repo"));
         assert_eq!(p.font.as_deref(), Some("Cascadia Code"));
+        let snippets: Vec<(&str, &str)> = p.snippets.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        assert_eq!(snippets, [("logs", "git log --oneline -20"), ("eq", "a=b")]);
+    }
+
+    #[test]
+    fn folder_snippets_come_from_the_nearest_file_above() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let root = std::env::temp_dir().join(format!("termie-snippets-{}-{nonce}", std::process::id()));
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).expect("temp dirs");
+        assert!(crate::folder_snippets(&deep).is_empty());
+        std::fs::write(root.join(".termie-snippets"), "# build\nbuild = cargo build --release\nbad = x\u{1b}[2J\nnope\n").expect("write");
+        assert_eq!(crate::folder_snippets(&deep), [("build".to_string(), "cargo build --release".to_string())]);
+        std::fs::write(deep.join(".termie-snippets"), "near=echo near\n").expect("write");
+        assert_eq!(crate::folder_snippets(&deep), [("near".to_string(), "echo near".to_string())]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

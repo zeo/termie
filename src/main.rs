@@ -553,6 +553,8 @@ enum PaletteAction {
     ToggleBookmark,
     /// open a saved working directory in a new tab
     OpenBookmark(usize),
+    /// type a snippet into the focused pane: config ones first, then the folder's
+    Snippet(usize),
     /// new tab with the focused pane's shell and cwd (Windows Terminal's Ctrl+Shift+D)
     DuplicateTab,
     NewShell(ShellKind),
@@ -792,6 +794,34 @@ const MAX_PROFILE_ENV: usize = 64;
 const MAX_PROFILE_RAW_LINES: usize = 8192;
 const MAX_SHELL_THEMES: usize = 256;
 const MAX_BOOKMARKS: usize = 64;
+const MAX_SNIPPETS: usize = 64;
+const SNIPPET_FILE: &str = ".termie-snippets";
+const MAX_SNIPPET_FILE_BYTES: usize = 64 * 1024;
+
+/// a snippet as (name, text), None when either is empty or carries a control
+/// character; snippets are typed into the prompt and must never press enter
+fn snippet_entry(name: &str, text: &str) -> Option<(String, String)> {
+    let (name, text) = (name.trim(), text.trim());
+    let ok = !name.is_empty() && !text.is_empty() && !name.chars().chain(text.chars()).any(char::is_control);
+    ok.then(|| (name.to_string(), text.to_string()))
+}
+
+/// `name = text` lines of the nearest `.termie-snippets` at or above `dir`
+fn folder_snippets(dir: &Path) -> Vec<(String, String)> {
+    let Some(text) = dir
+        .ancestors()
+        .map(|d| d.join(SNIPPET_FILE))
+        .find(|f| f.is_file())
+        .and_then(|f| read_text_file(&f, MAX_SNIPPET_FILE_BYTES))
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.split_once('=').and_then(|(n, t)| snippet_entry(n, t)))
+        .take(MAX_SNIPPETS)
+        .collect()
+}
 
 fn location_key(path: &str) -> String {
     #[cfg(windows)]
@@ -3992,6 +4022,8 @@ struct App {
     find_regex: bool,
     /// match case for the find bar, kept like `find_regex` (the Aa button or Alt+C)
     find_case: bool,
+    /// the focused folder's `.termie-snippets`, read as the palette opens
+    folder_snippets: Vec<(String, String)>,
     /// the plugins marketplace overlay, when open
     market: Option<MarketState>,
     /// plugin id currently installing on the marketplace worker
@@ -4190,6 +4222,7 @@ impl App {
             find: None,
             find_regex: false,
             find_case: false,
+            folder_snippets: Vec::new(),
             market: None,
             market_installing: None,
             pressed: None,
@@ -5553,6 +5586,7 @@ impl App {
                         PaletteAction::OpenBookmark(i),
                     )
                 }));
+                rows.extend(self.snippets().enumerate().map(|(i, (name, text))| (format!("snippet: {name}  {text}"), PaletteAction::Snippet(i))));
                 rows.extend(self.recent_commands().into_iter().map(|(line, cmd)| (format!("recent: {cmd}"), PaletteAction::RecentCommand(line))));
                 let query = query.trim();
                 if query.is_empty() {
@@ -6778,6 +6812,10 @@ impl App {
     }
 
     /// the focused pane's working directory (from OSC 7), as a filesystem path
+    fn snippets(&self) -> impl Iterator<Item = &(String, String)> {
+        self.persisted.snippets.iter().chain(&self.folder_snippets)
+    }
+
     fn focused_cwd(&self) -> Option<String> {
         let id = self.active_focused_id()?;
         let root = self.pw.tabs.get(self.pw.active_tab)?.root.as_ref()?;
@@ -7373,6 +7411,12 @@ impl App {
                     self.new_tab_cwd(Some(path), None);
                 }
             }
+            PaletteAction::Snippet(i) => {
+                let text = self.snippets().nth(i).map(|(_, t)| t.clone());
+                if let (Some(text), Some(id)) = (text, self.active_focused_id()) {
+                    self.send_paste_bytes(id, text.as_bytes());
+                }
+            }
             PaletteAction::DuplicateTab => {
                 let cwd = self.focused_cwd();
                 let shell = self.focused_shell();
@@ -7548,6 +7592,7 @@ impl App {
             }
             PaletteAction::OpenFind => self.open_find(),
             PaletteAction::OpenPalette => {
+                self.folder_snippets = self.focused_cwd().map(|d| folder_snippets(Path::new(&d))).unwrap_or_default();
                 self.palette = Some(PaletteState {
                     query: String::new(),
                     selected: 0,
