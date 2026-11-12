@@ -18,6 +18,7 @@ mod plugin;
 mod pty;
 mod regex;
 mod render;
+mod scheme;
 mod session;
 mod sixel;
 mod term;
@@ -610,6 +611,9 @@ enum PaletteAction {
     /// keyboard selection: move a cursor through screen + scrollback and copy
     MarkMode,
     Hints,
+    /// write the windows terminal / iterm2 / ghostty scheme on the clipboard
+    /// (as text, or as a path to the file) into colors.conf
+    ImportScheme,
     /// select the focused pane's retained history and live screen
     SelectAll,
     /// toggle termie as the platform's default terminal
@@ -736,6 +740,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     #[cfg(any(windows, target_os = "linux"))]
     ("quake drop-down", PaletteAction::Quake),
     ("cycle theme", PaletteAction::Theme),
+    ("import color scheme from clipboard", PaletteAction::ImportScheme),
     ("plugins", PaletteAction::Plugins),
     ("find", PaletteAction::OpenFind),
     ("copy", PaletteAction::Copy),
@@ -7775,6 +7780,7 @@ impl App {
             }
             PaletteAction::MarkMode => self.set_mark_mode(true),
             PaletteAction::Hints => self.start_hints(),
+            PaletteAction::ImportScheme => self.import_scheme(),
             PaletteAction::SelectAll => self.select_all(),
             PaletteAction::JumpAttention => self.jump_attention(),
             PaletteAction::FontPicker => self.open_font_picker(),
@@ -9875,6 +9881,34 @@ impl App {
             r.set_mark_mode(self.mark.is_some());
         }
         self.redraw();
+    }
+
+    fn import_scheme(&mut self) {
+        let win::ClipboardRead::Text(clip) = win::clipboard_get() else {
+            self.show_error("clipboard is too large to be a color scheme");
+            return;
+        };
+        let named = clip.trim().trim_matches('"');
+        let from_file = (!named.contains('\n')).then(|| read_text_file(Path::new(named), MAX_STARTUP_TEXT_BYTES)).flatten();
+        let Some(colors) = scheme::import(from_file.as_deref().unwrap_or(&clip)) else {
+            self.show_error("no windows terminal, iterm2 or ghostty color scheme on the clipboard");
+            return;
+        };
+        let Some(path) = app_dir().map(|d| d.join("colors.conf")) else {
+            return;
+        };
+        let existing = read_text_file(&path, MAX_STARTUP_TEXT_BYTES).unwrap_or_default();
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| write_atomic(&path, scheme::merge_conf(&existing, &colors).as_bytes()));
+        match written {
+            Ok(()) => {
+                let _ = self.proxy.send_event(UserEvent::UserConfChanged);
+                self.show_notice(&format!("imported {} colors into colors.conf", colors.len()));
+            }
+            Err(e) => self.show_error(&format!("colors.conf: {e}")),
+        }
     }
 
     /// label every link, path, hash and address on the focused pane's screen;
