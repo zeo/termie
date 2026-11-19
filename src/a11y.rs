@@ -10,7 +10,7 @@ use accesskit::{
 use crate::grid::{Grid, Line};
 use crate::term::Terminal;
 
-const ROOT: NodeId = NodeId(1);
+pub const ROOT: NodeId = NodeId(1);
 pub const TERMINAL: NodeId = NodeId(2);
 const TITLE_BAR: NodeId = NodeId(3);
 const TAB_LIST: NodeId = NodeId(4);
@@ -239,8 +239,12 @@ pub fn build_tree(
     tab_list.set_size_of_set(tabs.len());
     tab_list.set_children(tabs.iter().map(|tab| Target::Tab(tab.id).node_id()).collect::<Vec<_>>());
 
+    let has_terminal = !tabs.is_empty() || screen.is_some();
+
     let mut tab_panel = Node::new(Role::TabPanel);
-    tab_panel.set_children([TERMINAL]);
+    if has_terminal {
+        tab_panel.set_children([TERMINAL]);
+    }
     if let Some(tab) = tabs.iter().find(|tab| tab.selected) {
         tab_panel.set_labelled_by([Target::Tab(tab.id).node_id()]);
     }
@@ -295,7 +299,7 @@ pub fn build_tree(
         }
         nodes.push((control.target.node_id(), node));
     }
-    let mut focus = TERMINAL;
+    let mut focus = if has_terminal { TERMINAL } else { ROOT };
     let mut top = vec![TITLE_BAR, TAB_PANEL, OUTPUT];
     for panel in panels {
         if let Some(id) = panel.focus {
@@ -708,7 +712,30 @@ mod tests {
     }
 
     fn tree(panels: Vec<Panel>) -> TreeUpdate {
-        build_tree(None, "", "termie", None, None, None, Vec::new(), Vec::new(), panels)
+        build_tree(
+            None,
+            "",
+            "termie",
+            None,
+            None,
+            None,
+            vec![TabInfo {
+                id: 1,
+                label: "shell".to_string(),
+                selected: true,
+                bounds: Rect::default(),
+            }],
+            Vec::new(),
+            panels,
+        )
+    }
+
+    #[test]
+    fn empty_tabs_without_screen_omits_terminal_and_focuses_root() {
+        let update = build_tree(None, "", "termie", None, None, None, Vec::new(), Vec::new(), Vec::new());
+        assert!(update.nodes.iter().all(|(id, _)| *id != TERMINAL));
+        assert_eq!(node(&update, TAB_PANEL).children(), &[]);
+        assert_eq!(update.focus, ROOT);
     }
 
     fn node(update: &TreeUpdate, id: NodeId) -> &Node {

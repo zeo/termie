@@ -7124,7 +7124,7 @@ impl App {
             panels,
         );
         if let Some(target) = self.pw.chrome_focus.and_then(|hot| self.a11y_target(hot))
-            && update.focus == a11y::TERMINAL
+            && (update.focus == a11y::TERMINAL || update.focus == a11y::ROOT)
         {
             update.focus = target.node_id();
         }
